@@ -98,6 +98,26 @@ pub const MAX_EVENT_BYTES: usize = 64 * 1024;
 /// for what the agent actually produced.
 pub const TRUNCATION_MARK: &str = "…(truncated)";
 
+/// The ceiling on an identifier: a session id, a tool-call id, a tool name.
+///
+/// Identifiers are **rejected** past this, never truncated. A shortened session
+/// id resumes nothing and a shortened tool id matches no call, so a truncated
+/// one is not a smaller version of the value, it is a wrong one. Dropping it
+/// loses correlation for that event; keeping a corrupted one loses correlation
+/// *and* lies about it.
+///
+/// Generous by three orders of magnitude: real ids are UUIDs of about 36 bytes
+/// and tool names are a dozen. Anything near this is malformed rather than
+/// merely long.
+pub const MAX_IDENTIFIER_BYTES: usize = 4 * 1024;
+
+/// The ceiling on the total bytes held in the pending-tool map.
+///
+/// Counting entries alone bounded nothing: 1024 entries of unbounded id and
+/// name could retain hundreds of megabytes. This bounds the bytes, which is
+/// what actually needed bounding.
+pub(crate) const MAX_PENDING_TOOL_BYTES: usize = 256 * 1024;
+
 /// The ceiling on how many tool calls may be tracked at once.
 ///
 /// Entries are removed as results arrive, so this only bites when an agent
@@ -129,6 +149,19 @@ pub(crate) fn append_capped(buf: &mut String, line: &str) -> bool {
         buf.push('\n');
     }
     true
+}
+
+/// Whether an identifier is small enough to be usable.
+///
+/// The predicate deliberately returns a yes/no rather than a shortened value:
+/// see [`MAX_IDENTIFIER_BYTES`] for why truncating one is worse than losing it.
+fn usable_identifier(value: &str) -> bool {
+    value.len() <= MAX_IDENTIFIER_BYTES
+}
+
+/// Keep an identifier only if it is usable.
+fn accept_identifier(value: Option<String>) -> Option<String> {
+    value.filter(|v| usable_identifier(v))
 }
 
 /// Shorten `text` to [`MAX_EVENT_BYTES`], marking it if anything was dropped.
@@ -173,19 +206,49 @@ fn enforce_bounds(event: Event) -> Event {
     match event {
         Event::Text(text) => Event::Text(bound_text(text)),
         Event::Thinking(text) => Event::Thinking(bound_text(text)),
+        // An unusable id is dropped rather than shortened, so the event still
+        // reports what the agent did while making the loss of correlation
+        // explicit instead of silently wrong.
         Event::ToolCall { id, name, input } => Event::ToolCall {
-            id,
-            name: bound_text(name),
+            id: accept_identifier(id),
+            name: bound_identifier(name),
             input: bound_value(input),
         },
         Event::ToolResult { id, ok, output } => Event::ToolResult {
-            id,
+            id: accept_identifier(id),
             ok,
             output: bound_text(output),
         },
-        // Identifiers and quota fields are bounded by their own nature.
-        other @ (Event::Started { .. } | Event::RateLimit(_)) => other,
+        // `model` is for display, so shortening it costs nothing. The session
+        // id is not: `Started` is only emitted once a usable one exists, so it
+        // needs no filtering here.
+        Event::Started { session, model } => Event::Started {
+            session,
+            model: model.map(bound_identifier),
+        },
+        Event::RateLimit(limit) => Event::RateLimit(RateLimit {
+            status: bound_identifier(limit.status),
+            window: limit.window.map(bound_identifier),
+            resets_at: limit.resets_at,
+        }),
     }
+}
+
+/// Shorten a short-by-nature field to [`MAX_IDENTIFIER_BYTES`].
+///
+/// For values that are descriptive rather than correlating, a tool name or a
+/// model or a quota status word, where a shortened value is still meaningful.
+fn bound_identifier(text: String) -> String {
+    if text.len() <= MAX_IDENTIFIER_BYTES {
+        return text;
+    }
+    let mut cut = MAX_IDENTIFIER_BYTES - TRUNCATION_MARK.len();
+    while cut > 0 && !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let mut out = text[..cut].to_string();
+    out.push_str(TRUNCATION_MARK);
+    out
 }
 
 /// Facts that are only known once the stream ends.
@@ -219,6 +282,9 @@ pub(crate) struct Parser {
     term: Terminal,
     /// Tool names by call id, so a result can be attributed to its call.
     tools: HashMap<String, String>,
+    /// Bytes currently held in `tools`, kept alongside it because a map has no
+    /// cheap way to answer that.
+    tool_bytes: usize,
     /// True once a [`Event::Started`] has been emitted, so it fires only once.
     started: bool,
     /// Whether any record was recognized as this agent's own shape.
@@ -236,6 +302,7 @@ impl Parser {
             format,
             term: Terminal::default(),
             tools: HashMap::new(),
+            tool_bytes: 0,
             started: false,
             structured: false,
             terminal_seen: false,
@@ -329,10 +396,33 @@ impl Parser {
     /// Track a tool call so its result can be attributed, bounded so an agent
     /// that announces calls it never finishes cannot grow this without limit.
     fn remember_tool(&mut self, id: &str, name: &str) {
-        if self.tools.len() >= MAX_PENDING_TOOLS {
+        // An unusable id cannot correlate anything, so tracking it only costs
+        // memory.
+        if !usable_identifier(id) {
             return;
         }
-        self.tools.insert(id.to_string(), name.to_string());
+        let name = bound_identifier(name.to_string());
+        let cost = id.len() + name.len();
+        // Both budgets matter: the count bounds a flood of tiny entries, the
+        // bytes bound a few enormous ones. Counting entries alone was no bound
+        // at all while the entries themselves were unbounded.
+        if self.tools.len() >= MAX_PENDING_TOOLS
+            || self.tool_bytes.saturating_add(cost) > MAX_PENDING_TOOL_BYTES
+        {
+            return;
+        }
+        self.tool_bytes += cost;
+        if let Some(previous) = self.tools.insert(id.to_string(), name) {
+            // Replacing an entry must not double-count its predecessor.
+            self.tool_bytes = self.tool_bytes.saturating_sub(id.len() + previous.len());
+        }
+    }
+
+    /// Stop tracking a call once its result has arrived, releasing its budget.
+    fn forget_tool(&mut self, id: &str) {
+        if let Some(name) = self.tools.remove(id) {
+            self.tool_bytes = self.tool_bytes.saturating_sub(id.len() + name.len());
+        }
     }
 
     /// Whether any structured record has been recognized on this stream.
@@ -365,7 +455,11 @@ impl Parser {
     /// reports quota, and `result` closes with the answer and usage.
     fn claude(&mut self, v: &Value) -> Vec<Event> {
         let ty = v.get("type").and_then(Value::as_str).unwrap_or_default();
-        if let Some(id) = v.get("session_id").and_then(Value::as_str) {
+        // An unusable session id must not be captured: it would be persisted as
+        // a binding that can never resume anything.
+        if let Some(id) = v.get("session_id").and_then(Value::as_str)
+            && usable_identifier(id)
+        {
             self.term.session.get_or_insert_with(|| id.to_string());
         }
         match ty {
@@ -443,7 +537,7 @@ impl Parser {
                         .and_then(Value::as_str)
                         .inspect(|id| {
                             // The call has been answered, so stop tracking it.
-                            self.tools.remove(*id);
+                            self.forget_tool(id);
                         })
                         .map(str::to_string),
                     ok: block
@@ -467,7 +561,9 @@ impl Parser {
     /// call is emitted on first sighting and the result only once it completes.
     fn codex(&mut self, v: &Value) -> Vec<Event> {
         let ty = v.get("type").and_then(Value::as_str).unwrap_or_default();
-        if let Some(id) = v.get("thread_id").and_then(Value::as_str) {
+        if let Some(id) = v.get("thread_id").and_then(Value::as_str)
+            && usable_identifier(id)
+        {
             self.term.session.get_or_insert_with(|| id.to_string());
         }
         match ty {
@@ -527,7 +623,7 @@ impl Parser {
                         // in-progress one has an empty string and a null code.
                         if done {
                             if let Some(id) = &id {
-                                self.tools.remove(id);
+                                self.forget_tool(id);
                             }
                             out.push(Event::ToolResult {
                                 id,
@@ -602,7 +698,7 @@ impl Parser {
             }
             "tool.execution_complete" => vec![Event::ToolResult {
                 id: field("toolCallId").inspect(|id| {
-                    self.tools.remove(id);
+                    self.forget_tool(id);
                 }),
                 ok: data.and_then(|d| d.get("success")).and_then(Value::as_bool),
                 output: data
@@ -615,7 +711,9 @@ impl Parser {
             // Copilot's terminal record is flat, not nested under `data`.
             "result" => {
                 self.terminal_seen = true;
-                if let Some(id) = v.get("sessionId").and_then(Value::as_str) {
+                if let Some(id) = v.get("sessionId").and_then(Value::as_str)
+                    && usable_identifier(id)
+                {
                     self.term.session = Some(id.to_string());
                 }
                 if let Some(usage) = v.get("usage") {
@@ -1019,20 +1117,161 @@ mod tests {
         assert_eq!(id.as_deref(), Some("t1"), "the id must survive whole");
     }
 
-    /// Identifiers are exempt: a shortened session id cannot resume anything,
-    /// and a shortened tool id cannot be matched to its call.
+    /// A usable identifier passes through whole, however awkward its length.
+    /// Truncating one is worse than losing it: a shortened session id resumes
+    /// nothing and a shortened tool id matches no call.
     #[test]
-    fn identifiers_are_never_truncated() {
-        let long_id = "s".repeat(MAX_EVENT_BYTES * 2);
-        let line = serde_json::json!({"type": "system", "subtype": "init", "session_id": long_id})
-            .to_string();
+    fn usable_identifiers_are_never_shortened() {
+        // Long enough to be unusual, small enough to still be an identifier.
+        let id = "s".repeat(MAX_IDENTIFIER_BYTES);
+        let line =
+            serde_json::json!({"type": "system", "subtype": "init", "session_id": id}).to_string();
         let (events, term) = run(Agent::Claude, &[&line]);
 
         let Some(Event::Started { session, .. }) = events.first().cloned() else {
             panic!("expected Started, got {events:?}")
         };
-        assert_eq!(session.len(), long_id.len(), "the session id was shortened");
-        assert_eq!(term.session.as_deref(), Some(long_id.as_str()));
+        assert_eq!(session.len(), id.len(), "the session id was shortened");
+        assert_eq!(term.session.as_deref(), Some(id.as_str()));
+    }
+
+    /// The hole this closes: identifiers were exempt from every bound, so a
+    /// 512 KiB id rode through and the "16 MiB queued" figure was wrong.
+    /// Rejecting is right where truncating is not, because a binding that
+    /// cannot resume is worse than no binding.
+    #[test]
+    fn an_oversized_session_id_is_rejected_rather_than_stored() {
+        let id = "s".repeat(MAX_IDENTIFIER_BYTES + 1);
+        for (agent, line) in [
+            (
+                Agent::Claude,
+                serde_json::json!({"type": "system", "subtype": "init", "session_id": id})
+                    .to_string(),
+            ),
+            (
+                Agent::Codex,
+                serde_json::json!({"type": "thread.started", "thread_id": id}).to_string(),
+            ),
+            (
+                Agent::Copilot,
+                serde_json::json!({"type": "result", "sessionId": id, "exitCode": 0}).to_string(),
+            ),
+        ] {
+            let (events, term) = run(agent, &[&line]);
+            assert!(term.session.is_none(), "{agent} stored an unusable id");
+            assert!(
+                !events.iter().any(|e| matches!(e, Event::Started { .. })),
+                "{agent} announced a session it cannot resume"
+            );
+        }
+    }
+
+    /// A tool event with an unusable id is still reported: what the agent did
+    /// is worth knowing even when it cannot be correlated. The id is dropped,
+    /// never shortened into something that would match the wrong call.
+    #[test]
+    fn an_oversized_tool_id_drops_the_id_but_keeps_the_event() {
+        let id = "t".repeat(MAX_IDENTIFIER_BYTES + 1);
+        let line = serde_json::json!({
+            "type": "assistant", "session_id": "s",
+            "message": {"content": [{
+                "type": "tool_use", "id": id, "name": "Bash", "input": {"command": "ls"}
+            }]}
+        })
+        .to_string();
+
+        let (events, _) = run(Agent::Claude, &[&line]);
+        let Some(Event::ToolCall { id: seen, name, .. }) = events
+            .iter()
+            .find(|e| matches!(e, Event::ToolCall { .. }))
+            .cloned()
+        else {
+            panic!("the call itself must still be reported, got {events:?}")
+        };
+        assert_eq!(seen, None, "an unusable id must be dropped, not shortened");
+        assert_eq!(name, "Bash");
+    }
+
+    /// Bounding the entry count bounded nothing while the entries themselves
+    /// were unbounded: 1024 pending calls could retain hundreds of megabytes.
+    #[test]
+    fn the_pending_tool_map_is_bounded_by_bytes_not_only_entries() {
+        let mut parser = Parser::new(Agent::Claude, Format::Stream);
+        // Ids and names just under the identifier ceiling, so the entry count
+        // is nowhere near its limit while the bytes are.
+        for i in 0..MAX_PENDING_TOOLS {
+            let line = serde_json::json!({
+                "type": "assistant", "session_id": "s",
+                "message": {"content": [{
+                    "type": "tool_use",
+                    "id": format!("{i:0>width$}", width = MAX_IDENTIFIER_BYTES),
+                    "name": "x".repeat(MAX_IDENTIFIER_BYTES),
+                    "input": {}
+                }]}
+            })
+            .to_string();
+            parser.push(&line);
+        }
+        assert!(
+            parser.tool_bytes <= MAX_PENDING_TOOL_BYTES,
+            "pending tools grew to {} bytes",
+            parser.tool_bytes
+        );
+    }
+
+    /// Answering a call must release its budget, or a long run of ordinary
+    /// paired calls would exhaust it and stop correlating.
+    #[test]
+    fn a_completed_tool_call_releases_its_budget() {
+        let mut parser = Parser::new(Agent::Claude, Format::Stream);
+        let call = |id: &str| {
+            serde_json::json!({
+                "type": "assistant", "session_id": "s",
+                "message": {"content": [{
+                    "type": "tool_use", "id": id, "name": "Bash", "input": {}
+                }]}
+            })
+            .to_string()
+        };
+        let result = |id: &str| {
+            serde_json::json!({
+                "type": "user", "session_id": "s",
+                "message": {"content": [{
+                    "type": "tool_result", "tool_use_id": id, "content": "done"
+                }]}
+            })
+            .to_string()
+        };
+
+        for i in 0..(MAX_PENDING_TOOLS * 4) {
+            let id = format!("toolu_{i}");
+            parser.push(&call(&id));
+            parser.push(&result(&id));
+        }
+        assert_eq!(parser.tool_bytes, 0, "budget leaked across paired calls");
+        assert!(parser.tools.is_empty());
+    }
+
+    /// The claim the changelog makes has to survive an adversarial line: every
+    /// field at its worst, times the channel depth, still under 20 MiB.
+    #[test]
+    fn a_worst_case_event_stays_within_the_stated_ceiling() {
+        let huge = "x".repeat(MAX_LINE);
+        let line = serde_json::json!({
+            "type": "assistant", "session_id": huge,
+            "message": {"content": [{
+                "type": "tool_use", "id": huge, "name": huge, "input": {"command": huge}
+            }]}
+        })
+        .to_string();
+
+        let (events, _) = run(Agent::Claude, &[&line]);
+        for event in &events {
+            let size = serde_json::to_string(event).unwrap().len();
+            // Payload plus identifiers, with room for JSON framing.
+            let ceiling = MAX_EVENT_BYTES + 4 * MAX_IDENTIFIER_BYTES;
+            assert!(size <= ceiling, "an event reached {size} bytes: {event:?}");
+        }
     }
 
     /// Truncating JSON would produce something that no longer parses, so an

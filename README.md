@@ -144,9 +144,10 @@ the child and joins its readers before returning `Error::Cancelled`. So when it 
 tree really is gone, which matters if the next thing you do touches the files it was working
 on.
 
-`drop` cannot await, so it signals and aborts as a backstop. That is prompt but **not
-synchronous**: teardown runs when the runtime next polls the aborted task. Both kill the
-tree; only `cancel` tells you when.
+`drop` **synchronously signals** the process group on Unix, then aborts the driver. What it
+cannot do is wait: `Drop` cannot await, so it does not block until the child has exited and
+its readers are joined. Both kill the tree; only `cancel` tells you when it is gone. On
+Windows only the direct child is signalled.
 
 Each run gets its own process group on Unix, and cancellation, drop and timeout all tear
 down the whole group. Killing only the CLI would orphan the commands *it* started, which

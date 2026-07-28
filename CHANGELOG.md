@@ -19,11 +19,21 @@ them through an ordinary `cargo update`.
   `Error::NotAuthenticated` carrying the command that fixes it. Callers matching on `Ok`
   should expect this variant. `Error::is_auth_failure` distinguishes it.
 - **Event payloads are bounded at `MAX_EVENT_BYTES`** (64 KiB), marked with
-  `TRUNCATION_MARK` when shortened. The channel bounded how many events queued but not how
-  large they were, leaving roughly 130 MiB reachable in flight; it is now about 16 MiB.
-  Identifiers are exempt, because a truncated session id resumes nothing and a truncated
-  tool id matches no call. Oversized tool arguments are replaced rather than cut, since
-  truncated JSON no longer parses.
+  `TRUNCATION_MARK` when shortened. Oversized tool arguments are replaced rather than cut,
+  since truncated JSON no longer parses.
+- **Identifiers are validated rather than truncated.** A session id, tool-call id or tool
+  name over `MAX_IDENTIFIER_BYTES` (4 KiB) is rejected: an oversized session id is not
+  captured or persisted, and an oversized tool id is dropped while its event is still
+  reported. Shortening one would be worse than losing it, since a truncated session id
+  resumes nothing and a truncated tool id matches the wrong call.
+- **The pending-tool map is bounded by bytes**, not only by entry count. Counting entries
+  bounded nothing while the entries themselves were unbounded.
+
+  Together these give a real ceiling on queued memory. Each event is at most 64 KiB of
+  payload plus a few identifiers of 4 KiB, so a full 256-deep channel holds under about
+  21 MiB, with a further 256 KiB of pending-tool state. Before this release the figure was
+  unbounded in practice: identifiers were exempt from every limit, so a single line could
+  carry a 512 KiB id and 256 queued events could reach roughly 128 MiB.
 
 ### Fixed
 

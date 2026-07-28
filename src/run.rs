@@ -79,11 +79,12 @@ const EVENT_BUFFER: usize = 256;
 /// files with nobody watching. Call [`Run::detach`] when background execution is
 /// genuinely what you want.
 ///
-/// Dropping is prompt but not synchronous: `Drop` cannot await, so it asks the
-/// driver to stop and aborts it, and the teardown runs when the runtime next
-/// polls that task. If you need to *know* the tree is gone before doing
-/// something else, such as touching the files it was working on, use
-/// [`Run::cancel`], which waits for exactly that.
+/// On Unix, dropping **synchronously signals** the run's process group and then
+/// aborts the driver task. What it cannot do is *wait*: `Drop` cannot await, so
+/// it does not block until the child has exited or its readers have been
+/// joined. Use [`Run::cancel`] when you need to know the tree has actually gone
+/// before continuing, such as before touching the files it was working on. On
+/// Windows only the direct child is signalled.
 #[derive(Debug)]
 pub struct Run {
     events: mpsc::Receiver<Event>,
