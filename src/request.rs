@@ -151,6 +151,29 @@ impl Request {
         self
     }
 
+    /// Start a **new** conversation under an id you choose, rather than one the
+    /// agent picks.
+    ///
+    /// Useful when a host already has its own identifier for a thread and wants
+    /// the agent's session to match it, with no mapping table in between. The
+    /// id is known before the process starts, so the association survives a run
+    /// that dies mid-turn.
+    ///
+    /// Only Claude and Copilot accept an assigned id
+    /// ([`SessionSupport::Minted`]). Codex reveals its `thread_id` only in its
+    /// own output, so this is [`crate::Error::Unsupported`] for it, raised when
+    /// the argv is built rather than silently starting an unrelated session.
+    ///
+    /// Both CLIs require a valid UUID here; this crate passes the string through
+    /// without checking, so a non-UUID surfaces as the agent's own error.
+    ///
+    /// [`SessionSupport::Minted`]: crate::SessionSupport::Minted
+    #[must_use]
+    pub fn session_id(mut self, id: impl Into<String>) -> Self {
+        self.cont = Continue::NewWith(id.into());
+        self
+    }
+
     /// Attach this run to a caller-owned session name.
     ///
     /// The store decides whether this turn creates, continues, or forks, and the

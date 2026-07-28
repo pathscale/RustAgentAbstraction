@@ -32,10 +32,35 @@ and not inferred from documentation.
 | **Codex** | agent-printed (`thread_id`) | no | `--json` | prepended to prompt | `exec resume <id>` |
 | **Copilot** | caller-minted (`--session-id`) | no | `--output-format json` | prepended to prompt | `--session-id` |
 
-**Minted beats printed.** Where the caller can assign the session id up front (Claude,
-Copilot), the binding is written *before* the process starts, so a run that crashes
-mid-turn still leaves a resumable session. Codex only reveals its `thread_id` in its output,
-so its binding can only be recorded after a run produces one.
+### Can I choose the session id, or do I have to read it back?
+
+Both, depending on the agent. Verified by round-trip, not from `--help`:
+
+| | assign it up front | read it back |
+|---|---|---|
+| **Claude Code** | yes, `.session_id(uuid)` | also reported |
+| **Copilot** | yes, `.session_id(uuid)` | also reported |
+| **Codex** | **no** | `thread_id`, before it answers |
+
+```rust
+// Claude and Copilot: the id is yours to pick, so it can match a thread id
+// your app already has, with no mapping table in between.
+let mine = uuid::Uuid::new_v4().to_string();
+let outcome = run(&Request::new(Agent::Claude, "hi").session_id(&mine)).await?;
+assert_eq!(outcome.session.as_deref(), Some(mine.as_str()));
+```
+
+Both CLIs require a valid UUID. Asking Codex for an assigned id is an
+`Error::Unsupported` raised before spawning, never a silently unrelated conversation.
+
+**Assigning beats reading back**, where you get the choice: the binding exists *before* the
+process starts, so a run that dies mid-turn still leaves a resumable session. Codex's
+`thread_id` can only be recorded once it has been printed.
+
+That said, Codex prints it early. It arrives in `thread.started`, the first record of the
+stream, **before any answer text**, so a host can persist the binding the moment the stream
+opens rather than waiting for the turn to finish. `Event::Started` is the normalized form of
+that moment for all three agents.
 
 Asking an agent for something it cannot do is always an `Error::Unsupported`, never a quiet
 downgrade. A caller that asked to fork and silently got a linear resume would corrupt the
