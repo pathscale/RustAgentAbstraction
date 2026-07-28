@@ -180,6 +180,30 @@ Two more honest limits: Codex has no true plan mode, so `Plan` maps to its read-
 sandbox (writes blocked, execution still permitted), and `unchecked_args` can contradict any
 of this by design.
 
+## Is each agent logged in?
+
+Without spending a request:
+
+```rust
+for agent in Agent::ALL {
+    let status = AuthStatus::check(agent).await?;
+    println!("{agent}: {}", status.summary());
+}
+```
+
+```text
+claude-code: logged in as you@example.com (max)
+codex:       logged in as ChatGPT
+copilot:     unknown: copilot exposes no status command, so this cannot be
+             confirmed without spending a request
+```
+
+Claude answers JSON (`claude auth status`), Codex answers prose
+(`codex login status`), and **Copilot offers neither**. That third case reports `Unknown`
+rather than "logged out", because telling someone to re-authenticate a working setup is
+worse than admitting the question cannot be answered. `needs_login()` is true only for a
+*confirmed* logout, so gating on it never nags about an agent that simply cannot be asked.
+
 ## Environment isolation
 
 **`EnvPolicy::Minimal` is the default.** Inheriting the whole environment is what a CLI gets

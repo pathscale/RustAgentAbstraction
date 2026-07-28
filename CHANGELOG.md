@@ -37,6 +37,10 @@ them through an ordinary `cargo update`.
 
 ### Fixed
 
+- **`COPILOT_GITHUB_TOKEN` reaches Copilot under `EnvPolicy::Minimal`.** It is the
+  *highest-precedence* credential variable Copilot accepts and it was missing from the
+  list, so a host authenticating that way would have failed to authenticate at all once
+  `Minimal` became the default.
 - **Dropping a `Run` now reliably kills the process group.** It signalled the driver and
   aborted it, which left the kill waiting on the runtime to poll the aborted task. On Linux
   that did not reliably happen and grandchildren survived, while `cancel` and timeouts were
@@ -47,6 +51,11 @@ them through an ordinary `cargo update`.
 
 ### Added
 
+- **`AuthStatus::check(agent)`** answers whether an agent is logged in without spending a
+  request, which a missing login otherwise only revealed by running a turn and failing.
+  Claude reports JSON, Codex reports prose, and Copilot offers neither: that case is
+  `AuthState::Unknown` rather than a logout, since telling someone to re-authenticate a
+  working setup is worse than admitting the question cannot be answered.
 - **`Probe`** reads a CLI's `--version` and compares it against
   `Agent::verified_version`, the release its flag mappings were checked against, reporting
   `Verified` / `Newer` / `Older` / `Unrecognized` with an `advisory()` written to be shown to
