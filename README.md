@@ -114,6 +114,25 @@ the first one's conversation. Uppercase is encoded too, since macOS and Windows 
 case-insensitive and would otherwise collide `Chat` with `chat`. The record keeps your
 original name, so `list()` hands back what you passed, not a mangled segment.
 
+## Cancellation
+
+**Dropping a `Run` kills the agent, and everything it spawned.** Closing a window or
+cancelling a request should stop the work, not leave an agent running invisibly, spending
+quota and writing files with nobody watching.
+
+```rust
+let running = stream(&request)?;
+// ... user closes the tab
+drop(running);              // agent and its child processes are gone
+running.cancel().await;     // same, but waits until they are actually dead
+running.detach();           // opt out: keep running unsupervised
+```
+
+Each run gets its own process group on Unix, and cancellation, drop and timeout all tear
+down the whole group. Killing only the CLI would orphan the commands *it* started, which
+keep holding files and credentials afterwards. Windows has no equivalent here yet: only the
+direct child is killed, since containing a tree there needs a Job Object.
+
 ## Permissions
 
 `Permission` maps one posture onto each agent's own vocabulary:
@@ -127,6 +146,18 @@ original name, so `list()` hands back what you passed, not a mangled segment.
 | `Bypass` | `bypassPermissions` | `--dangerously-bypass-approvals-and-sandbox` | `--allow-all-paths` |
 
 The default is `ReadOnly`. Widen it explicitly.
+
+**What this does not cover.** These postures constrain each CLI's *built-in* tools: its
+shell, its file writes, its sandbox. They do **not** constrain MCP servers, plugins or
+custom tools, which are a separate tool category in all three CLIs. An MCP tool that files
+an issue, writes to a database or calls a deploy API can still act during a nominally
+read-only run. Claude's mapping denies `mcp__*` as well, but the other two have no
+equivalent switch, so if a run must not cause remote side effects the containment has to be
+which MCP servers are enabled at all.
+
+Two more honest limits: Codex has no true plan mode, so `Plan` maps to its read-only
+sandbox (writes blocked, execution still permitted), and `unchecked_args` can contradict any
+of this by design.
 
 ## Gotchas worth knowing
 

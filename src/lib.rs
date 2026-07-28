@@ -95,7 +95,7 @@ mod session;
 
 pub use agent::{Agent, Caps, Continue, Format, Permission, Plan, STDIN_THRESHOLD, SessionSupport};
 pub use error::{Error, Result};
-pub use event::{Event, MAX_CAPTURE, Parser, Terminal};
+pub use event::{Event, MAX_CAPTURE};
 pub use outcome::{Outcome, RateLimit, Stop, Usage};
 pub use request::Request;
 pub use run::{Run, run, stream};
