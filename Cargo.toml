@@ -1,0 +1,47 @@
+[package]
+name = "agent-abstraction"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Drive Claude Code, Codex and Copilot CLIs headlessly from Rust, as a library."
+license = "MIT"
+repository = "https://github.com/pathscale/RustAgentAbstraction"
+readme = "README.md"
+keywords = ["agent", "claude", "codex", "copilot", "cli"]
+categories = ["development-tools"]
+
+# Library only, by design. There is no binary: the consumer (an agencyzero GUI,
+# a service, a test) links this crate and spawns the agent directly, so nothing
+# marshals a request through a CLI and back out of stdout twice.
+[lib]
+name = "agent_abstraction"
+path = "src/lib.rs"
+
+[dependencies]
+# `process` gives an async child with piped stdio; `io-util` the line reader that
+# turns a JSONL stream into events; `time` the run timeout; `sync` the event
+# channel. No `full`: the consumer picks its own runtime features.
+tokio = { version = "1", features = ["process", "io-util", "sync", "time", "rt", "macros"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+# Session ids are caller-minted UUIDv4 (`claude --session-id`, and Copilot's
+# handle, which the CLI never prints). v4 only, since these are opaque handles and not
+# sort keys, so the v7 timestamp would leak wall-clock into a stable id.
+uuid = { version = "1", features = ["v4", "serde"] }
+# Resolves the agent binary on PATH so "not installed" is a typed error with an
+# install hint, rather than a bare ENOENT from the spawn.
+which = "8"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "forbid"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# The crate's own error type is deliberately wide (one variant per failure a
+# caller must branch on); boxing it would push that branch into a downcast.
+result_large_err = "allow"
