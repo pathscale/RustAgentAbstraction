@@ -97,7 +97,7 @@ mod session;
 
 pub use agent::{Agent, Caps, EnvPolicy, Format, NETWORK_ENV, Permission, SessionSupport};
 pub use error::{Error, Result};
-pub use event::{Event, MAX_CAPTURE};
+pub use event::{Event, MAX_CAPTURE, MAX_EVENT_BYTES, MAX_LINE, TRUNCATION_MARK};
 pub use outcome::{Outcome, RateLimit, Stop, Usage};
 pub use probe::{Probe, Version, VersionStatus};
 pub use request::Request;

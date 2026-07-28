@@ -82,6 +82,22 @@ pub const MAX_CAPTURE: usize = 1024 * 1024;
 /// one emitting an endless line is the case this exists for.
 pub const MAX_LINE: usize = 512 * 1024;
 
+/// The ceiling on any single event's payload.
+///
+/// [`MAX_CAPTURE`] bounds what is *kept*, and the channel bounds how many events
+/// are queued, but neither bounds how large one event is. With a 512 KiB line
+/// limit and a 256-deep channel, a stalled consumer could hold roughly 130 MiB
+/// of events. Bounding the payload brings that to about 16 MiB, which is a
+/// number worth being able to state.
+///
+/// 64 KiB is far more than a UI renders of a single tool result and is generous
+/// for a model turn.
+pub const MAX_EVENT_BYTES: usize = 64 * 1024;
+
+/// Marks a payload this crate shortened, so a truncated value is never mistaken
+/// for what the agent actually produced.
+pub const TRUNCATION_MARK: &str = "…(truncated)";
+
 /// The ceiling on how many tool calls may be tracked at once.
 ///
 /// Entries are removed as results arrive, so this only bites when an agent
@@ -113,6 +129,63 @@ pub(crate) fn append_capped(buf: &mut String, line: &str) -> bool {
         buf.push('\n');
     }
     true
+}
+
+/// Shorten `text` to [`MAX_EVENT_BYTES`], marking it if anything was dropped.
+fn bound_text(text: String) -> String {
+    if text.len() <= MAX_EVENT_BYTES {
+        return text;
+    }
+    let mut cut = MAX_EVENT_BYTES - TRUNCATION_MARK.len();
+    while cut > 0 && !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let mut out = text[..cut].to_string();
+    out.push_str(TRUNCATION_MARK);
+    out
+}
+
+/// Shorten a tool call's arguments, which are structured rather than text.
+///
+/// A truncated JSON value would no longer parse, so an oversized one is
+/// replaced wholesale by an object recording what was dropped. That keeps the
+/// value valid JSON, which is what a consumer expects of this field.
+fn bound_value(value: Value) -> Value {
+    let size = value.to_string().len();
+    if size <= MAX_EVENT_BYTES {
+        return value;
+    }
+    serde_json::json!({
+        "truncated": true,
+        "original_bytes": size,
+        "note": "arguments exceeded MAX_EVENT_BYTES and were dropped rather than \
+                 truncated, which would have produced invalid JSON",
+    })
+}
+
+/// Apply [`MAX_EVENT_BYTES`] to an event's payload.
+///
+/// Payloads only. Identifiers, the session id and tool-call ids, are left
+/// whole however long they are: they are short in practice, and shortening one
+/// would break the thing it exists for, resuming a conversation or matching a
+/// result to its call. A truncated identifier is worse than a large one.
+fn enforce_bounds(event: Event) -> Event {
+    match event {
+        Event::Text(text) => Event::Text(bound_text(text)),
+        Event::Thinking(text) => Event::Thinking(bound_text(text)),
+        Event::ToolCall { id, name, input } => Event::ToolCall {
+            id,
+            name: bound_text(name),
+            input: bound_value(input),
+        },
+        Event::ToolResult { id, ok, output } => Event::ToolResult {
+            id,
+            ok,
+            output: bound_text(output),
+        },
+        // Identifiers and quota fields are bounded by their own nature.
+        other @ (Event::Started { .. } | Event::RateLimit(_)) => other,
+    }
 }
 
 /// Facts that are only known once the stream ends.
@@ -185,7 +258,7 @@ impl Parser {
         // is the answer.
         if self.format == Format::Text {
             append_capped(&mut self.term.text, line);
-            return vec![Event::Text(line.to_string())];
+            return vec![enforce_bounds(Event::Text(line.to_string()))];
         }
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             self.term.unparsed += 1;
@@ -213,6 +286,10 @@ impl Parser {
             Agent::Codex => self.codex(&value),
             Agent::Copilot => self.copilot(&value),
         };
+        // Every event leaves through here, so bounding once at the exit covers
+        // all three agents rather than each parser remembering.
+        out = out.into_iter().map(enforce_bounds).collect();
+
         // Fire `Started` exactly once, from whichever record first revealed the
         // id, and put it ahead of that record's own events.
         if !self.started {
@@ -906,6 +983,97 @@ mod tests {
             ],
         );
         assert_eq!(term.text, "DONE");
+    }
+
+    /// The channel bounds how many events queue, not how large they are. With
+    /// a 512 KiB line limit that left ~130 MiB reachable in flight.
+    #[test]
+    fn an_enormous_tool_result_is_bounded_and_marked() {
+        let huge = "x".repeat(MAX_EVENT_BYTES * 4);
+        let line = serde_json::json!({
+            "type": "user",
+            "session_id": "s",
+            "message": {"content": [{
+                "type": "tool_result", "tool_use_id": "t1", "content": huge
+            }]}
+        })
+        .to_string();
+
+        let (events, _) = run(Agent::Claude, &[&line]);
+        let Some(Event::ToolResult { output, id, .. }) = events
+            .iter()
+            .find(|e| matches!(e, Event::ToolResult { .. }))
+            .cloned()
+        else {
+            panic!("expected a tool result, got {events:?}")
+        };
+        assert!(
+            output.len() <= MAX_EVENT_BYTES,
+            "kept {} bytes",
+            output.len()
+        );
+        assert!(
+            output.ends_with(TRUNCATION_MARK),
+            "truncation must be visible"
+        );
+        assert_eq!(id.as_deref(), Some("t1"), "the id must survive whole");
+    }
+
+    /// Identifiers are exempt: a shortened session id cannot resume anything,
+    /// and a shortened tool id cannot be matched to its call.
+    #[test]
+    fn identifiers_are_never_truncated() {
+        let long_id = "s".repeat(MAX_EVENT_BYTES * 2);
+        let line = serde_json::json!({"type": "system", "subtype": "init", "session_id": long_id})
+            .to_string();
+        let (events, term) = run(Agent::Claude, &[&line]);
+
+        let Some(Event::Started { session, .. }) = events.first().cloned() else {
+            panic!("expected Started, got {events:?}")
+        };
+        assert_eq!(session.len(), long_id.len(), "the session id was shortened");
+        assert_eq!(term.session.as_deref(), Some(long_id.as_str()));
+    }
+
+    /// Truncating JSON would produce something that no longer parses, so an
+    /// oversized argument object is replaced rather than cut.
+    #[test]
+    fn oversized_tool_arguments_stay_valid_json() {
+        let line = serde_json::json!({
+            "type": "assistant",
+            "session_id": "s",
+            "message": {"content": [{
+                "type": "tool_use", "id": "t1", "name": "Bash",
+                "input": {"command": "y".repeat(MAX_EVENT_BYTES * 3)}
+            }]}
+        })
+        .to_string();
+
+        let (events, _) = run(Agent::Claude, &[&line]);
+        let Some(Event::ToolCall { input, .. }) = events
+            .iter()
+            .find(|e| matches!(e, Event::ToolCall { .. }))
+            .cloned()
+        else {
+            panic!("expected a tool call, got {events:?}")
+        };
+        assert_eq!(input["truncated"], true, "got {input}");
+        assert!(
+            input.is_object(),
+            "the replacement must still be valid JSON"
+        );
+        assert!(input.to_string().len() <= MAX_EVENT_BYTES);
+    }
+
+    #[test]
+    fn ordinary_payloads_pass_through_untouched() {
+        let (events, _) = run(
+            Agent::Claude,
+            &[
+                r#"{"type":"assistant","session_id":"s","message":{"content":[{"type":"text","text":"pong"}]}}"#,
+            ],
+        );
+        assert!(events.contains(&Event::Text("pong".into())), "{events:?}");
     }
 
     #[test]
