@@ -81,8 +81,13 @@ in two checkouts never collides, and written through a temp file and a rename so
 concurrent reader never sees a half-written record. A corrupt record reads as absent: the
 next turn opens a fresh conversation rather than failing over a cache nobody asked about.
 
-Session names are reduced to a single safe path segment, so a name like `../../etc/passwd`
-cannot escape the store.
+Names are percent-encoded into a single path segment, which is **injective**: two different
+names can never land on the same file. That matters more than it sounds, because the failure
+mode of a lossy scheme is silent, not loud. Folding unsafe characters to `-` would map
+`café` and `cafe-` together, and the second session to use that name would quietly resume
+the first one's conversation. Uppercase is encoded too, since macOS and Windows are
+case-insensitive and would otherwise collide `Chat` with `chat`. The record keeps your
+original name, so `list()` hands back what you passed, not a mangled segment.
 
 ## Permissions
 
@@ -112,6 +117,29 @@ The default is `ReadOnly`. Widen it explicitly.
 - **Claude's `stream-json` requires `--verbose`**, or it refuses to start. Handled.
 - **Large prompts move to stdin automatically** above 128 KiB, so a long prompt never fails
   with `E2BIG`.
+
+## When a vendor changes its output
+
+The CLIs move. A format change shows up here as a run that exits `0` and returns nothing,
+which is a miserable thing to debug from the outside, so `Outcome` carries the evidence:
+
+```rust
+if outcome.looks_like_a_format_change() {
+    tracing::error!(
+        unparsed = outcome.unparsed,
+        sample = ?outcome.first_unparsed,
+        "the CLI is healthy; this crate's parser is not",
+    );
+}
+```
+
+Unparseable lines are counted rather than discarded. A non-zero count on its own is normal
+(agents interleave banners with their JSON); a non-zero count *with an empty answer* is the
+signature worth alerting on.
+
+Captured buffers (`text`, raw stdout, stderr) are bounded at `MAX_CAPTURE`, 1 MiB, keeping
+the earliest output. An agent can stream for hours, and an unbounded capture turns a long
+run into an OOM instead of an answer.
 
 ## No shell, ever
 

@@ -258,9 +258,15 @@ async fn forking_branches_to_a_new_session() {
 async fn a_missing_agent_reports_how_to_install_it() {
     let request = Request::new(Agent::Codex, "hi").bin("agent-abstraction-no-such-binary");
     let err = run(&request).await.unwrap_err();
+    // Assert on the structured field rather than the rendered message: the
+    // wording is free to change, the contract that an install hint is carried
+    // at all is not.
+    let agent_abstraction::Error::NotInstalled { agent, hint, .. } = &err else {
+        panic!("expected NotInstalled, got {err:?}")
+    };
+    assert_eq!(*agent, Agent::Codex);
     assert!(
-        matches!(err, agent_abstraction::Error::NotInstalled { .. }),
-        "got {err:?}"
+        !hint.is_empty(),
+        "a missing agent must say how to install it"
     );
-    assert!(err.to_string().contains("npm install"), "{err}");
 }

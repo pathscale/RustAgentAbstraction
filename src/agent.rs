@@ -268,6 +268,48 @@ impl fmt::Display for Agent {
     }
 }
 
+/// Builds an argv, keeping every flag name literal at its call site so the flag
+/// list for an agent stays greppable and auditable against `--help`.
+struct Argv(Vec<String>);
+
+impl Argv {
+    /// Start with the binary.
+    fn new(bin: &str) -> Self {
+        Self(vec![bin.to_string()])
+    }
+
+    /// A bare flag with no value.
+    fn bare(&mut self, flag: &str) -> &mut Self {
+        self.0.push(flag.to_string());
+        self
+    }
+
+    /// A flag and its value, as two arguments.
+    fn pair(&mut self, flag: &str, value: impl AsRef<str>) -> &mut Self {
+        self.0.push(flag.to_string());
+        self.0.push(value.as_ref().to_string());
+        self
+    }
+
+    /// A flag and its value, only when the value is present.
+    fn opt(&mut self, flag: &str, value: Option<&String>) -> &mut Self {
+        if let Some(value) = value {
+            self.pair(flag, value);
+        }
+        self
+    }
+
+    /// A positional argument.
+    fn arg(&mut self, value: impl Into<String>) -> &mut Self {
+        self.0.push(value.into());
+        self
+    }
+
+    fn done(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.0)
+    }
+}
+
 /// Claude Code's permission-mode token for each posture. Choices verified from
 /// `claude --help` (2.1.205): acceptEdits, auto, bypassPermissions, manual,
 /// dontAsk, plan.
@@ -286,79 +328,67 @@ fn claude_mode(p: Permission) -> &'static str {
 
 /// `claude -p <prompt> --permission-mode M --output-format F [...]`
 fn argv_claude(plan: &Plan) -> Vec<String> {
-    let mut a = vec![plan.bin.clone(), "-p".into()];
+    let mut a = Argv::new(&plan.bin);
+    a.bare("-p");
     if plan.stdin_prompt {
         // With `--input-format text` claude reads the prompt from stdin, so a
         // large prompt never has to fit on the argv.
-        a.push("--input-format".into());
-        a.push("text".into());
+        a.pair("--input-format", "text");
     } else {
-        a.push(Agent::Claude.effective_prompt(plan));
+        a.arg(Agent::Claude.effective_prompt(plan));
     }
 
-    a.push("--permission-mode".into());
-    a.push(claude_mode(plan.permission).into());
+    a.pair("--permission-mode", claude_mode(plan.permission));
     if plan.permission == Permission::ReadOnly {
         // Remove the mutating tools outright. Reads still run via Read/Grep/Glob.
-        a.push("--disallowedTools".into());
+        a.bare("--disallowedTools");
         for tool in ["Bash", "Edit", "Write", "NotebookEdit"] {
-            a.push(tool.into());
+            a.arg(tool);
         }
     }
 
-    if let Some(model) = &plan.model {
-        a.push("--model".into());
-        a.push(model.clone());
-    }
-    if let Some(system) = &plan.system {
-        a.push("--append-system-prompt".into());
-        a.push(system.clone());
-    }
+    a.opt("--model", plan.model.as_ref());
+    a.opt("--append-system-prompt", plan.system.as_ref());
 
     match &plan.cont {
         Continue::New => {}
         Continue::NewWith(id) => {
-            a.push("--session-id".into());
-            a.push(id.clone());
+            a.pair("--session-id", id);
         }
         Continue::Resume(id) => {
-            a.push("--resume".into());
-            a.push(id.clone());
+            a.pair("--resume", id);
         }
         Continue::Fork(id) => {
-            a.push("--resume".into());
-            a.push(id.clone());
             // Mints a new id off `id`, leaving the original and its cached
             // prefix untouched. The new id comes back in the output.
-            a.push("--fork-session".into());
+            a.pair("--resume", id).bare("--fork-session");
         }
     }
 
-    a.push("--output-format".into());
-    a.push(
+    a.pair(
+        "--output-format",
         match plan.format {
             Format::Text => "text",
             Format::Json => "json",
             Format::Stream => "stream-json",
-        }
-        .into(),
+        },
     );
     if plan.format == Format::Stream {
         // Claude refuses `-p --output-format stream-json` without it:
         // "--print with --output-format=stream-json requires --verbose".
-        a.push("--verbose".into());
+        a.bare("--verbose");
     }
-    a
+    a.done()
 }
 
 /// `codex exec [resume <id>] --skip-git-repo-check [sandbox flags] [--model M]
 /// [--json] <prompt>`
 fn argv_codex(plan: &Plan) -> Vec<String> {
-    let mut a = vec![plan.bin.clone(), "exec".into()];
+    let mut a = Argv::new(&plan.bin);
+    a.bare("exec");
     if let Continue::Resume(id) = &plan.cont {
         // Continuation is a subcommand, not a flag.
-        a.push("resume".into());
-        a.push(id.clone());
+        a.bare("resume").arg(id.clone());
     }
 
     // `codex exec` aborts outside a git repository unless told not to. That
@@ -367,37 +397,28 @@ fn argv_codex(plan: &Plan) -> Vec<String> {
     // directories, worktrees and review checkouts, and a hard abort there is
     // useless to them. The real containment is the sandbox below, which is
     // `read-only` by default, so nothing is unrecoverable regardless.
-    a.push("--skip-git-repo-check".into());
+    a.bare("--skip-git-repo-check");
 
     match plan.permission {
-        Permission::Bypass => a.push("--dangerously-bypass-approvals-and-sandbox".into()),
-        Permission::ReadOnly | Permission::Plan => {
-            a.push("--sandbox".into());
-            a.push("read-only".into());
-        }
-        Permission::Edit | Permission::Auto => {
-            a.push("--sandbox".into());
-            a.push("workspace-write".into());
-        }
-    }
+        Permission::Bypass => a.bare("--dangerously-bypass-approvals-and-sandbox"),
+        Permission::ReadOnly | Permission::Plan => a.pair("--sandbox", "read-only"),
+        Permission::Edit | Permission::Auto => a.pair("--sandbox", "workspace-write"),
+    };
 
-    if let Some(model) = &plan.model {
-        a.push("--model".into());
-        a.push(model.clone());
-    }
+    a.opt("--model", plan.model.as_ref());
     // `--json` is Codex's event stream and the only place `thread_id` appears.
     if plan.format != Format::Text {
-        a.push("--json".into());
+        a.bare("--json");
     }
     // Codex has no system flag, so the system text rides the prompt. A literal
     // `-` makes it read the prompt from stdin instead, keeping a large one off
     // the argv.
-    a.push(if plan.stdin_prompt {
-        "-".into()
+    a.arg(if plan.stdin_prompt {
+        "-".to_string()
     } else {
         Agent::Codex.effective_prompt(plan)
     });
-    a
+    a.done()
 }
 
 /// `copilot -p <prompt> --allow-all-tools [...] [--session-id <uuid>]`
@@ -409,63 +430,46 @@ fn argv_codex(plan: &Plan) -> Vec<String> {
 fn argv_copilot(plan: &Plan) -> Vec<String> {
     // Copilot reads stdin as the prompt only when `-p` is absent: a `-p` value
     // makes the pipe be ignored. So a piped prompt drops the flag entirely.
-    let mut a = if plan.stdin_prompt {
-        vec![plan.bin.clone()]
-    } else {
-        vec![
-            plan.bin.clone(),
-            "-p".into(),
-            Agent::Copilot.effective_prompt(plan),
-        ]
-    };
+    let mut a = Argv::new(&plan.bin);
+    if !plan.stdin_prompt {
+        a.pair("-p", Agent::Copilot.effective_prompt(plan));
+    }
 
     // Without this, a headless run stops at the first tool confirmation.
-    a.push("--allow-all-tools".into());
-    a.push("--no-ask-user".into());
+    a.bare("--allow-all-tools").bare("--no-ask-user");
     match plan.permission {
-        Permission::Bypass | Permission::Auto => a.push("--allow-all-paths".into()),
+        Permission::Bypass | Permission::Auto => a.bare("--allow-all-paths"),
         // Deny beats allow, so this is allow-all minus the mutating tools.
-        Permission::ReadOnly => {
-            a.push("--allow-all-paths".into());
-            a.push("--deny-tool=shell".into());
-            a.push("--deny-tool=write".into());
-        }
+        Permission::ReadOnly => a
+            .bare("--allow-all-paths")
+            .bare("--deny-tool=shell")
+            .bare("--deny-tool=write"),
         // Edits run; shell stays denied so commands cannot.
-        Permission::Edit => {
-            a.push("--allow-all-paths".into());
-            a.push("--deny-tool=shell".into());
-        }
-        Permission::Plan => {
-            a.push("--mode".into());
-            a.push("plan".into());
-        }
-    }
+        Permission::Edit => a.bare("--allow-all-paths").bare("--deny-tool=shell"),
+        Permission::Plan => a.pair("--mode", "plan"),
+    };
 
-    if let Some(model) = &plan.model {
-        a.push("--model".into());
-        a.push(model.clone());
-    }
+    a.opt("--model", plan.model.as_ref());
     // One flag serves both directions: it sets the UUID for a new session and
     // resumes an existing one by id.
     match &plan.cont {
         Continue::NewWith(id) | Continue::Resume(id) => {
-            a.push("--session-id".into());
-            a.push(id.clone());
+            a.pair("--session-id", id);
         }
         // `Fork` is rejected by `Agent::check` before reaching here.
         Continue::New | Continue::Fork(_) => {}
     }
 
-    a.push("--output-format".into());
-    a.push(
+    a.pair(
+        "--output-format",
         if plan.format == Format::Text {
             "text"
         } else {
+            // Copilot's `json` is JSONL, so it serves both structured formats.
             "json"
-        }
-        .into(),
+        },
     );
-    a
+    a.done()
 }
 
 #[cfg(test)]

@@ -65,6 +65,41 @@ pub enum Event {
     RateLimit(RateLimit),
 }
 
+/// The ceiling on any single captured buffer.
+///
+/// An agent can stream for hours; `text`, raw stdout and stderr would otherwise
+/// grow without bound and a long run would end in an OOM rather than an answer.
+/// A megabyte is far more prose than any consumer displays, and the fields this
+/// bounds are for reading and diagnosis, never for reconstructing the stream.
+pub const MAX_CAPTURE: usize = 1024 * 1024;
+
+/// Append `line` and a newline to `buf`, stopping once [`MAX_CAPTURE`] is
+/// reached. Returns whether anything was written.
+///
+/// Truncation keeps the *earliest* output, which is where a banner, a usage
+/// error, or the start of an answer lives. Later output from a runaway agent is
+/// the part worth dropping.
+pub(crate) fn append_capped(buf: &mut String, line: &str) -> bool {
+    let remaining = MAX_CAPTURE.saturating_sub(buf.len());
+    if remaining == 0 {
+        return false;
+    }
+    // `<` rather than `<=`, because the newline also has to fit.
+    if line.len() < remaining {
+        buf.push_str(line);
+        buf.push('\n');
+    } else {
+        // Cut on a character boundary; a truncated buffer must stay valid UTF-8.
+        let mut cut = remaining - 1;
+        while cut > 0 && !line.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        buf.push_str(&line[..cut]);
+        buf.push('\n');
+    }
+    true
+}
+
 /// Facts that are only known once the stream ends.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Terminal {
@@ -78,6 +113,14 @@ pub struct Terminal {
     pub stop: Stop,
     /// The last quota signal seen.
     pub rate_limit: Option<RateLimit>,
+    /// How many output lines could not be parsed.
+    ///
+    /// Non-zero is not automatically a fault: agents interleave banners and
+    /// warnings with their JSON. It matters when a run *also* came back empty,
+    /// which is what a vendor changing its output shape looks like from here.
+    pub unparsed: usize,
+    /// The first line that failed to parse, as evidence for the above.
+    pub first_unparsed: Option<String>,
 }
 
 /// Incrementally turns one agent's output into [`Event`]s and a [`Terminal`].
@@ -109,7 +152,9 @@ impl Parser {
     ///
     /// Unparseable lines yield nothing rather than failing the run: agents
     /// interleave banners and warnings with their JSON, and a stray line is not
-    /// a reason to lose a completed turn.
+    /// a reason to lose a completed turn. They are counted in
+    /// [`Terminal::unparsed`] so that a silent vendor format change is
+    /// diagnosable instead of merely producing an empty answer.
     pub fn push(&mut self, line: &str) -> Vec<Event> {
         let line = line.trim();
         if line.is_empty() {
@@ -118,11 +163,21 @@ impl Parser {
         // Under a plain-text format there is nothing to parse: the whole stream
         // is the answer.
         if self.format == Format::Text {
-            self.term.text.push_str(line);
-            self.term.text.push('\n');
+            append_capped(&mut self.term.text, line);
             return vec![Event::Text(line.to_string())];
         }
         let Ok(value) = serde_json::from_str::<Value>(line) else {
+            self.term.unparsed += 1;
+            if self.term.first_unparsed.is_none() {
+                // One short sample is enough to identify a shape change; keeping
+                // every stray line would reintroduce the unbounded growth this
+                // parser just capped.
+                let mut cut = line.len().min(512);
+                while cut > 0 && !line.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                self.term.first_unparsed = Some(line[..cut].to_string());
+            }
             return Vec::new();
         };
         let mut out = match self.agent {
@@ -495,14 +550,22 @@ fn codex_tool_input(item: &Value, item_ty: &str) -> Value {
     }
 }
 
-/// Flatten a tool result's `content`, which is either a plain string or an array
-/// of content blocks.
+/// Flatten a tool result's `content` into the observation the model saw.
+///
+/// Anthropic tool results are either a bare string or an array of content
+/// blocks. Text blocks flatten to their text; any other block kind (an image,
+/// or a shape added in a future API version) is kept as its raw JSON rather
+/// than dropped, so a caller inspecting a tool result never silently loses part
+/// of it. This is lossy in presentation, never in content.
 fn flatten_text(v: Option<&Value>) -> String {
     match v {
         Some(Value::String(s)) => s.clone(),
         Some(Value::Array(blocks)) => blocks
             .iter()
-            .filter_map(|b| b.get("text").and_then(Value::as_str))
+            .map(|b| match b.get("text").and_then(Value::as_str) {
+                Some(text) => text.to_string(),
+                None => b.to_string(),
+            })
             .collect::<Vec<_>>()
             .join("\n"),
         Some(other) => other.to_string(),
@@ -760,6 +823,85 @@ mod tests {
             ],
         );
         assert_eq!(term.text, "DONE");
+    }
+
+    #[test]
+    fn capture_is_bounded_and_keeps_the_earliest_output() {
+        let mut buf = String::new();
+        // Far more than the cap, in chunks, as a streaming agent would.
+        for i in 0..50_000 {
+            append_capped(&mut buf, &format!("line {i} aaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+        }
+        assert!(buf.len() <= MAX_CAPTURE, "grew to {}", buf.len());
+        assert!(buf.starts_with("line 0 "), "the earliest output is kept");
+    }
+
+    #[test]
+    fn capping_never_splits_a_multibyte_character() {
+        let mut buf = "x".repeat(MAX_CAPTURE - 3);
+        // A 4-byte character that cannot fit in the 3 bytes remaining.
+        assert!(append_capped(&mut buf, "🙂🙂"));
+        assert!(buf.len() <= MAX_CAPTURE);
+        // The invariant is simply that this is still a valid Rust string, which
+        // would have panicked on a mid-character slice above.
+        assert!(buf.is_char_boundary(buf.len()));
+    }
+
+    #[test]
+    fn a_full_buffer_reports_that_it_took_nothing() {
+        let mut buf = "x".repeat(MAX_CAPTURE);
+        assert!(!append_capped(&mut buf, "more"));
+        assert_eq!(buf.len(), MAX_CAPTURE);
+    }
+
+    /// A vendor changing its output shape looks like a clean exit with nothing
+    /// parsed. Counting the misses turns that from a mystery into a diagnosis.
+    #[test]
+    fn unparseable_lines_are_counted_and_sampled() {
+        let (_, term) = run(
+            Agent::Claude,
+            &[
+                "<html>an error page, not JSON</html>",
+                "another bad line",
+                r#"{"type":"result","result":"ok","session_id":"s"}"#,
+            ],
+        );
+        assert_eq!(term.unparsed, 2);
+        assert_eq!(
+            term.first_unparsed.as_deref(),
+            Some("<html>an error page, not JSON</html>")
+        );
+    }
+
+    #[test]
+    fn a_clean_stream_reports_no_parse_failures() {
+        let (_, term) = run(
+            Agent::Claude,
+            &[r#"{"type":"result","result":"ok","session_id":"s"}"#],
+        );
+        assert_eq!(term.unparsed, 0);
+        assert!(term.first_unparsed.is_none());
+    }
+
+    /// Non-text content blocks are preserved as raw JSON rather than dropped, so
+    /// a caller inspecting a tool result never silently loses part of it.
+    #[test]
+    fn tool_result_blocks_that_are_not_text_are_kept_not_dropped() {
+        let (events, _) = run(
+            Agent::Claude,
+            &[
+                r#"{"type":"user","session_id":"s","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":[{"type":"text","text":"seen"},{"type":"image","source":{"data":"abc"}}]}]}}"#,
+            ],
+        );
+        let output = events
+            .iter()
+            .find_map(|e| match e {
+                Event::ToolResult { output, .. } => Some(output),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("expected a tool result, got {events:?}"));
+        assert!(output.contains("seen"));
+        assert!(output.contains("image"), "the image block was dropped");
     }
 
     #[test]

@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 
 use crate::agent::Continue;
 use crate::error::{Error, Result};
-use crate::event::{Event, Parser, Terminal};
+use crate::event::{Event, Parser, Terminal, append_capped};
 use crate::outcome::{Outcome, Stop};
 use crate::request::Request;
 
@@ -60,11 +60,16 @@ impl Run {
         while self.events.recv().await.is_some() {}
         match self.task.await {
             Ok(result) => result,
-            // The driver task itself panicked or was cancelled; there is no
-            // outcome to report and no useful exit code to invent.
-            Err(join) => Err(Error::Spawn {
+            // The driver task panicked or was cancelled. The process itself
+            // started fine, so this is not a spawn failure and must not claim
+            // to be one.
+            Err(join) => Err(Error::Interrupted {
                 bin: self.argv.first().cloned().unwrap_or_default(),
-                source: std::io::Error::other(join),
+                detail: if join.is_panic() {
+                    "the driver task panicked".into()
+                } else {
+                    "the driver task was cancelled".into()
+                },
             }),
         }
     }
@@ -162,8 +167,9 @@ async fn drive(mut child: Child, request: Request, events: mpsc::Sender<Event>) 
         if let Some(handle) = stderr {
             let mut lines = BufReader::new(handle).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                buf.push_str(&line);
-                buf.push('\n');
+                // Keep draining after the cap is hit: an undrained pipe would
+                // block the child even though we no longer want the bytes.
+                append_capped(&mut buf, &line);
             }
         }
         buf
@@ -171,14 +177,17 @@ async fn drive(mut child: Child, request: Request, events: mpsc::Sender<Event>) 
 
     let stdout = child.stdout.take();
     let mut parser = Parser::new(request.agent, plan.format);
+    // Raw stdout is retained only as a fallback answer for a run that exited
+    // cleanly without producing a structured one, and as evidence when
+    // classifying a failure. It is capped for the same reason as everything
+    // else here: an agent can stream for hours.
     let mut raw = String::new();
 
     let read_stdout = async {
         if let Some(handle) = stdout {
             let mut lines = BufReader::new(handle).lines();
             while let Some(line) = lines.next_line().await? {
-                raw.push_str(&line);
-                raw.push('\n');
+                append_capped(&mut raw, &line);
                 for event in parser.push(&line) {
                     // A receiver that went away is not a failure: the run should
                     // still finish and produce its outcome.
@@ -249,6 +258,8 @@ async fn drive(mut child: Child, request: Request, events: mpsc::Sender<Event>) 
         rate_limit: terminal.rate_limit,
         exit_code,
         stderr,
+        unparsed: terminal.unparsed,
+        first_unparsed: terminal.first_unparsed,
     })
 }
 
