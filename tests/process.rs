@@ -74,10 +74,28 @@ async fn grandchild_pid(dir: &Path) -> i32 {
     panic!("the fake agent never spawned its grandchild");
 }
 
-/// Give the OS a moment to reap after a kill.
-async fn settle() {
-    tokio::time::sleep(Duration::from_millis(300)).await;
+/// Wait for a pid to disappear, up to `limit`. Returns whether it did.
+///
+/// `Drop` cannot await, so it aborts the driver task and the actual teardown
+/// happens when the runtime next polls it. That is prompt but not synchronous,
+/// so asserting after a fixed sleep is a bet on scheduler timing: it held
+/// locally and on a quiet runner, and lost on a loaded 2-vCPU CI runner. What
+/// the contract actually promises is "killed promptly", so that is what this
+/// waits for.
+async fn wait_until_dead(pid: i32, limit: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + limit;
+    while tokio::time::Instant::now() < deadline {
+        if !alive(pid) {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    !alive(pid)
 }
+
+/// Long enough to absorb a loaded CI runner, short enough that a genuine leak
+/// still fails the test rather than hanging it.
+const TEARDOWN_GRACE: Duration = Duration::from_secs(10);
 
 /// The default that matters for a GUI: closing a window must stop the agent,
 /// not leave it running invisibly and spending quota.
@@ -92,10 +110,9 @@ async fn dropping_a_run_kills_the_agent_and_its_children() {
     assert!(alive(grandchild), "the grandchild should be running");
 
     drop(running);
-    settle().await;
 
     assert!(
-        !alive(grandchild),
+        wait_until_dead(grandchild, TEARDOWN_GRACE).await,
         "dropping the run left a grandchild ({grandchild}) alive; \
          killing only the CLI orphans whatever it spawned"
     );
@@ -115,8 +132,9 @@ async fn cancel_stops_the_whole_tree_before_returning() {
     let err = running.cancel().await.unwrap_err();
     assert!(err.is_cancelled(), "cancel should report itself: {err:?}");
 
-    // No settle(): cooperative cancellation must have reaped the tree before
-    // returning, so the check is immediate rather than after a grace period.
+    // Checked immediately, with no polling, unlike the drop test above. That
+    // asymmetry is the point: `cancel` awaits its own teardown, so if the tree
+    // is not already gone when it returns, the contract is broken.
     assert!(
         !alive(grandchild),
         "cancel returned while a grandchild was still alive, so it is not \
@@ -142,9 +160,10 @@ async fn a_timed_out_run_kills_its_children() {
         matches!(err, agent_abstraction::Error::Timeout { .. }),
         "got {err:?}"
     );
-    settle().await;
-
-    assert!(!alive(grandchild), "the timeout left a grandchild alive");
+    assert!(
+        wait_until_dead(grandchild, TEARDOWN_GRACE).await,
+        "the timeout left a grandchild alive"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -159,7 +178,9 @@ async fn detach_lets_a_run_outlive_its_handle() {
     let grandchild = grandchild_pid(&dir).await;
 
     running.detach();
-    settle().await;
+    // A brief pause is right here rather than a poll: the assertion is that
+    // nothing kills it, so the test has to give something the chance to.
+    tokio::time::sleep(Duration::from_millis(500)).await;
 
     assert!(
         alive(grandchild),
