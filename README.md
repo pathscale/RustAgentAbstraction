@@ -100,8 +100,10 @@ The default is `ReadOnly`. Widen it explicitly.
 
 ## Gotchas worth knowing
 
-- **`codex exec` refuses to run outside a git repository.** Pass
-  `.args(["--skip-git-repo-check"])` when your working directory may not be one.
+- **`codex exec` refuses to run outside a git repository.** This crate always passes
+  `--skip-git-repo-check`, so it runs anywhere. That check exists to stop an agent editing
+  files with no way to undo them; the sandbox is the real containment here, and it defaults
+  to `read-only`.
 - **Copilot's tool filters need `=`.** They are declared `--deny-tool[=tools...]`, an
   optional value, which binds only as `--deny-tool=shell`. Across a space the value is read
   as a positional and the deny is silently lost. This crate always emits the combined form.

@@ -34,11 +34,9 @@ fn ping(agent: Agent) -> Request {
         .permission(Permission::ReadOnly)
         .timeout(Duration::from_secs(180));
     match agent {
-        // The cheapest model on each side; Copilot picks its own.
+        // The cheapest model on each side; Codex and Copilot pick their own.
         Agent::Claude => request.model("haiku"),
-        // `codex exec` refuses to run outside a git repository.
-        Agent::Codex => request.args(["--skip-git-repo-check"]),
-        Agent::Copilot => request,
+        Agent::Codex | Agent::Copilot => request,
     }
 }
 
@@ -96,6 +94,37 @@ async fn copilot_answers_and_reports_a_session() {
         outcome.session.is_some(),
         "copilot must report a session id"
     );
+}
+
+/// `codex exec` aborts outside a git repository unless the check is waived.
+/// This crate waives it on every invocation, so a run from a scratch directory
+/// must still work. Running the rest of the suite from the repo would never
+/// catch a regression here, because the repo *is* a git checkout.
+#[tokio::test]
+#[ignore = "spawns a real agent and consumes quota"]
+async fn codex_runs_outside_a_git_repository() {
+    if !available(Agent::Codex) {
+        return;
+    }
+    let scratch = std::env::temp_dir().join(format!("aa-nogit-{}", std::process::id()));
+    std::fs::create_dir_all(&scratch).unwrap();
+    assert!(
+        !scratch.join(".git").exists(),
+        "the point of this test is that it is not a repo"
+    );
+
+    let outcome = run(&ping(Agent::Codex).cwd(&scratch))
+        .await
+        .expect("codex refused to run outside a git repo");
+
+    assert!(outcome.is_ok(), "unexpected stop: {outcome:?}");
+    assert!(
+        outcome.text.trim().to_lowercase().contains("pong"),
+        "got {:?}",
+        outcome.text
+    );
+
+    std::fs::remove_dir_all(&scratch).ok();
 }
 
 /// The streaming path must deliver events *before* the run settles, and the
