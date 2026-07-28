@@ -753,6 +753,10 @@ fn looks_unauthenticated(text: &str) -> bool {
         // Claude, verified: an unauthenticated run answers exactly this.
         "not logged in",
         "please run /login",
+        // Copilot, verified: it exits 1 with plain text, and none of the other
+        // phrases here appear in it. Its wording shares no vocabulary with the
+        // other two, which is why this had to be observed rather than guessed.
+        "no authentication information",
         "invalid api key",
         "authentication_error",
         "unauthorized",
@@ -993,6 +997,34 @@ mod tests {
         assert_eq!(*agent, Agent::Claude);
         assert!(hint.contains("/login"), "{hint}");
         assert!(err.is_auth_failure());
+    }
+
+    /// Verbatim from an unauthenticated Copilot run, captured by pointing it at
+    /// an empty HOME. Its wording shares no phrase with Claude's or Codex's, so
+    /// before this was observed the phrase list did not match it at all and a
+    /// missing Copilot login was reported as a generic failure.
+    #[test]
+    fn copilots_own_unauthenticated_wording_is_recognized() {
+        let stderr = "Error: No authentication information found.\n\n\
+                      Copilot can be authenticated with GitHub using an OAuth Token or a \
+                      Fine-Grained Personal Access Token.\n\n\
+                      To authenticate, you can use any of the following methods:\n\
+                      \u{2022} Start 'copilot' and run the '/login' command\n\
+                      \u{2022} Set the COPILOT_GITHUB_TOKEN, GH_TOKEN, or GITHUB_TOKEN \
+                      environment variable";
+        let err = classify_run(
+            Agent::Copilot,
+            "copilot",
+            1,
+            stderr,
+            "",
+            &Terminal::default(),
+        );
+        let Error::NotAuthenticated { agent, hint, .. } = &err else {
+            panic!("expected NotAuthenticated, got {err:?}")
+        };
+        assert_eq!(*agent, Agent::Copilot);
+        assert!(hint.contains("copilot login"), "{hint}");
     }
 
     /// Each agent's hint has to name its own login route, since they differ:
