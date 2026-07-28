@@ -356,6 +356,14 @@ const MAX_STEM: usize = 200;
 /// encoded, so an escape marker is unambiguous and no literal character can be
 /// mistaken for one.
 ///
+/// The tradeoff this makes, deliberately: an ASCII name stays readable on disk
+/// (`greet-flow.json`), while a non-ASCII one becomes verbose, since every byte
+/// outside the safe set costs three characters and a multi-byte character
+/// several of those (`日本語` encodes to 27). Readability is a debugging
+/// convenience; a collision resumes the wrong conversation. So the scheme keeps
+/// names distinguishable first and legible second, and a caller who wants
+/// pretty filenames should choose ASCII names.
+///
 /// Names too long to encode whole are truncated and disambiguated with a hash of
 /// the full input, so the length bound costs readability but never uniqueness.
 fn encode_segment(name: &str) -> String {

@@ -89,6 +89,7 @@ mod agent;
 mod error;
 mod event;
 mod outcome;
+mod proc;
 mod request;
 mod run;
 mod session;

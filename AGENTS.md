@@ -28,6 +28,15 @@ Copilot CLIs headlessly behind one API. Consumed as a direct dependency by the
 - **No shell.** Arguments are built as a `Vec<String>` and handed to `exec`. Never
   interpolate a prompt into a shell string; that is how a prompt containing `$(...)` becomes
   a command.
+- **Cancellation is complete on Unix and incomplete on Windows.** Dropping, cancelling or
+  timing out a run tears down the whole process group, so the commands an agent started die
+  with it. On Windows only the direct child is killed: containing a tree there needs a Job
+  Object, which this crate does not set up. Do not describe cancellation as cross-platform,
+  and keep `tests/process.rs` honest by leaving it `#![cfg(unix)]` rather than making it
+  pass vacuously elsewhere.
+- **`src/proc.rs` holds the crate's only `unsafe`.** `Cargo.toml` sets
+  `unsafe_code = "deny"` rather than `forbid` so that one audited call can be excepted. A
+  second `unsafe` anywhere is a design question, not a local decision.
 
 ## Build & run
 
@@ -59,6 +68,7 @@ Pure logic and I/O are kept apart so the mappings are testable without spawning 
 | `src/event.rs` | Normalizing three JSON dialects into one event vocabulary. **Pure.** |
 | `src/session.rs` | Name → native-id bindings on disk. |
 | `src/run.rs` | Spawning, streaming, timeouts, failure classification. |
+| `src/proc.rs` | Process-group teardown. The crate's only `unsafe`. |
 | `src/outcome.rs` | What a finished run produced. |
 | `src/error.rs` | One error type; one variant per case a caller must branch on. |
 

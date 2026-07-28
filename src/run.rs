@@ -19,6 +19,7 @@ use crate::agent::{Continue, EnvPolicy};
 use crate::error::{Error, Result};
 use crate::event::{Event, Parser, Terminal, append_capped};
 use crate::outcome::{Outcome, Stop};
+use crate::proc::kill_process_group;
 use crate::request::Request;
 
 /// How many events may queue before the producer waits for the consumer. Deep
@@ -302,32 +303,6 @@ impl Drop for ChildGuard {
         }
     }
 }
-
-/// Signal an entire process group, so commands the agent spawned die with it.
-///
-/// Best effort by nature: the group may already be gone, which is not a failure.
-/// On Windows there is no equivalent here and only the direct child is killed;
-/// containing a tree there needs a Job Object, which this crate does not yet
-/// set up.
-#[cfg(unix)]
-fn kill_process_group(child: &tokio::process::Child) {
-    if let Some(pid) = child.id() {
-        // Negating the pid targets the group, which `process_group(0)` made this
-        // child the leader of.
-        // SAFETY: `libc::kill` has no safe wrapper. The pid comes from a live
-        // `Child`, and signalling a group that has already exited returns ESRCH
-        // rather than doing anything undefined.
-        // A pid always fits in i32; the cast back is how the group is addressed.
-        let Ok(pid) = i32::try_from(pid) else { return };
-        #[allow(unsafe_code)]
-        unsafe {
-            libc::kill(-pid, libc::SIGKILL);
-        }
-    }
-}
-
-#[cfg(not(unix))]
-fn kill_process_group(_child: &tokio::process::Child) {}
 
 /// Feed the child, read both its pipes, and assemble the outcome.
 #[allow(
