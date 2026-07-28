@@ -351,7 +351,8 @@ fn argv_claude(plan: &Plan) -> Vec<String> {
     a
 }
 
-/// `codex exec [resume <id>] --skip-git-repo-check [sandbox flags] [--json] <prompt>`
+/// `codex exec [resume <id>] --skip-git-repo-check [sandbox flags] [--model M]
+/// [--json] <prompt>`
 fn argv_codex(plan: &Plan) -> Vec<String> {
     let mut a = vec![plan.bin.clone(), "exec".into()];
     if let Continue::Resume(id) = &plan.cont {
@@ -584,6 +585,37 @@ mod tests {
         let a = argv(Agent::Codex, &p);
         assert_eq!(a[0..4], ["codex", "exec", "resume", "thread-9"]);
         assert_eq!(a.last().unwrap(), "hi");
+    }
+
+    /// The model is the caller's choice on every agent. It is forwarded
+    /// verbatim and never defaulted, normalized, or validated here: a host with
+    /// a model picker owns that list, and an unknown name must surface as the
+    /// agent's own error rather than something this crate guessed at.
+    #[test]
+    fn every_agent_forwards_the_callers_model_verbatim() {
+        for agent in Agent::ALL {
+            let mut p = plan(agent.bin());
+            // Deliberately not a real model id: nothing here may interpret it.
+            p.model = Some("some-model-9".into());
+            let a = argv(agent, &p);
+            let at = pos(&a, "--model").unwrap_or_else(|| panic!("{agent} dropped --model: {a:?}"));
+            assert_eq!(a[at + 1], "some-model-9", "{agent} rewrote the model");
+        }
+    }
+
+    /// No model means the agent picks its own, so a host can offer a "default"
+    /// entry without this crate inventing one.
+    #[test]
+    fn no_model_means_no_model_flag() {
+        for agent in Agent::ALL {
+            let p = plan(agent.bin());
+            assert!(p.model.is_none());
+            let a = argv(agent, &p);
+            assert!(
+                pos(&a, "--model").is_none(),
+                "{agent} invented a model: {a:?}"
+            );
+        }
     }
 
     /// `codex exec` aborts outside a git repository. A host embedding this
