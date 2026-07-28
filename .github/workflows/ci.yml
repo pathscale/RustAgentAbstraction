@@ -57,14 +57,27 @@ jobs:
     runs-on: ubicloud-standard-2
     permissions:
       contents: read
-      # `audit-check` reports advisories as check annotations.
-      checks: write
-      issues: write
     steps:
       - uses: actions/checkout@v4
 
-      # Worth having now that the crate is published: an advisory against tokio
-      # or serde reaches every consumer, and nothing else here would notice.
-      - uses: rustsec/audit-check@v2
+      - uses: dtolnay/rust-toolchain@stable
+
+      # `Cargo.lock` is not committed, per library convention, so there is
+      # nothing for audit to read until one is resolved. That is also the more
+      # meaningful check for a library: consumers resolve their own graph, so
+      # what matters is whether a *fresh* resolution pulls in an advisory, not
+      # whether some pinned snapshot did.
+      - name: Resolve a dependency graph to audit
+        run: cargo generate-lockfile
+
+      # A prebuilt binary rather than `rustsec/audit-check`, which compiles
+      # cargo-audit from source on every run. That took 2m53s here, against a
+      # ~40s build for the crate itself, and Ubicloud bills by vCPU-minute.
+      - uses: taiki-e/install-action@v2
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          tool: cargo-audit
+
+      # Worth having now that the crate is published: an advisory against tokio
+      # or serde reaches every consumer, and nothing else in CI would notice.
+      - name: Audit dependencies
+        run: cargo audit
