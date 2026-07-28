@@ -50,14 +50,27 @@ fn fake_agent(dir: &Path) -> PathBuf {
     script
 }
 
-/// Whether a pid is still alive, via a null signal.
+/// The process state as `ps` reports it, or `None` if the pid is gone.
+fn process_state(pid: i32) -> Option<String> {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    let state = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!state.is_empty()).then_some(state)
+}
+
+/// Whether a pid is still running.
+///
+/// Deliberately not `kill -0`, which succeeds for a **zombie**: a process that
+/// has exited but whose parent has not reaped it. That distinction does not
+/// matter on a developer machine, where init reaps orphans immediately, but a
+/// CI container's PID 1 is often not a real init, so an orphan can sit as a
+/// zombie indefinitely and `kill -0` keeps reporting it alive long after it
+/// died. A killed process is dead whether or not anyone collected its exit
+/// status.
 fn alive(pid: i32) -> bool {
-    // `kill -0` reports liveness without actually signalling.
-    std::process::Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+    process_state(pid).is_some_and(|state| !state.starts_with('Z'))
 }
 
 /// Wait for the grandchild to record its pid, then return it.
@@ -74,10 +87,28 @@ async fn grandchild_pid(dir: &Path) -> i32 {
     panic!("the fake agent never spawned its grandchild");
 }
 
-/// Give the OS a moment to reap after a kill.
-async fn settle() {
-    tokio::time::sleep(Duration::from_millis(300)).await;
+/// Wait for a pid to disappear, up to `limit`. Returns whether it did.
+///
+/// `Drop` cannot await, so it aborts the driver task and the actual teardown
+/// happens when the runtime next polls it. That is prompt but not synchronous,
+/// so asserting after a fixed sleep is a bet on scheduler timing: it held
+/// locally and on a quiet runner, and lost on a loaded 2-vCPU CI runner. What
+/// the contract actually promises is "killed promptly", so that is what this
+/// waits for.
+async fn wait_until_dead(pid: i32, limit: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + limit;
+    while tokio::time::Instant::now() < deadline {
+        if !alive(pid) {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    !alive(pid)
 }
+
+/// Long enough to absorb a loaded CI runner, short enough that a genuine leak
+/// still fails the test rather than hanging it.
+const TEARDOWN_GRACE: Duration = Duration::from_secs(10);
 
 /// The default that matters for a GUI: closing a window must stop the agent,
 /// not leave it running invisibly and spending quota.
@@ -92,12 +123,12 @@ async fn dropping_a_run_kills_the_agent_and_its_children() {
     assert!(alive(grandchild), "the grandchild should be running");
 
     drop(running);
-    settle().await;
 
     assert!(
-        !alive(grandchild),
-        "dropping the run left a grandchild ({grandchild}) alive; \
-         killing only the CLI orphans whatever it spawned"
+        wait_until_dead(grandchild, TEARDOWN_GRACE).await,
+        "dropping the run left a grandchild ({grandchild}) alive in state {:?}; \
+         killing only the CLI orphans whatever it spawned",
+        process_state(grandchild)
     );
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -115,12 +146,14 @@ async fn cancel_stops_the_whole_tree_before_returning() {
     let err = running.cancel().await.unwrap_err();
     assert!(err.is_cancelled(), "cancel should report itself: {err:?}");
 
-    // No settle(): cooperative cancellation must have reaped the tree before
-    // returning, so the check is immediate rather than after a grace period.
+    // Checked immediately, with no polling, unlike the drop test above. That
+    // asymmetry is the point: `cancel` awaits its own teardown, so if the tree
+    // is not already gone when it returns, the contract is broken.
     assert!(
         !alive(grandchild),
-        "cancel returned while a grandchild was still alive, so it is not \
-         awaiting its own cleanup"
+        "cancel returned while a grandchild was still alive (state {:?}), so it \
+         is not awaiting its own cleanup",
+        process_state(grandchild)
     );
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -142,9 +175,11 @@ async fn a_timed_out_run_kills_its_children() {
         matches!(err, agent_abstraction::Error::Timeout { .. }),
         "got {err:?}"
     );
-    settle().await;
-
-    assert!(!alive(grandchild), "the timeout left a grandchild alive");
+    assert!(
+        wait_until_dead(grandchild, TEARDOWN_GRACE).await,
+        "the timeout left a grandchild alive in state {:?}",
+        process_state(grandchild)
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -159,7 +194,9 @@ async fn detach_lets_a_run_outlive_its_handle() {
     let grandchild = grandchild_pid(&dir).await;
 
     running.detach();
-    settle().await;
+    // A brief pause is right here rather than a poll: the assertion is that
+    // nothing kills it, so the test has to give something the chance to.
+    tokio::time::sleep(Duration::from_millis(500)).await;
 
     assert!(
         alive(grandchild),

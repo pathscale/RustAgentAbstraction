@@ -77,8 +77,13 @@ const EVENT_BUFFER: usize = 256;
 /// this crate targets: closing a window or cancelling a request should stop the
 /// work, not leave an agent running invisibly, spending quota and touching
 /// files with nobody watching. Call [`Run::detach`] when background execution is
-/// genuinely what you want, or [`Run::cancel`] to stop one deterministically and
-/// wait for it to die.
+/// genuinely what you want.
+///
+/// Dropping is prompt but not synchronous: `Drop` cannot await, so it asks the
+/// driver to stop and aborts it, and the teardown runs when the runtime next
+/// polls that task. If you need to *know* the tree is gone before doing
+/// something else, such as touching the files it was working on, use
+/// [`Run::cancel`], which waits for exactly that.
 #[derive(Debug)]
 pub struct Run {
     events: mpsc::Receiver<Event>,
