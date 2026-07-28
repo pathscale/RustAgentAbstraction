@@ -13,7 +13,9 @@
 
 use std::time::Duration;
 
-use agent_abstraction::{Agent, Event, Format, Permission, Request, SessionStore, run, stream};
+use agent_abstraction::{
+    Agent, EnvPolicy, Event, Format, Permission, Request, SessionStore, run, stream,
+};
 
 /// A prompt with exactly one correct answer, so the assertion is about the
 /// plumbing rather than the model's judgement.
@@ -214,6 +216,92 @@ async fn codex_reveals_its_thread_id_before_it_answers() {
         "the id must arrive before any answer text, so a binding can be stored early"
     );
     assert_eq!(outcome.session, first_event);
+}
+
+/// `EnvPolicy::Minimal` only earns its place if a run under it still works.
+/// An isolation setting that silently breaks authentication is worse than none,
+/// because the failure surfaces as "not logged in" rather than as a config
+/// mistake. This is the test that keeps the per-agent list honest.
+#[tokio::test]
+#[ignore = "spawns a real agent and consumes quota"]
+async fn every_agent_still_works_under_a_minimal_environment() {
+    for agent in Agent::ALL {
+        if !available(agent) {
+            continue;
+        }
+        let outcome = run(&ping(agent).env_policy(EnvPolicy::Minimal))
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "{agent} could not authenticate under EnvPolicy::Minimal, \
+                                        so its essential_env list is incomplete: {e}"
+                )
+            });
+        assert!(
+            outcome.text.trim().to_lowercase().contains("pong"),
+            "{agent} answered {:?}",
+            outcome.text
+        );
+    }
+}
+
+/// Codex cannot be *told* a session id, so continuity depends entirely on
+/// reading its `thread_id` back off the stream and storing it ourselves.
+///
+/// This is the test that proves that path works end to end, with no reading of
+/// `$CODEX_HOME/sessions/`: turn one states a fact, the id is captured and
+/// persisted, and a second run in a separate process resumes from the store and
+/// recalls it. If Codex ever stopped emitting `thread.started`, this fails.
+#[tokio::test]
+#[ignore = "spawns a real agent and consumes quota"]
+async fn codex_resumes_from_a_captured_thread_id_without_scraping() {
+    if !available(Agent::Codex) {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("aa-codex-resume-{}", std::process::id()));
+    let store = SessionStore::open(&dir);
+    let project = std::env::current_dir().unwrap();
+    let name = "codex-memory";
+
+    let first = Request::new(Agent::Codex, "Remember the number 5619. Reply OK.")
+        .permission(Permission::ReadOnly)
+        .timeout(Duration::from_secs(180))
+        .session(&store, &project, name, false)
+        .expect("planning the first turn failed");
+    let first = run(&first).await.expect("first turn failed");
+    let thread = first
+        .session
+        .clone()
+        .expect("codex must report a thread id on the stream");
+
+    // The binding must be on disk, since that is the only place the id exists
+    // for us: nothing reads Codex's own session directory.
+    let stored = store
+        .get(&project, name)
+        .expect("store read failed")
+        .expect("no binding was persisted");
+    assert_eq!(stored.token, thread);
+    assert_eq!(stored.agent, Agent::Codex);
+
+    let second = Request::new(Agent::Codex, "What number did I ask you to remember?")
+        .permission(Permission::ReadOnly)
+        .timeout(Duration::from_secs(180))
+        .session(&store, &project, name, false)
+        .expect("planning the second turn failed");
+    assert_eq!(
+        second.session_phase(),
+        Some(agent_abstraction::Phase::Continue),
+        "the second turn must continue the stored thread"
+    );
+    let second = run(&second).await.expect("second turn failed");
+
+    assert!(
+        second.text.contains("5619"),
+        "codex lost its context on resume: {:?}",
+        second.text
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 /// The streaming path must deliver events *before* the run settles, and the

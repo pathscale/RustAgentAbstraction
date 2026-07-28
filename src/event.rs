@@ -125,7 +125,7 @@ pub struct Terminal {
 
 /// Incrementally turns one agent's output into [`Event`]s and a [`Terminal`].
 #[derive(Debug)]
-pub struct Parser {
+pub(crate) struct Parser {
     agent: Agent,
     format: Format,
     term: Terminal,

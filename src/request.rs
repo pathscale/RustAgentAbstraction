@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::agent::{Agent, Continue, Format, Permission, Plan, STDIN_THRESHOLD};
+use crate::agent::{Agent, Continue, EnvPolicy, Format, Permission, Plan, STDIN_THRESHOLD};
 use crate::error::Result;
 use crate::session::{Phase, SessionStore};
 
@@ -31,7 +31,7 @@ pub struct Request {
     pub(crate) cwd: Option<PathBuf>,
     pub(crate) env: Vec<(String, String)>,
     pub(crate) extra_args: Vec<String>,
-    pub(crate) clear_env: bool,
+    pub(crate) env_policy: EnvPolicy,
     pub(crate) timeout: Option<Duration>,
     /// Set when [`Request::session`] resolved a named session, so the runner
     /// knows to write the binding back.
@@ -65,7 +65,7 @@ impl Request {
             cwd: None,
             env: Vec::new(),
             extra_args: Vec::new(),
-            clear_env: false,
+            env_policy: EnvPolicy::Inherit,
             timeout: None,
             binding: None,
         }
@@ -123,21 +123,22 @@ impl Request {
         self
     }
 
-    /// Start from an empty environment instead of inheriting the host's.
+    /// Choose which of the host's environment variables reach the agent.
     ///
-    /// By default the agent inherits every variable this process holds, which
-    /// is how the CLIs find their own credentials, `PATH` and `HOME`. In an
-    /// embedded host that same inheritance also hands the agent, and anything
-    /// it runs, every unrelated secret in the process: cloud credentials, CI
-    /// tokens, database URLs.
+    /// Defaults to [`EnvPolicy::Inherit`]. [`EnvPolicy::Minimal`] is the one to
+    /// reach for when embedding in a process that holds unrelated secrets: it
+    /// passes through only what the selected agent actually needs, a list the
+    /// crate maintains per agent, so it isolates without a caller having to
+    /// work out what to put back.
     ///
-    /// With this set, only variables passed to [`Request::env`] reach the child.
-    /// That is the stronger position, but it is opt-in because an empty
-    /// environment breaks every agent until you supply at least `PATH`, `HOME`
-    /// and the CLI's own credential variable.
+    /// ```no_run
+    /// # use agent_abstraction::{Agent, EnvPolicy, Request};
+    /// let request = Request::new(Agent::Claude, "review this")
+    ///     .env_policy(EnvPolicy::Minimal);
+    /// ```
     #[must_use]
-    pub fn clear_env(mut self) -> Self {
-        self.clear_env = true;
+    pub fn env_policy(mut self, policy: EnvPolicy) -> Self {
+        self.env_policy = policy;
         self
     }
 
@@ -279,8 +280,12 @@ impl Request {
     }
 
     /// Freeze the request into the [`Plan`] an argv is built from.
+    ///
+    /// Crate-internal: `Plan` is how the crate works, not what it promises, and
+    /// a caller that wants to see the command line should use
+    /// [`Request::argv`].
     #[must_use]
-    pub fn plan(&self) -> Plan {
+    pub(crate) fn plan(&self) -> Plan {
         Plan {
             bin: self
                 .bin

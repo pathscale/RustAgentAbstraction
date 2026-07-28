@@ -159,12 +159,53 @@ Two more honest limits: Codex has no true plan mode, so `Plan` maps to its read-
 sandbox (writes blocked, execution still permitted), and `unchecked_args` can contradict any
 of this by design.
 
+## Environment isolation
+
+By default the agent inherits the whole parent environment, which is how the CLIs find their
+credentials. In an embedded host that also hands the agent, and every command it runs, any
+unrelated secret the process happens to hold.
+
+```rust
+Request::new(Agent::Claude, "review this").env_policy(EnvPolicy::Minimal)
+```
+
+`Minimal` passes through only what the selected agent needs. The crate owns that list per
+agent rather than the caller, because an incomplete hand-written one fails as an
+authentication error rather than as an obvious config mistake.
+
+The list was derived by experiment, not assumption: `PATH` + `HOME` alone is **not** enough,
+because Claude's keychain lookup is keyed on `USER` and returns "Not logged in" without it.
+`PATH` + `HOME` + `USER` is the verified floor for all three on macOS. Windows names are
+included on the same reasoning but are unverified.
+
+Proxy and custom-CA variables are deliberately **excluded**. They are situational rather
+than required, and `HTTPS_PROXY` routinely embeds credentials (`http://user:pass@proxy`),
+so forwarding them automatically would leak one through the policy meant to withhold
+secrets. A host that needs them should surface them as a setting; `NETWORK_ENV` names them
+so a settings screen does not have to hardcode the list:
+
+```rust
+for name in NETWORK_ENV {
+    if let Ok(value) = std::env::var(name) {
+        request = request.env(*name, value);
+    }
+}
+```
+
+Two tests keep it honest: a live one asserting every agent still authenticates under
+`Minimal`, so an incomplete list fails loudly, and a deterministic one asserting the host's
+own variables do not reach the child.
+
 ## Gotchas worth knowing
 
 - **`codex exec` refuses to run outside a git repository.** This crate always passes
   `--skip-git-repo-check`, so it runs anywhere. That check exists to stop an agent editing
   files with no way to undo them; the sandbox is the real containment here, and it defaults
   to `read-only`.
+- **`codex exec resume` does not accept `--sandbox`.** It is a different option set from
+  `codex exec` and rejects the flag outright, so the permission posture is applied as
+  `-c sandbox_mode=...` on the resume path. Only a multi-turn run reveals this: every
+  single-turn test passes either way.
 - **Copilot's tool filters need `=`.** They are declared `--deny-tool[=tools...]`, an
   optional value, which binds only as `--deny-tool=shell`. Across a space the value is read
   as a positional and the deny is silently lost. This crate always emits the combined form.
