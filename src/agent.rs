@@ -95,10 +95,21 @@ pub enum Permission {
 /// Environment variables that route an agent's traffic through a corporate
 /// proxy or a custom certificate authority.
 ///
+/// None of the three vendors documents proxy support, and none exposes a proxy
+/// flag, so this is a convenience list of names a host may want to forward, not
+/// a claim that forwarding them works. (The names do appear in all three
+/// shipped binaries, but that shows they are referenced, not that provider
+/// traffic honours them.) Verify against your own proxy before relying on it.
+///
 /// Not included in [`EnvPolicy::Minimal`]: they are situational, and the proxy
 /// URLs frequently carry credentials. Offered here so a host can present them
 /// as an explicit setting and forward the ones it wants with
 /// [`crate::Request::env`], rather than every caller rediscovering the names.
+///
+/// Excluding them from `Minimal` does not block them. Under the default
+/// [`EnvPolicy::Inherit`] they flow exactly as they would for the CLI run from a
+/// shell; the only thing `Minimal` changes is that forwarding becomes a
+/// decision rather than an accident.
 ///
 /// ```no_run
 /// # use agent_abstraction::{Agent, EnvPolicy, NETWORK_ENV, Request};
@@ -113,9 +124,11 @@ pub enum Permission {
 pub const NETWORK_ENV: &[&str] = &[
     "HTTP_PROXY",
     "HTTPS_PROXY",
+    "ALL_PROXY",
     "NO_PROXY",
     "http_proxy",
     "https_proxy",
+    "all_proxy",
     "no_proxy",
     "SSL_CERT_FILE",
     "SSL_CERT_DIR",
