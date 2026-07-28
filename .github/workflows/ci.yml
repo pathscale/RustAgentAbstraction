@@ -13,7 +13,13 @@ env:
 jobs:
   check:
     name: fmt, clippy, test
-    runs-on: ubuntu-latest
+    # Ubicloud, never a GitHub-hosted label: CI here runs on Ubicloud runners
+    # and `ubuntu-latest` would quietly bill GitHub Actions minutes instead.
+    # `-2` is deliberate rather than lazy: this job finishes in well under a
+    # minute, and Ubicloud bills by vCPU-minute, so a larger runner costs more
+    # for no wall-clock gain. Reach for `-4`/`-8` when a build is actually the
+    # bottleneck.
+    runs-on: ubicloud-standard-2
     steps:
       - uses: actions/checkout@v4
 
@@ -45,3 +51,20 @@ jobs:
         run: cargo doc --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
+
+  audit:
+    name: cargo audit
+    runs-on: ubicloud-standard-2
+    permissions:
+      contents: read
+      # `audit-check` reports advisories as check annotations.
+      checks: write
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # Worth having now that the crate is published: an advisory against tokio
+      # or serde reaches every consumer, and nothing else here would notice.
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
