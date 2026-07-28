@@ -33,7 +33,11 @@ thiserror = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
 # Resolves the agent binary on PATH so "not installed" is a typed error with an
 # install hint, rather than a bare ENOENT from the spawn.
-which = "8"
+
+# Killing a process *group* on timeout or cancellation. Without it only the CLI
+# dies and the commands it spawned keep running.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
@@ -42,7 +46,9 @@ uuid = { version = "1", features = ["v4"] }
 
 [lints.rust]
 missing_docs = "warn"
-unsafe_code = "forbid"
+# `deny` rather than `forbid`: one audited exception exists, `libc::kill` for
+# process-group teardown, which has no safe wrapper.
+unsafe_code = "deny"
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }

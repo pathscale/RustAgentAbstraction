@@ -21,7 +21,9 @@ const PING: &str = "Reply with the single word: pong. No punctuation, no explana
 
 /// Whether the agent's binary is on PATH; tests no-op without it.
 fn available(agent: Agent) -> bool {
-    let found = which::which(agent.bin()).is_ok();
+    let found = std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths).any(|dir| dir.join(agent.bin()).is_file())
+    });
     if !found {
         eprintln!("skipping: `{}` is not installed", agent.bin());
     }

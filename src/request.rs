@@ -31,6 +31,7 @@ pub struct Request {
     pub(crate) cwd: Option<PathBuf>,
     pub(crate) env: Vec<(String, String)>,
     pub(crate) extra_args: Vec<String>,
+    pub(crate) clear_env: bool,
     pub(crate) timeout: Option<Duration>,
     /// Set when [`Request::session`] resolved a named session, so the runner
     /// knows to write the binding back.
@@ -64,6 +65,7 @@ impl Request {
             cwd: None,
             env: Vec::new(),
             extra_args: Vec::new(),
+            clear_env: false,
             timeout: None,
             binding: None,
         }
@@ -121,6 +123,24 @@ impl Request {
         self
     }
 
+    /// Start from an empty environment instead of inheriting the host's.
+    ///
+    /// By default the agent inherits every variable this process holds, which
+    /// is how the CLIs find their own credentials, `PATH` and `HOME`. In an
+    /// embedded host that same inheritance also hands the agent, and anything
+    /// it runs, every unrelated secret in the process: cloud credentials, CI
+    /// tokens, database URLs.
+    ///
+    /// With this set, only variables passed to [`Request::env`] reach the child.
+    /// That is the stronger position, but it is opt-in because an empty
+    /// environment breaks every agent until you supply at least `PATH`, `HOME`
+    /// and the CLI's own credential variable.
+    #[must_use]
+    pub fn clear_env(mut self) -> Self {
+        self.clear_env = true;
+        self
+    }
+
     /// Kill the run if it has not finished within `timeout`.
     #[must_use]
     pub fn timeout(mut self, timeout: Duration) -> Self {
@@ -128,13 +148,21 @@ impl Request {
         self
     }
 
-    /// Append raw arguments, after everything this crate builds.
+    /// Append raw arguments after everything this crate builds.
     ///
-    /// The escape hatch for agent-specific flags with no unified spelling, such
-    /// as `--add-dir` to widen file access or Codex's `-c key=value` config
-    /// overrides. Arguments are passed straight to the binary without a shell.
+    /// The escape hatch for agent-specific flags with no unified spelling.
+    ///
+    /// **This voids the crate's guarantees.** Arguments land after the generated
+    /// ones, so they can contradict [`Request::permission`], redirect the output
+    /// format the parser expects, or point the run at a different session.
+    /// Codex's `-c key=value` in particular can rewrite sandbox and approval
+    /// policy for the invocation. Nothing here is validated, and a security
+    /// review of the permission posture means little without also reviewing
+    /// whatever is passed here.
+    ///
+    /// Arguments are passed straight to the binary without a shell.
     #[must_use]
-    pub fn args<I, S>(mut self, args: I) -> Self
+    pub fn unchecked_args<I, S>(mut self, args: I) -> Self
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
@@ -208,10 +236,31 @@ impl Request {
         });
         // A named session needs an id back, so it selects the format that
         // carries one unless the caller pinned a format explicitly.
-        if self.format.is_none() {
-            self.format = self.agent.session_format();
+        match self.format {
+            None => self.format = self.agent.session_format(),
+            // An explicit format that cannot carry an id would let the run
+            // succeed and then silently fail to update the binding, so the
+            // combination is refused here rather than discovered later.
+            Some(format) if !self.agent.format_carries_session(format) => {
+                return Err(crate::Error::Unsupported {
+                    agent: self.agent,
+                    what: "a named session under an output format that carries no session id",
+                });
+            }
+            Some(_) => {}
         }
         Ok(self)
+    }
+
+    /// Roughly how many bytes of command line this request needs.
+    ///
+    /// Only the caller-supplied text is counted; the flags themselves are a
+    /// bounded handful of short literals. Used to decide whether the prompt has
+    /// to move to stdin.
+    fn argv_weight(&self) -> usize {
+        self.prompt.len()
+            + self.system.as_ref().map_or(0, String::len)
+            + self.extra_args.iter().map(String::len).sum::<usize>()
     }
 
     /// The format this request will actually use.
@@ -243,9 +292,11 @@ impl Request {
             permission: self.permission,
             format: self.effective_format(),
             cont: self.cont.clone(),
-            // A prompt too large for the argv is piped instead, so a long one
-            // never fails with E2BIG.
-            stdin_prompt: self.prompt.len() >= STDIN_THRESHOLD,
+            // Measure the whole command line, not just the prompt: for Codex
+            // and Copilot the system text is prepended to it, and for Claude the
+            // system prompt rides its own argument. A small prompt with a large
+            // system prompt would otherwise still hit E2BIG.
+            stdin_prompt: self.argv_weight() >= STDIN_THRESHOLD,
         }
     }
 
@@ -277,7 +328,7 @@ mod tests {
     #[test]
     fn extra_args_land_after_everything_the_crate_builds() {
         let argv = Request::new(Agent::Claude, "hi")
-            .args(["--add-dir", "/tmp/extra"])
+            .unchecked_args(["--add-dir", "/tmp/extra"])
             .argv()
             .unwrap();
         assert_eq!(argv[argv.len() - 2..], ["--add-dir", "/tmp/extra"]);

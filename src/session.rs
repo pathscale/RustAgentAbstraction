@@ -86,6 +86,11 @@ impl SessionStore {
     }
 
     /// The file backing `name` for `project`. Pure path arithmetic.
+    ///
+    /// The agent is **not** part of the key on purpose: one name must resolve to
+    /// one file across agents, so asking for a Claude session under a name
+    /// Codex already owns is a loud [`Error::SessionConflict`] rather than two
+    /// unrelated conversations quietly sharing a name.
     #[must_use]
     pub fn path_of(&self, project: &Path, name: &str) -> PathBuf {
         self.dir
@@ -93,15 +98,33 @@ impl SessionStore {
             .join(format!("{}.json", encode_segment(name)))
     }
 
-    /// The stored record, or `None` when absent.
+    /// The stored record, or `None` when there is none.
     ///
-    /// A corrupt record reads as absent: the next turn starts a fresh
-    /// conversation, which is recoverable, rather than failing the run over a
-    /// cache the caller never asked about.
-    #[must_use]
-    pub fn get(&self, project: &Path, name: &str) -> Option<SessionRecord> {
-        let text = fs::read_to_string(self.path_of(project, name)).ok()?;
-        serde_json::from_str(&text).ok()
+    /// Only a genuinely absent file is `Ok(None)`. A permission error, an I/O
+    /// failure or a corrupt record is an [`Error::Store`], because treating
+    /// those as "no session" silently starts a new conversation and abandons
+    /// one the caller believes they are still in.
+    ///
+    /// # Errors
+    /// [`Error::Store`] if the record exists but cannot be read or parsed.
+    pub fn get(&self, project: &Path, name: &str) -> Result<Option<SessionRecord>> {
+        let path = self.path_of(project, name);
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(source) => {
+                return Err(Error::Store {
+                    path: path.display().to_string(),
+                    source,
+                });
+            }
+        };
+        serde_json::from_str(&text)
+            .map(Some)
+            .map_err(|e| Error::Store {
+                path: path.display().to_string(),
+                source: std::io::Error::new(std::io::ErrorKind::InvalidData, e),
+            })
     }
 
     /// Every session recorded for `project`, in unspecified order.
@@ -141,7 +164,7 @@ impl SessionStore {
                 what: "named sessions (it exposes no session id headlessly)",
             });
         }
-        let existing = self.get(project, name);
+        let existing = self.get(project, name)?;
         if let Some(record) = &existing {
             if record.agent != agent {
                 return Err(Error::SessionConflict {
@@ -188,13 +211,26 @@ impl SessionStore {
         name: &str,
         token: &str,
     ) -> Result<SessionRecord> {
+        // The same invariant `plan` enforces, applied here too: `bind` is
+        // public, so the check cannot live only on the path that happens to
+        // call it first.
+        if let Some(existing) = self.get(project, name)?
+            && existing.agent != agent
+        {
+            return Err(Error::SessionConflict {
+                name: name.to_string(),
+                bound: existing.agent,
+                requested: agent,
+            });
+        }
+
         let now = now_secs();
         let record = SessionRecord {
             name: name.to_string(),
             project: project.display().to_string(),
             agent,
             token: token.to_string(),
-            created: self.get(project, name).map_or(now, |r| r.created),
+            created: self.get(project, name)?.map_or(now, |r| r.created),
             updated: now,
         };
 
@@ -205,15 +241,26 @@ impl SessionStore {
         };
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(store_err)?;
+            restrict_to_owner(parent).map_err(store_err)?;
         }
         let mut text = serde_json::to_string_pretty(&record)
             .map_err(|e| store_err(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
         text.push('\n');
+
         // Write beside the target and rename, so a reader never observes a
-        // partial record.
-        let tmp = path.with_extension("json.tmp");
-        fs::write(&tmp, text).map_err(store_err)?;
-        fs::rename(&tmp, &path).map_err(store_err)?;
+        // partial record. The temp name carries the pid and a counter: a single
+        // shared `<name>.json.tmp` would let two concurrent writers for the same
+        // session scribble over each other's half-written file and then rename
+        // the result into place.
+        let tmp = path.with_extension(format!("{}.{}.tmp", std::process::id(), next_temp_id()));
+        write_private(&tmp, text.as_bytes()).map_err(store_err)?;
+        // Rename is atomic within a directory, so the last writer wins cleanly
+        // rather than producing a torn record.
+        fs::rename(&tmp, &path).map_err(|e| {
+            // Do not leave the temp file behind if the rename failed.
+            let _ = fs::remove_file(&tmp);
+            store_err(e)
+        })?;
         Ok(record)
     }
 
@@ -232,6 +279,50 @@ impl SessionStore {
             }),
         }
     }
+}
+
+/// A per-process counter making each temp filename unique, so concurrent writes
+/// to one session cannot share a scratch file.
+fn next_temp_id() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Write `bytes` to a newly created file that only the owner can read.
+///
+/// Session tokens resume conversations, so they are closer to a credential than
+/// to a cache entry and should not be readable by other users on the machine.
+/// Permissions are set at creation rather than afterwards, leaving no window
+/// where the file exists world-readable.
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(bytes)?;
+    // Flush to disk before the rename, so a crash cannot leave an empty record
+    // where a valid one is expected.
+    file.sync_all()
+}
+
+/// Restrict a directory to its owner. A no-op on platforms without Unix modes,
+/// where the parent directory's inherited ACL governs instead.
+fn restrict_to_owner(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
 }
 
 /// Seconds since the epoch. A pre-1970 clock reads as 0 rather than panicking;
@@ -415,7 +506,7 @@ mod tests {
         store
             .bind(Agent::Claude, &project, "Greet Flow ☕", "t-1")
             .unwrap();
-        let record = store.get(&project, "Greet Flow ☕").unwrap();
+        let record = store.get(&project, "Greet Flow ☕").unwrap().unwrap();
         assert_eq!(record.name, "Greet Flow ☕");
         assert_eq!(store.list(&project)[0].name, "Greet Flow ☕");
         fs::remove_dir_all(&store.dir).ok();
@@ -468,7 +559,7 @@ mod tests {
         assert_eq!(phase, Phase::Continue);
         assert_eq!(cont, Continue::Resume("sess-1".into()));
 
-        let record = store.get(&project, "chat").unwrap();
+        let record = store.get(&project, "chat").unwrap().unwrap();
         assert_eq!(record.token, "sess-1");
         assert_eq!(record.agent, Agent::Claude);
         fs::remove_dir_all(&store.dir).ok();
@@ -530,19 +621,21 @@ mod tests {
     }
 
     #[test]
-    fn a_corrupt_record_reads_as_absent_rather_than_failing() {
+    fn a_corrupt_record_is_reported_rather_than_silently_ignored() {
         let (store, project) = store("corrupt");
         let path = store.path_of(&project, "chat");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, b"{ not json").unwrap();
-        assert!(store.get(&project, "chat").is_none());
-        assert_eq!(
-            store
-                .plan(Agent::Claude, &project, "chat", false)
-                .unwrap()
-                .0,
-            Phase::Create
-        );
+        // Treating this as "no session" would silently abandon a conversation
+        // the caller believes they are still in.
+        assert!(matches!(
+            store.get(&project, "chat"),
+            Err(Error::Store { .. })
+        ));
+        assert!(matches!(
+            store.plan(Agent::Claude, &project, "chat", false),
+            Err(Error::Store { .. })
+        ));
         fs::remove_dir_all(&store.dir).ok();
     }
 
@@ -556,7 +649,7 @@ mod tests {
         assert_eq!(names, ["a", "b"]);
 
         store.forget(&project, "a").unwrap();
-        assert!(store.get(&project, "a").is_none());
+        assert!(store.get(&project, "a").unwrap().is_none());
         // Forgetting twice is not an error.
         store.forget(&project, "a").unwrap();
         assert_eq!(store.list(&project).len(), 1);
@@ -569,8 +662,8 @@ mod tests {
         let other = PathBuf::from("/home/me/other");
         store.bind(Agent::Claude, &project, "chat", "t-1").unwrap();
         store.bind(Agent::Claude, &other, "chat", "t-2").unwrap();
-        assert_eq!(store.get(&project, "chat").unwrap().token, "t-1");
-        assert_eq!(store.get(&other, "chat").unwrap().token, "t-2");
+        assert_eq!(store.get(&project, "chat").unwrap().unwrap().token, "t-1");
+        assert_eq!(store.get(&other, "chat").unwrap().unwrap().token, "t-2");
         fs::remove_dir_all(&store.dir).ok();
     }
 }

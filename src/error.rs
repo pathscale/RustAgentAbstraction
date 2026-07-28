@@ -124,6 +124,13 @@ pub enum Error {
         detail: String,
     },
 
+    /// [`crate::stream`] was called outside a Tokio runtime.
+    ///
+    /// Spawning the driver task needs a runtime context. Reporting this rather
+    /// than letting `tokio::spawn` panic keeps the fallible signature honest.
+    #[error("no Tokio runtime is running; call this from within one")]
+    NoRuntime,
+
     /// The task driving the run panicked or was cancelled, so there is no
     /// outcome to report.
     ///

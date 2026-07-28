@@ -53,15 +53,38 @@ pub struct Caps {
 }
 
 /// Permission posture for a run, mapped onto each agent's own vocabulary.
+///
+/// # What these do and do not guarantee
+///
+/// These postures constrain each CLI's **built-in** tools: its shell, its file
+/// writes, its sandbox. They do **not** constrain MCP servers, plugins or custom
+/// tools the agent is configured with. An MCP tool that files an issue, writes
+/// to a database or calls a deployment API is a separate tool category in all
+/// three CLIs and can still act during a nominally restricted run.
+///
+/// If a run must not cause remote side effects, the containment has to come from
+/// the agent's own configuration (which MCP servers are enabled at all), not
+/// from this enum. What is selected here is enforced by the CLI, and what the
+/// CLI does not model cannot be enforced from out here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Permission {
-    /// Read and search only; mutating tools are denied.
+    /// No writes to the local filesystem, and no shell where the CLI can gate
+    /// one.
+    ///
+    /// The strongest posture this crate can express, and still not a guarantee
+    /// of "no side effects": see the type-level note about MCP tools. Codex
+    /// enforces it with a read-only sandbox, which blocks writes but still
+    /// permits command execution.
     #[default]
     ReadOnly,
-    /// Plan without executing.
+    /// Ask the agent to plan rather than act.
+    ///
+    /// Claude and Copilot have a real plan mode. **Codex has none**, so this
+    /// maps to its read-only sandbox: writes are blocked, but the model is not
+    /// instructed to withhold execution the way a true plan mode would.
     Plan,
-    /// Allow file edits, but still gate shell commands.
+    /// Allow file edits, while still gating shell commands where the CLI can.
     Edit,
     /// Allow the agent's own default automation.
     Auto,
@@ -210,6 +233,18 @@ impl Agent {
         }
     }
 
+    /// Whether `format` can carry this agent's session id.
+    ///
+    /// Distinct from [`Agent::session_format`], which names the *preferred* one:
+    /// Claude reports its id under both `Json` and `Stream`, and only plain text
+    /// loses it. A named session needs this, not equality with the preferred
+    /// format, or streaming a named Claude session would be refused for no
+    /// reason.
+    #[must_use]
+    pub fn format_carries_session(self, format: Format) -> bool {
+        self.session_format().is_some() && format != Format::Text
+    }
+
     /// Reject a plan this agent cannot honour, before anything is spawned.
     fn check(self, plan: &Plan) -> Result<()> {
         let caps = self.caps();
@@ -340,9 +375,12 @@ fn argv_claude(plan: &Plan) -> Vec<String> {
 
     a.pair("--permission-mode", claude_mode(plan.permission));
     if plan.permission == Permission::ReadOnly {
-        // Remove the mutating tools outright. Reads still run via Read/Grep/Glob.
+        // Remove the mutating built-ins outright. Reads still run via
+        // Read/Grep/Glob. `mcp__*` covers every MCP tool: denying only the
+        // built-in writers would leave an MCP server free to mutate remote
+        // state during a run the caller asked to be read-only.
         a.bare("--disallowedTools");
-        for tool in ["Bash", "Edit", "Write", "NotebookEdit"] {
+        for tool in ["Bash", "Edit", "Write", "NotebookEdit", "mcp__*"] {
             a.arg(tool);
         }
     }
@@ -440,12 +478,12 @@ fn argv_copilot(plan: &Plan) -> Vec<String> {
     match plan.permission {
         Permission::Bypass | Permission::Auto => a.bare("--allow-all-paths"),
         // Deny beats allow, so this is allow-all minus the mutating tools.
-        Permission::ReadOnly => a
-            .bare("--allow-all-paths")
-            .bare("--deny-tool=shell")
-            .bare("--deny-tool=write"),
+        // `--allow-all-paths` is deliberately NOT set: it disables path
+        // verification entirely, which would widen filesystem reach in the one
+        // posture that exists to narrow it.
+        Permission::ReadOnly => a.bare("--deny-tool=shell").bare("--deny-tool=write"),
         // Edits run; shell stays denied so commands cannot.
-        Permission::Edit => a.bare("--allow-all-paths").bare("--deny-tool=shell"),
+        Permission::Edit => a.bare("--deny-tool=shell"),
         Permission::Plan => a.pair("--mode", "plan"),
     };
 

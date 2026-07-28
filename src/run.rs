@@ -29,11 +29,21 @@ const EVENT_BUFFER: usize = 256;
 /// A run in progress.
 ///
 /// Yields events through [`Run::recv`] and settles into an [`Outcome`] through
-/// [`Run::finish`]. Dropping it detaches the run; the child is not killed.
+/// [`Run::finish`].
+///
+/// **Dropping a `Run` kills the agent.** That is the safe default for the hosts
+/// this crate targets: closing a window or cancelling a request should stop the
+/// work, not leave an agent running invisibly, spending quota and touching
+/// files with nobody watching. Call [`Run::detach`] when background execution is
+/// genuinely what you want, or [`Run::cancel`] to stop one deterministically and
+/// wait for it to die.
 #[derive(Debug)]
 pub struct Run {
     events: mpsc::Receiver<Event>,
-    task: tokio::task::JoinHandle<Result<Outcome>>,
+    /// `None` only after [`Run::finish`], [`Run::cancel`] or [`Run::detach`]
+    /// has taken ownership, which is what stops `Drop` from aborting a run that
+    /// was already settled deliberately.
+    task: Option<tokio::task::JoinHandle<Result<Outcome>>>,
     argv: Vec<String>,
 }
 
@@ -44,9 +54,20 @@ impl Run {
     }
 
     /// The exact command line that was spawned.
+    ///
+    /// **This contains the prompt and any session id.** Treat it as sensitive:
+    /// logging it verbatim puts user content into your logs. Use
+    /// [`Run::redacted_argv`] for diagnostics.
     #[must_use]
     pub fn argv(&self) -> &[String] {
         &self.argv
+    }
+
+    /// The command line with prompt and session id replaced by placeholders,
+    /// safe to log.
+    #[must_use]
+    pub fn redacted_argv(&self) -> Vec<String> {
+        redact(&self.argv)
     }
 
     /// Wait for the run to finish.
@@ -58,7 +79,12 @@ impl Run {
     /// Whatever the run failed with. See [`Error`].
     pub async fn finish(mut self) -> Result<Outcome> {
         while self.events.recv().await.is_some() {}
-        match self.task.await {
+        // Taking the handle disarms the `Drop` guard: this run is settling
+        // normally, not being abandoned.
+        let Some(task) = self.task.take() else {
+            unreachable!("the handle is only taken by a consuming method")
+        };
+        match task.await {
             Ok(result) => result,
             // The driver task panicked or was cancelled. The process itself
             // started fine, so this is not a spawn failure and must not claim
@@ -73,6 +99,81 @@ impl Run {
             }),
         }
     }
+
+    /// Stop the run and wait until the agent is actually gone.
+    ///
+    /// Deterministic, unlike dropping: when this returns, the process and its
+    /// children have been signalled and reaped. Prefer it over `drop` when you
+    /// need to know the agent has stopped before doing something else, such as
+    /// mutating the files it was working on.
+    pub async fn cancel(mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+            // Aborting drops the driver's `Child`, whose `kill_on_drop` and
+            // process-group teardown do the actual killing. Awaiting the
+            // JoinError is what guarantees that has happened.
+            let _ = task.await;
+        }
+    }
+
+    /// Let the run continue after this handle goes away.
+    ///
+    /// The opposite of the default. Nothing can observe or stop the agent
+    /// afterwards, so reach for this only when an unsupervised background run
+    /// is genuinely intended.
+    pub fn detach(mut self) {
+        // Dropping the handle without aborting is what detaches a tokio task.
+        drop(self.task.take());
+    }
+}
+
+impl Drop for Run {
+    fn drop(&mut self) {
+        // Still holding the handle means the caller abandoned this run rather
+        // than finishing, cancelling or detaching it. Abort, which drops the
+        // driver's `Child` and triggers the kill path.
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
+/// Placeholders substituted for sensitive argv values.
+const REDACTED: &str = "<redacted>";
+
+/// Replace prompt and session-id values with a placeholder.
+///
+/// Flag *names* are kept so a redacted command line is still recognisable; only
+/// the values that carry user content or a resumable handle are removed.
+fn redact(argv: &[String]) -> Vec<String> {
+    /// Flags whose following argument is sensitive.
+    const SENSITIVE_FLAGS: &[&str] = &[
+        "-p",
+        "--prompt",
+        "--append-system-prompt",
+        "--system",
+        "--session-id",
+        "--resume",
+    ];
+    let mut out = Vec::with_capacity(argv.len());
+    let mut redact_next = false;
+    for (i, arg) in argv.iter().enumerate() {
+        if redact_next {
+            out.push(REDACTED.to_string());
+            redact_next = false;
+            continue;
+        }
+        redact_next = SENSITIVE_FLAGS.contains(&arg.as_str());
+        // Codex takes its prompt as the trailing positional rather than behind
+        // a flag, so the last argument is redacted unless it is a flag itself.
+        let trailing_prompt = i + 1 == argv.len() && !arg.starts_with('-') && i > 1;
+        out.push(if trailing_prompt {
+            REDACTED.to_string()
+        } else {
+            arg.clone()
+        });
+    }
+    out
 }
 
 /// Run `request` to completion, discarding the intermediate events.
@@ -92,16 +193,12 @@ pub async fn run(request: &Request) -> Result<Outcome> {
 /// [`Error::NotInstalled`] if the binary is missing, [`Error::Unsupported`] if
 /// the agent cannot honour the request, or [`Error::Spawn`] on an OS failure.
 pub fn stream(request: &Request) -> Result<Run> {
+    // `tokio::spawn` panics outside a runtime. A fallible signature must not
+    // hide that, so the context is checked and reported as an ordinary error.
+    let runtime = tokio::runtime::Handle::try_current().map_err(|_| Error::NoRuntime)?;
+
     let plan = request.plan();
     let argv = request.argv()?;
-
-    // Resolve on PATH first, so a missing agent is an actionable error with an
-    // install hint rather than a bare ENOENT out of the spawn.
-    which::which(&plan.bin).map_err(|_| Error::NotInstalled {
-        agent: request.agent,
-        bin: plan.bin.clone(),
-        hint: request.agent.install_hint(),
-    })?;
 
     let mut command = Command::new(&argv[0]);
     command
@@ -120,33 +217,123 @@ pub fn stream(request: &Request) -> Result<Run> {
     if let Some(cwd) = &request.cwd {
         command.current_dir(cwd);
     }
+    if request.clear_env {
+        command.env_clear();
+    }
     for (key, value) in &request.env {
         command.env(key, value);
     }
 
-    let child = command.spawn().map_err(|source| Error::Spawn {
-        bin: plan.bin.clone(),
-        source,
+    // Put the agent in its own process group so the whole tree can be signalled
+    // together. Killing only the CLI leaves the commands *it* spawned running:
+    // a build, a test run, a server, still holding files and credentials after
+    // the run is supposedly over.
+    // 0 means "make this child its own group leader". `tokio::process::Command`
+    // exposes this directly on unix.
+    #[cfg(unix)]
+    command.process_group(0);
+
+    let child = command.spawn().map_err(|source| {
+        // A missing binary is the common case and deserves an actionable error
+        // with an install hint. Reading it off the spawn avoids resolving PATH
+        // twice, and with it the window where the resolved path is replaced
+        // between the check and the exec.
+        if source.kind() == std::io::ErrorKind::NotFound {
+            Error::NotInstalled {
+                agent: request.agent,
+                bin: plan.bin.clone(),
+                hint: request.agent.install_hint(),
+            }
+        } else {
+            Error::Spawn {
+                bin: plan.bin.clone(),
+                source,
+            }
+        }
     })?;
 
     let (tx, rx) = mpsc::channel(EVENT_BUFFER);
     let request = request.clone();
-    let task = tokio::spawn(drive(child, request, tx));
+    let task = runtime.spawn(drive(child, request, tx));
     Ok(Run {
         events: rx,
-        task,
+        task: Some(task),
         argv,
     })
 }
 
+/// Owns the child and tears down its whole process group when dropped.
+///
+/// `kill_on_drop` alone is not enough: it kills the CLI, leaving the commands
+/// *it* spawned running. Since aborting the driver task drops this guard, the
+/// same teardown covers cancellation, a dropped [`Run`] and a timeout, without
+/// each path having to remember to do it.
+struct ChildGuard {
+    child: Child,
+    /// Cleared once the child has been reaped, so a pid the OS may since have
+    /// recycled is never signalled.
+    armed: bool,
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            kill_process_group(&self.child);
+        }
+    }
+}
+
+/// Signal an entire process group, so commands the agent spawned die with it.
+///
+/// Best effort by nature: the group may already be gone, which is not a failure.
+/// On Windows there is no equivalent here and only the direct child is killed;
+/// containing a tree there needs a Job Object, which this crate does not yet
+/// set up.
+#[cfg(unix)]
+fn kill_process_group(child: &tokio::process::Child) {
+    if let Some(pid) = child.id() {
+        // Negating the pid targets the group, which `process_group(0)` made this
+        // child the leader of.
+        // SAFETY: `libc::kill` has no safe wrapper. The pid comes from a live
+        // `Child`, and signalling a group that has already exited returns ESRCH
+        // rather than doing anything undefined.
+        // A pid always fits in i32; the cast back is how the group is addressed.
+        let Ok(pid) = i32::try_from(pid) else { return };
+        #[allow(unsafe_code)]
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_process_group(_child: &tokio::process::Child) {}
+
 /// Feed the child, read both its pipes, and assemble the outcome.
-async fn drive(mut child: Child, request: Request, events: mpsc::Sender<Event>) -> Result<Outcome> {
+#[allow(
+    clippy::too_many_lines,
+    reason = "one linear lifecycle: feed, read, wait, classify. Splitting it \
+              would thread the child, parser, buffers and cancellation state \
+              through helpers and obscure the ordering that matters, such as \
+              killing the group before reaping."
+)]
+async fn drive(child: Child, request: Request, events: mpsc::Sender<Event>) -> Result<Outcome> {
+    // From here on the child is owned by a guard, so every exit path from this
+    // task, including an abort, takes the process group with it.
+    let mut child = ChildGuard { child, armed: true };
     let plan = request.plan();
     let bin = plan.bin.clone();
 
+    // An assigned id is known before anything runs, so record it now. This is
+    // what makes the session survive a run that times out, crashes, or is
+    // cancelled: the binding does not depend on reaching the end.
+    if let Some(token) = preassigned_token(&request) {
+        persist_session(&request, &token)?;
+    }
+
     // Deliver a piped prompt and close the pipe, or the agent waits on EOF.
     if plan.stdin_prompt {
-        if let Some(mut stdin) = child.stdin.take() {
+        if let Some(mut stdin) = child.child.stdin.take() {
             let prompt = request.agent.effective_prompt(&plan);
             stdin
                 .write_all(prompt.as_bytes())
@@ -161,7 +348,7 @@ async fn drive(mut child: Child, request: Request, events: mpsc::Sender<Event>) 
 
     // Drain stderr on its own task: a full stderr pipe blocks the child even
     // while stdout still has room.
-    let stderr = child.stderr.take();
+    let stderr = child.child.stderr.take();
     let stderr_task = tokio::spawn(async move {
         let mut buf = String::new();
         if let Some(handle) = stderr {
@@ -175,13 +362,17 @@ async fn drive(mut child: Child, request: Request, events: mpsc::Sender<Event>) 
         buf
     });
 
-    let stdout = child.stdout.take();
+    let stdout = child.child.stdout.take();
     let mut parser = Parser::new(request.agent, plan.format);
     // Raw stdout is retained only as a fallback answer for a run that exited
     // cleanly without producing a structured one, and as evidence when
     // classifying a failure. It is capped for the same reason as everything
     // else here: an agent can stream for hours.
     let mut raw = String::new();
+    // Tracks the first `Started`, so the binding is written once, and carries a
+    // store failure back out instead of discarding it.
+    let mut bound = false;
+    let mut persist_result: Result<()> = Ok(());
 
     let read_stdout = async {
         if let Some(handle) = stdout {
@@ -189,6 +380,15 @@ async fn drive(mut child: Child, request: Request, events: mpsc::Sender<Event>) 
             while let Some(line) = lines.next_line().await? {
                 append_capped(&mut raw, &line);
                 for event in parser.push(&line) {
+                    // Bind a printed id the moment it appears rather than at the
+                    // end. Codex announces its thread before answering, so a
+                    // turn killed mid-answer stays resumable.
+                    if let Event::Started { session, .. } = &event
+                        && !bound
+                    {
+                        bound = true;
+                        persist_result = persist_session(&request, session);
+                    }
                     // A receiver that went away is not a failure: the run should
                     // still finish and produce its outcome.
                     if events.send(event).await.is_err() {
@@ -206,14 +406,19 @@ async fn drive(mut child: Child, request: Request, events: mpsc::Sender<Event>) 
         Some(limit) => {
             match tokio::time::timeout(limit, async {
                 read_stdout.await?;
-                child.wait().await
+                child.child.wait().await
             })
             .await
             {
                 Ok(result) => result,
                 Err(_elapsed) => {
-                    // Kill, then reap, so no zombie is left behind.
-                    let _ = child.kill().await;
+                    // Order matters: signal the group *before* reaping. Reaping
+                    // clears the child's pid, and the group kill needs that pid
+                    // to target the group, so doing it the other way round
+                    // silently leaves every grandchild running.
+                    kill_process_group(&child.child);
+                    let _ = child.child.kill().await;
+                    child.armed = false;
                     return Err(Error::Timeout {
                         bin,
                         timeout: limit,
@@ -223,7 +428,7 @@ async fn drive(mut child: Child, request: Request, events: mpsc::Sender<Event>) 
             }
         }
         None => match read_stdout.await {
-            Ok(()) => child.wait().await,
+            Ok(()) => child.child.wait().await,
             Err(source) => Err(source),
         },
     }
@@ -231,6 +436,9 @@ async fn drive(mut child: Child, request: Request, events: mpsc::Sender<Event>) 
         bin: bin.clone(),
         source,
     })?;
+
+    // The child has been reaped, so its pid must not be signalled again.
+    child.armed = false;
 
     drop(events);
     let stderr = stderr_task.await.unwrap_or_default();
@@ -244,11 +452,26 @@ async fn drive(mut child: Child, request: Request, events: mpsc::Sender<Event>) 
         terminal.text = raw.trim().to_string();
     }
 
-    if exit_code != 0 {
+    // A provider refusal is not always an exit code. Claude can report a
+    // blocking `rate_limit_event` and still exit 0, and the crate promises that
+    // quota refusals surface as `Error::RateLimited`, so the terminal state is
+    // checked regardless of how the process exited.
+    let quota_blocked = terminal
+        .rate_limit
+        .as_ref()
+        .is_some_and(crate::outcome::RateLimit::is_blocking);
+    if exit_code != 0 || quota_blocked {
         return Err(classify(&bin, exit_code, &stderr, &raw, &terminal));
     }
 
-    persist_session(&request, &terminal);
+    // A fork lands on a *new* id the agent only reveals at the end, so the name
+    // has to be repointed once the run settles. Everything else was bound above.
+    persist_result?;
+    if let Some(token) = &terminal.session
+        && !bound
+    {
+        persist_session(&request, token)?;
+    }
     Ok(Outcome {
         agent: request.agent,
         session: terminal.session,
@@ -312,28 +535,29 @@ fn first_meaningful_line(text: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Write the session binding back, if this run was attached to a name.
+/// Write the session binding back, reporting any store failure.
 ///
-/// Best-effort: a store that cannot be written must not discard a completed
-/// run's result. The next turn simply starts a new conversation.
-fn persist_session(request: &Request, terminal: &Terminal) {
+/// Called as soon as an id is known rather than only on a clean exit. Waiting
+/// for success would lose the binding for exactly the runs where continuity
+/// matters most: a timeout, a crash, or a cancelled turn.
+fn persist_session(request: &Request, token: &str) -> Result<()> {
     let Some(binding) = &request.binding else {
-        return;
+        return Ok(());
     };
-    // Prefer the id the agent reported. For a minted session it is the one we
-    // assigned, so the two agree; for a forked one the agent reports the *new*
-    // branch, which is what the name should now follow.
-    let token = terminal
-        .session
-        .clone()
-        .or_else(|| match &request.plan().cont {
-            Continue::NewWith(id) => Some(id.clone()),
-            _ => None,
-        });
-    if let Some(token) = token {
-        let _ = binding
-            .store
-            .bind(request.agent, &binding.project, &binding.name, &token);
+    binding
+        .store
+        .bind(request.agent, &binding.project, &binding.name, token)
+        .map(|_| ())
+}
+
+/// The id this run is already known by before it starts, if any.
+///
+/// Only a caller-assigned id qualifies: a printed id does not exist yet. This
+/// is what makes an assigned session survive a run that never finishes.
+fn preassigned_token(request: &Request) -> Option<String> {
+    match &request.plan().cont {
+        Continue::NewWith(id) => Some(id.clone()),
+        _ => None,
     }
 }
 
@@ -407,6 +631,51 @@ mod tests {
         };
         assert_eq!(code, 2);
         assert_eq!(stderr, "real problem");
+    }
+
+    /// Prompts and session ids ride the argv, and `Run::argv` invites logging
+    /// it. The redacted form must keep the shape while dropping the content.
+    #[test]
+    fn redaction_removes_prompts_and_session_ids_but_keeps_flags() {
+        let argv = crate::Request::new(Agent::Claude, "my secret prompt")
+            .system("secret system")
+            .session_id("11111111-2222-3333-4444-555555555555")
+            .argv()
+            .unwrap();
+        let safe = redact(&argv);
+
+        for secret in [
+            "my secret prompt",
+            "secret system",
+            "11111111-2222-3333-4444-555555555555",
+        ] {
+            assert!(
+                !safe.iter().any(|a| a.contains(secret)),
+                "{secret:?} survived redaction: {safe:?}"
+            );
+        }
+        // Still recognisable as the same command.
+        assert_eq!(safe[0], "claude");
+        assert!(safe.contains(&"--permission-mode".to_string()));
+        assert!(safe.contains(&"--session-id".to_string()));
+    }
+
+    #[test]
+    fn codex_trailing_prompt_is_redacted_even_without_a_flag() {
+        let argv = crate::Request::new(Agent::Codex, "my secret prompt")
+            .argv()
+            .unwrap();
+        let safe = redact(&argv);
+        assert_eq!(safe.last().unwrap(), REDACTED);
+        assert_eq!(safe[1], "exec", "the subcommand must survive");
+    }
+
+    /// `stream` is synchronous but spawns a task. Outside a runtime that would
+    /// panic, which a `Result`-returning function must not do.
+    #[test]
+    fn stream_outside_a_runtime_errors_instead_of_panicking() {
+        let err = stream(&crate::Request::new(Agent::Claude, "hi")).unwrap_err();
+        assert!(matches!(err, Error::NoRuntime), "got {err:?}");
     }
 
     #[tokio::test]
