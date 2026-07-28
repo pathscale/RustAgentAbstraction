@@ -138,24 +138,31 @@ pub const NETWORK_ENV: &[&str] = &[
 
 /// Which of the host's environment variables reach the agent.
 ///
-/// The default is [`EnvPolicy::Inherit`], matching how a CLI behaves when run
-/// from a shell. In an embedded host that also hands the agent, and every
-/// command it runs, whatever unrelated secrets the process happens to hold:
-/// cloud credentials, CI tokens, database URLs.
+/// **The default is [`EnvPolicy::Minimal`].** Inheriting the whole environment
+/// is what a CLI gets from a shell, but this crate is embedded in processes that
+/// hold unrelated secrets, and full inheritance hands every one of them to the
+/// agent and to every command the agent runs. That is a decision worth making
+/// deliberately, so it is the opt-in rather than the default.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum EnvPolicy {
-    /// Pass the whole parent environment through.
-    #[default]
-    Inherit,
     /// Pass through only what the selected agent needs, per
     /// [`Agent::essential_env`], plus anything set with [`crate::Request::env`].
     ///
     /// The crate owns this list rather than the caller, because "what does this
     /// CLI need to work" is knowledge about the agent, and an incomplete
     /// hand-written list produces a run that fails in a way that looks like an
-    /// auth problem.
+    /// auth problem. Every agent is verified to authenticate under it by the
+    /// live test suite.
+    #[default]
     Minimal,
+    /// Pass the whole parent environment through, as a shell would.
+    ///
+    /// Correct when the host process holds nothing the agent should not see, or
+    /// when something environment-specific (a proxy, a custom CA, a vendor
+    /// variable this crate does not know about) has to reach the CLI and
+    /// enumerating it is impractical.
+    Inherit,
     /// Pass through only these names, plus anything set with
     /// [`crate::Request::env`]. Names unset in the parent are skipped.
     Only(Vec<String>),

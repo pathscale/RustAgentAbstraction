@@ -52,8 +52,9 @@ pub(crate) struct Binding {
 impl Request {
     /// A request for `agent` with `prompt`.
     ///
-    /// Defaults are deliberately conservative: [`Permission::ReadOnly`], and the
-    /// agent's structured output format. Widen them explicitly.
+    /// Defaults are deliberately conservative: [`Permission::ReadOnly`],
+    /// [`EnvPolicy::Minimal`], and the agent's structured output format. Widen
+    /// them explicitly.
     pub fn new(agent: Agent, prompt: impl Into<String>) -> Self {
         Self {
             agent,
@@ -67,7 +68,7 @@ impl Request {
             cwd: None,
             env: Vec::new(),
             extra_args: Vec::new(),
-            env_policy: EnvPolicy::Inherit,
+            env_policy: EnvPolicy::Minimal,
             timeout: None,
             binding: None,
         }
@@ -127,16 +128,15 @@ impl Request {
 
     /// Choose which of the host's environment variables reach the agent.
     ///
-    /// Defaults to [`EnvPolicy::Inherit`]. [`EnvPolicy::Minimal`] is the one to
-    /// reach for when embedding in a process that holds unrelated secrets: it
-    /// passes through only what the selected agent actually needs, a list the
-    /// crate maintains per agent, so it isolates without a caller having to
-    /// work out what to put back.
+    /// Defaults to [`EnvPolicy::Minimal`], which passes through only what the
+    /// selected agent needs. Reach for [`EnvPolicy::Inherit`] when the host
+    /// holds nothing the agent should not see, or when something this crate
+    /// does not know about has to reach the CLI.
     ///
     /// ```no_run
     /// # use agent_abstraction::{Agent, EnvPolicy, Request};
     /// let request = Request::new(Agent::Claude, "review this")
-    ///     .env_policy(EnvPolicy::Minimal);
+    ///     .env_policy(EnvPolicy::Inherit);
     /// ```
     #[must_use]
     pub fn env_policy(mut self, policy: EnvPolicy) -> Self {
@@ -369,10 +369,17 @@ impl Request {
 mod tests {
     use super::*;
 
+    /// The defaults are the safe posture, so a caller who configures nothing
+    /// does not get the permissive one by accident.
     #[test]
-    fn defaults_are_read_only_and_structured() {
+    fn defaults_are_read_only_isolated_and_structured() {
         let request = Request::new(Agent::Claude, "hi");
         assert_eq!(request.permission, Permission::ReadOnly);
+        assert_eq!(
+            request.env_policy,
+            EnvPolicy::Minimal,
+            "full environment inheritance must be an explicit decision"
+        );
         assert_eq!(request.effective_format(), Format::Json);
         let argv = request.argv().unwrap();
         assert!(argv.contains(&"--disallowedTools".to_string()));
