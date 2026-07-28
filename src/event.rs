@@ -272,6 +272,8 @@ pub struct Terminal {
     pub unparsed: usize,
     /// The first line that failed to parse, as evidence for the above.
     pub first_unparsed: Option<String>,
+    /// The schema-conforming answer, where the agent reports one separately.
+    pub structured: Option<Value>,
 }
 
 /// Incrementally turns one agent's output into [`Event`]s and a [`Terminal`].
@@ -475,6 +477,11 @@ impl Parser {
                 self.terminal_seen = true;
                 if let Some(text) = v.get("result").and_then(Value::as_str) {
                     self.term.text = text.to_string();
+                }
+                // Claude returns the conforming value as its own field, so it
+                // needs no re-parsing out of the answer text.
+                if let Some(value) = v.get("structured_output") {
+                    self.term.structured = Some(value.clone());
                 }
                 self.term.usage = claude_usage(v);
                 self.term.stop = if v.get("is_error").and_then(Value::as_bool) == Some(true) {

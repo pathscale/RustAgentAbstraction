@@ -513,3 +513,98 @@ async fn installed_agents_report_their_login_state() {
         eprintln!("{agent}: {}", status.summary());
     }
 }
+
+/// Structured output is the capability a consumer needs to get findings back as
+/// data rather than prose to re-parse. The two CLIs deliver it differently,
+/// Claude inline and Codex through a file this crate writes, so this proves the
+/// unified interface against both rather than against the flag mapping alone.
+#[tokio::test]
+#[ignore = "spawns a real agent and consumes quota"]
+async fn a_schema_constrains_the_answer_to_data() {
+    const SCHEMA: &str = r#"{
+        "type": "object",
+        "properties": {"name": {"type": "string"}, "age": {"type": "integer"}},
+        "required": ["name", "age"],
+        "additionalProperties": false
+    }"#;
+
+    for agent in [Agent::Claude, Agent::Codex] {
+        if !available(agent) {
+            continue;
+        }
+        let request = Request::new(agent, "Alice is 30 years old.")
+            .permission(Permission::ReadOnly)
+            .timeout(Duration::from_secs(180))
+            .schema(SCHEMA);
+        let request = match agent {
+            Agent::Claude => request.model("haiku"),
+            _ => request,
+        };
+
+        let outcome = run(&request)
+            .await
+            .unwrap_or_else(|e| panic!("{agent} schema run failed: {e}"));
+
+        let value = outcome
+            .structured
+            .unwrap_or_else(|| panic!("{agent} returned no structured answer: {:?}", outcome.text));
+        assert_eq!(value["name"], "Alice", "{agent}: {value}");
+        assert_eq!(value["age"], 30, "{agent}: {value}");
+    }
+}
+
+/// Copilot has no schema support, so asking must fail before spawning rather
+/// than returning prose that a caller would try to parse as data.
+#[tokio::test]
+async fn copilot_refuses_a_schema_before_spawning() {
+    let err = Request::new(Agent::Copilot, "hi")
+        .schema(r#"{"type":"object"}"#)
+        .argv()
+        .unwrap_err();
+    assert!(
+        matches!(err, agent_abstraction::Error::Unsupported { .. }),
+        "got {err:?}"
+    );
+}
+
+/// The schema file Codex reads must not outlive the run that needed it.
+#[tokio::test]
+#[ignore = "spawns a real agent and consumes quota"]
+async fn a_codex_schema_file_is_cleaned_up() {
+    if !available(Agent::Codex) {
+        return;
+    }
+    let before = schema_files_in_temp();
+    let outcome = run(&Request::new(Agent::Codex, "Alice is 30 years old.")
+        .permission(Permission::ReadOnly)
+        .timeout(Duration::from_secs(180))
+        // `additionalProperties: false` is mandatory for Codex: without it the
+        // provider rejects the schema with a 400 before the model runs.
+        .schema(
+            r#"{"type":"object","properties":{"name":{"type":"string"}},
+                "required":["name"],"additionalProperties":false}"#,
+        ))
+    .await
+    .expect("run failed");
+
+    assert!(outcome.structured.is_some());
+    assert_eq!(
+        schema_files_in_temp(),
+        before,
+        "a schema file was left behind in the temp directory"
+    );
+}
+
+/// Count this crate's schema files currently in the temp directory.
+fn schema_files_in_temp() -> usize {
+    std::fs::read_dir(std::env::temp_dir()).map_or(0, |entries| {
+        entries
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("agent-abstraction-schema-")
+            })
+            .count()
+    })
+}

@@ -105,6 +105,12 @@ pub struct Outcome {
     pub unparsed: usize,
     /// The first line that failed to parse.
     pub first_unparsed: Option<String>,
+    /// The answer parsed against the schema given to [`crate::Request::schema`].
+    ///
+    /// `None` when no schema was asked for, or when the agent's answer did not
+    /// parse as JSON. Never a re-interpretation of prose: this is only set from
+    /// a value the agent produced under a schema.
+    pub structured: Option<serde_json::Value>,
 }
 
 impl Outcome {

@@ -126,6 +126,32 @@ the first one's conversation. Uppercase is encoded too, since macOS and Windows 
 case-insensitive and would otherwise collide `Chat` with `chat`. The record keeps your
 original name, so `list()` hands back what you passed, not a mangled segment.
 
+## Structured answers
+
+When the answer is data rather than prose, constrain it with a JSON Schema and read it
+back parsed instead of guessing at formatting the model never promised:
+
+```rust
+let outcome = run(&Request::new(Agent::Codex, "Alice is 30 years old.")
+    .schema(r#"{"type":"object",
+                "properties":{"name":{"type":"string"},"age":{"type":"integer"}},
+                "required":["name","age"],"additionalProperties":false}"#))
+    .await?;
+
+assert_eq!(outcome.structured.unwrap()["name"], "Alice");
+```
+
+The delivery differs and is hidden: Claude takes the schema inline and reports the value in
+its own field, Codex reads it from a file this crate writes and removes, and returns the
+value as its answer text. **Copilot 1.0.75 has no schema support at all**, so asking is an
+`Error::Unsupported` rather than prose dressed up as data.
+
+**Write schemas strictly.** Codex sends yours to OpenAI's structured-output API, which
+requires `"additionalProperties": false` on every object and every property in `required`.
+Without it the request fails with a 400 before the model runs. Claude is more forgiving, so
+a schema that works there can still fail on Codex; writing to the stricter rule keeps one
+schema usable for both.
+
 ## Cancellation
 
 **Dropping a `Run` kills the agent, and everything it spawned.** Closing a window or

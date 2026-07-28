@@ -51,6 +51,21 @@ pub struct Caps {
     /// Whether the agent takes a real system-prompt flag. When false the system
     /// text is prepended to the prompt so it still reaches the model.
     pub native_system: bool,
+    /// How the agent accepts a JSON Schema for its answer, if at all.
+    pub schema: SchemaSupport,
+}
+
+/// How an agent accepts a JSON Schema constraining its answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemaSupport {
+    /// The schema rides the command line (`claude --json-schema <schema>`).
+    Inline,
+    /// The schema must be a file the agent reads
+    /// (`codex exec --output-schema <FILE>`), so the runner writes one.
+    File,
+    /// No structured-output support. Asking is an error rather than a prose
+    /// answer dressed up as data.
+    None,
 }
 
 /// Permission posture for a run, mapped onto each agent's own vocabulary.
@@ -216,6 +231,15 @@ pub struct Plan {
     pub cont: Continue,
     /// True when the prompt is piped on stdin instead of riding the argv.
     pub stdin_prompt: bool,
+    /// A JSON Schema the answer must conform to, as text.
+    ///
+    /// Delivered differently per agent: Claude takes it inline, Codex takes a
+    /// path, so this is the source and `schema_file` is where the runner put it
+    /// when a file was needed.
+    pub schema: Option<String>,
+    /// Path to the schema on disk, materialized by the runner for agents that
+    /// take a file rather than an inline value.
+    pub schema_file: Option<String>,
 }
 
 /// Prompts at or above this many bytes are piped on stdin rather than placed on
@@ -416,6 +440,9 @@ impl Agent {
                 fork: true,
                 events: true,
                 native_system: true,
+                // Verified: `--json-schema <inline>` puts the conforming value
+                // in the result document's `structured_output`.
+                schema: SchemaSupport::Inline,
             },
             // `codex exec --json` emits `thread_id`; continuation is the
             // `resume` subcommand and is linear (`codex fork` is TUI-only).
@@ -424,6 +451,9 @@ impl Agent {
                 fork: false,
                 events: true,
                 native_system: false,
+                // Verified: `--output-schema <FILE>` makes the final
+                // `agent_message` the conforming JSON, with no separate field.
+                schema: SchemaSupport::File,
             },
             // Verified against Copilot CLI 1.0.75: `--session-id <uuid>` both
             // mints a new session and resumes an existing one (one flag, both
@@ -434,6 +464,8 @@ impl Agent {
                 fork: false,
                 events: true,
                 native_system: false,
+                // Copilot 1.0.75 exposes no schema flag at all.
+                schema: SchemaSupport::None,
             },
         }
     }
@@ -480,6 +512,12 @@ impl Agent {
             return Err(Error::Unsupported {
                 agent: self,
                 what: "assigning a session id up front",
+            });
+        }
+        if plan.schema.is_some() && caps.schema == SchemaSupport::None {
+            return Err(Error::Unsupported {
+                agent: self,
+                what: "constraining its answer to a JSON schema",
             });
         }
         if plan.format == Format::Stream && !caps.events {
@@ -693,6 +731,10 @@ fn argv_claude(plan: &Plan) -> Vec<Arg> {
             Format::Stream => "stream-json",
         },
     );
+    if let Some(schema) = &plan.schema {
+        // Inline, and the conforming value comes back in `structured_output`.
+        a.secret("--json-schema", schema, Sensitivity::Prompt);
+    }
     if plan.format == Format::Stream {
         // Claude refuses `-p --output-format stream-json` without it:
         // "--print with --output-format=stream-json requires --verbose".
@@ -741,6 +783,15 @@ fn argv_codex(plan: &Plan) -> Vec<Arg> {
     };
 
     a.opt("--model", plan.model.as_ref());
+    // Codex reads the schema from a file, which the runner writes before the
+    // spawn. `Request::argv` has no file to name, so it shows a placeholder:
+    // the preview is for display, and the real path exists only at spawn time.
+    if plan.schema.is_some() {
+        a.pair(
+            "--output-schema",
+            plan.schema_file.as_deref().unwrap_or("<schema-file>"),
+        );
+    }
     // `--json` is Codex's event stream and the only place `thread_id` appears.
     if plan.format != Format::Text {
         a.bare("--json");
@@ -827,6 +878,8 @@ mod tests {
             format: Format::Json,
             cont: Continue::New,
             stdin_prompt: false,
+            schema: None,
+            schema_file: None,
         }
     }
 
@@ -1022,6 +1075,55 @@ mod tests {
     /// `codex exec resume` rejects `--sandbox` and takes `-c sandbox_mode=`
     /// instead. Getting this wrong makes every second turn fail with an
     /// "unexpected argument" error, which only a multi-turn run reveals.
+    /// The two CLIs take a schema differently, and the difference is the
+    /// whole reason this needs handling rather than one shared flag.
+    #[test]
+    fn each_agent_takes_a_schema_in_its_own_shape() {
+        let schema = r#"{"type":"object"}"#;
+
+        let mut claude = plan("claude");
+        claude.schema = Some(schema.into());
+        let a = argv(Agent::Claude, &claude);
+        assert_eq!(
+            a[pos(&a, "--json-schema").unwrap() + 1],
+            schema,
+            "claude takes it inline"
+        );
+
+        let mut codex = plan("codex");
+        codex.schema = Some(schema.into());
+        codex.schema_file = Some("/tmp/s.json".into());
+        let a = argv(Agent::Codex, &codex);
+        assert_eq!(
+            a[pos(&a, "--output-schema").unwrap() + 1],
+            "/tmp/s.json",
+            "codex takes a path, never the schema itself"
+        );
+        assert!(!a.iter().any(|arg| arg.contains("\"type\"")));
+    }
+
+    /// Copilot 1.0.75 has no schema flag, and a prose answer presented as data
+    /// is exactly the silent downgrade this crate refuses elsewhere.
+    #[test]
+    fn copilot_refuses_a_schema_rather_than_answering_in_prose() {
+        let mut p = plan("copilot");
+        p.schema = Some(r#"{"type":"object"}"#.into());
+        assert!(matches!(
+            Agent::Copilot.argv(&p),
+            Err(Error::Unsupported { .. })
+        ));
+    }
+
+    /// A caller inspecting the command before running it has no file yet, since
+    /// it is written at spawn time.
+    #[test]
+    fn a_codex_schema_preview_shows_a_placeholder_path() {
+        let mut p = plan("codex");
+        p.schema = Some(r#"{"type":"object"}"#.into());
+        let a = argv(Agent::Codex, &p);
+        assert_eq!(a[pos(&a, "--output-schema").unwrap() + 1], "<schema-file>");
+    }
+
     #[test]
     fn codex_sets_the_sandbox_by_flag_when_fresh_and_by_config_when_resuming() {
         let mut fresh = plan("codex");

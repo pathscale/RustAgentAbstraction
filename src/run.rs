@@ -284,6 +284,22 @@ pub fn stream(request: &Request) -> Result<Run> {
     // hide that, so the context is checked and reported as an ordinary error.
     let runtime = tokio::runtime::Handle::try_current().map_err(|_| Error::NoRuntime)?;
 
+    // Written before the argv is built, because the argv has to name it.
+    let schema_file = match (&request.schema, request.agent.caps().schema) {
+        (Some(schema), crate::agent::SchemaSupport::File) => {
+            Some(SchemaFile::write(schema).map_err(|source| Error::Spawn {
+                bin: request.agent.bin().to_string(),
+                source,
+            })?)
+        }
+        _ => None,
+    };
+    let mut request = request.clone();
+    if let Some(file) = &schema_file {
+        request.schema_file = Some(file.0.display().to_string());
+    }
+    let request = &request;
+
     let plan = request.plan();
     let typed = request.typed_argv()?;
     let argv: Vec<String> = typed.iter().map(|a| a.value.clone()).collect();
@@ -361,14 +377,13 @@ pub fn stream(request: &Request) -> Result<Run> {
     let (tx, rx) = mpsc::channel(EVENT_BUFFER);
     let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
     let reaped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reaped_for_task = std::sync::Arc::clone(&reaped);
     let request = request.clone();
-    let task = runtime.spawn(drive(
-        child,
-        request,
-        tx,
-        cancel_rx,
-        std::sync::Arc::clone(&reaped),
-    ));
+    let task = runtime.spawn(async move {
+        // Moved in so the file outlives the run and is removed with it.
+        let _schema_file = schema_file;
+        drive(child, request, tx, cancel_rx, reaped_for_task).await
+    });
     Ok(Run {
         events: rx,
         typed,
@@ -387,6 +402,45 @@ fn inherit_named<S: AsRef<str>>(command: &mut Command, names: &[S]) {
         if let Some(value) = std::env::var_os(name.as_ref()) {
             command.env(name.as_ref(), value);
         }
+    }
+}
+
+/// A schema file written for one run, removed when the run ends.
+///
+/// Codex reads its schema from disk, so the file has to outlive the spawn and
+/// not outlive the process. Tying it to a guard means every exit path removes
+/// it, including a cancel or a timeout, without each one remembering.
+struct SchemaFile(std::path::PathBuf);
+
+impl SchemaFile {
+    /// Write `schema` somewhere the agent can read it.
+    fn write(schema: &str) -> std::io::Result<SchemaFile> {
+        use std::io::Write as _;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+        let path = std::env::temp_dir().join(format!(
+            "agent-abstraction-schema-{}-{}.json",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        // A schema can encode what a caller is looking for, so it is no more
+        // public than the prompt.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        options.open(&path)?.write_all(schema.as_bytes())?;
+        Ok(SchemaFile(path))
+    }
+}
+
+impl Drop for SchemaFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
     }
 }
 
@@ -619,6 +673,13 @@ async fn drive(
     // A fork lands on a *new* id the agent only reveals at the end, so the name
     // has to be repointed once the run settles. Everything else was bound above.
     persist_result?;
+    // Resolved before the terminal is consumed by the Outcome below.
+    let structured = terminal.structured.clone().or_else(|| {
+        request
+            .schema
+            .as_ref()
+            .and_then(|_| serde_json::from_str(&terminal.text).ok())
+    });
     if let Some(token) = &terminal.session
         && !bound
     {
@@ -635,6 +696,10 @@ async fn drive(
         stderr,
         unparsed: terminal.unparsed,
         first_unparsed: terminal.first_unparsed,
+        // Claude reports the conforming value separately; Codex returns it as
+        // the answer text, so that is parsed only when a schema was asked for.
+        // Prose is never reinterpreted as data.
+        structured,
     })
 }
 
@@ -727,8 +792,29 @@ fn classify(bin: &str, code: i32, stderr: &str, stdout: &str, terminal: &Termina
     Error::Failed {
         bin: bin.to_string(),
         code,
-        stderr: first_meaningful_line(stderr).unwrap_or_default(),
+        // Fall back to stdout when stderr explains nothing. Codex reports a
+        // rejected schema as an `{"type":"error"}` event on *stdout* while
+        // stderr carries only "Reading additional input from stdin...", so
+        // reporting stderr alone describes the failure as a status message.
+        stderr: first_meaningful_line(stderr)
+            .filter(|line| looks_explanatory(line))
+            .or_else(|| first_meaningful_line(stdout))
+            .or_else(|| first_meaningful_line(stderr))
+            .unwrap_or_default(),
     }
+}
+
+/// Whether a line plausibly explains a failure rather than narrating progress.
+fn looks_explanatory(line: &str) -> bool {
+    const NOISE: &[&str] = &[
+        "reading additional input",
+        "reading prompt",
+        "waiting",
+        "connecting",
+        "loading",
+    ];
+    let lower = line.to_ascii_lowercase();
+    !NOISE.iter().any(|noise| lower.contains(noise))
 }
 
 /// The CLI's complaint, if it refused an argument.
@@ -771,13 +857,41 @@ fn looks_rate_limited(text: &str) -> bool {
     .any(|needle| lower.contains(needle))
 }
 
-/// The first non-blank line, trimmed. Enough to identify a failure without
-/// pasting an entire stack trace into an error message.
+/// The most useful line of a CLI's output for an error message.
+///
+/// Not simply the first non-blank one. CLIs open with progress and status
+/// chatter, so the first line is often "Reading additional input from stdin..."
+/// while the actual cause is further down. That turns a report into a
+/// misdirection: it looks like an explanation and is not one.
+///
+/// So a line that looks like an error wins, and the first non-blank line is the
+/// fallback when nothing does.
 fn first_meaningful_line(text: &str) -> Option<String> {
-    text.lines()
+    const ERROR_MARKERS: &[&str] = &[
+        "error",
+        "failed",
+        "fatal",
+        "panic",
+        "denied",
+        "invalid",
+        "unexpected",
+        "cannot",
+        "unable",
+    ];
+    let lines: Vec<&str> = text
+        .lines()
         .map(str::trim)
-        .find(|line| !line.is_empty())
-        .map(str::to_string)
+        .filter(|line| !line.is_empty())
+        .collect();
+
+    lines
+        .iter()
+        .find(|line| {
+            let lower = line.to_ascii_lowercase();
+            ERROR_MARKERS.iter().any(|marker| lower.contains(marker))
+        })
+        .or_else(|| lines.first())
+        .map(|line| (*line).to_string())
 }
 
 /// Write the session binding back, reporting any store failure.
@@ -957,6 +1071,50 @@ mod tests {
                 "{stderr:?} should stay a plain failure"
             );
         }
+    }
+
+    /// Real output from a failing codex run: the first line is status, the
+    /// cause is below it. Reporting the first line looks like an explanation
+    /// while pointing at the wrong thing.
+    #[test]
+    fn a_status_line_does_not_masquerade_as_the_cause() {
+        let stderr = "Reading additional input from stdin...\n\
+                      error: invalid value 'nope' for '--sandbox <SANDBOX_MODE>'";
+        let err = classify_run(Agent::Codex, "codex", 1, stderr, "", &Terminal::default());
+        let Error::Failed {
+            stderr: reported, ..
+        } = err
+        else {
+            panic!("expected Failed, got {err:?}")
+        };
+        assert!(reported.contains("invalid value"), "reported {reported:?}");
+    }
+
+    /// Codex reports a rejected schema as a JSON error event on **stdout**
+    /// while stderr carries only a status line. Reporting stderr alone
+    /// described the failure as "Reading additional input from stdin...",
+    /// which is not what went wrong.
+    #[test]
+    fn a_cause_on_stdout_is_reported_when_stderr_only_narrates() {
+        let stdout = r#"{"type":"error","message":"invalid_json_schema: 'additionalProperties' is required to be supplied and to be false."}"#;
+        let err = classify_run(
+            Agent::Codex,
+            "codex",
+            1,
+            "Reading additional input from stdin...",
+            stdout,
+            &Terminal::default(),
+        );
+        let Error::Failed {
+            stderr: reported, ..
+        } = err
+        else {
+            panic!("expected Failed, got {err:?}")
+        };
+        assert!(
+            reported.contains("additionalProperties"),
+            "reported {reported:?}, which explains nothing"
+        );
     }
 
     #[test]
