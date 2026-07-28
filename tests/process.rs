@@ -50,14 +50,27 @@ fn fake_agent(dir: &Path) -> PathBuf {
     script
 }
 
-/// Whether a pid is still alive, via a null signal.
+/// The process state as `ps` reports it, or `None` if the pid is gone.
+fn process_state(pid: i32) -> Option<String> {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    let state = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!state.is_empty()).then_some(state)
+}
+
+/// Whether a pid is still running.
+///
+/// Deliberately not `kill -0`, which succeeds for a **zombie**: a process that
+/// has exited but whose parent has not reaped it. That distinction does not
+/// matter on a developer machine, where init reaps orphans immediately, but a
+/// CI container's PID 1 is often not a real init, so an orphan can sit as a
+/// zombie indefinitely and `kill -0` keeps reporting it alive long after it
+/// died. A killed process is dead whether or not anyone collected its exit
+/// status.
 fn alive(pid: i32) -> bool {
-    // `kill -0` reports liveness without actually signalling.
-    std::process::Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+    process_state(pid).is_some_and(|state| !state.starts_with('Z'))
 }
 
 /// Wait for the grandchild to record its pid, then return it.
@@ -113,8 +126,9 @@ async fn dropping_a_run_kills_the_agent_and_its_children() {
 
     assert!(
         wait_until_dead(grandchild, TEARDOWN_GRACE).await,
-        "dropping the run left a grandchild ({grandchild}) alive; \
-         killing only the CLI orphans whatever it spawned"
+        "dropping the run left a grandchild ({grandchild}) alive in state {:?}; \
+         killing only the CLI orphans whatever it spawned",
+        process_state(grandchild)
     );
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -137,8 +151,9 @@ async fn cancel_stops_the_whole_tree_before_returning() {
     // is not already gone when it returns, the contract is broken.
     assert!(
         !alive(grandchild),
-        "cancel returned while a grandchild was still alive, so it is not \
-         awaiting its own cleanup"
+        "cancel returned while a grandchild was still alive (state {:?}), so it \
+         is not awaiting its own cleanup",
+        process_state(grandchild)
     );
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -162,7 +177,8 @@ async fn a_timed_out_run_kills_its_children() {
     );
     assert!(
         wait_until_dead(grandchild, TEARDOWN_GRACE).await,
-        "the timeout left a grandchild alive"
+        "the timeout left a grandchild alive in state {:?}",
+        process_state(grandchild)
     );
     std::fs::remove_dir_all(&dir).ok();
 }
