@@ -38,6 +38,17 @@ Copilot CLIs headlessly behind one API. Consumed as a direct dependency by the
   `unsafe_code = "deny"` rather than `forbid` so that one audited call can be excepted. A
   second `unsafe` anywhere is a design question, not a local decision.
 
+## CI runners
+
+**Never `runs-on: ubuntu-latest`**, or any other GitHub-hosted label. CI here runs on
+Ubicloud: `ubicloud-standard-2` / `-4` / `-8`. A GitHub-hosted label is not a neutral
+default, it silently bills GitHub Actions minutes instead.
+
+Size by what the job actually needs. This crate's checks finish in well under a minute, so
+`-2` is correct; Ubicloud bills by vCPU-minute and a bigger runner costs more for no
+wall-clock gain. Ubicloud must also be enabled for a repository before its runners will
+pick up jobs, so a new repo needs that done first or workflows queue forever.
+
 ## Build & run
 
 ```bash
