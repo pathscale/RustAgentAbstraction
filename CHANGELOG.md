@@ -41,6 +41,11 @@ them through an ordinary `cargo update`.
   *highest-precedence* credential variable Copilot accepts and it was missing from the
   list, so a host authenticating that way would have failed to authenticate at all once
   `Minimal` became the default.
+- **A failure now reports its cause rather than a status line.** The first line of stderr
+  was taken as the explanation, but CLIs open with progress chatter: a rejected Codex schema
+  reported "Reading additional input from stdin...", which is not what went wrong. A line
+  that looks like an error now wins, and stdout is consulted when stderr only narrates, since
+  Codex reports errors as JSON events on stdout.
 - **Dropping a `Run` now reliably kills the process group.** It signalled the driver and
   aborted it, which left the kill waiting on the runtime to poll the aborted task. On Linux
   that did not reliably happen and grandchildren survived, while `cancel` and timeouts were
@@ -51,6 +56,17 @@ them through an ordinary `cargo update`.
 
 ### Added
 
+- **`Request::schema`** constrains an answer to a JSON Schema, with the conforming value on
+  `Outcome::structured` already parsed. For answers that are data rather than prose, such as
+  a set of review findings, this replaces guessing at formatting the model never promised.
+  Delivery differs and is hidden: Claude takes the schema inline and reports the value in its
+  own field, Codex reads it from a file this crate writes and removes. Copilot 1.0.75 has no
+  schema support, so asking is `Error::Unsupported` rather than prose presented as data.
+
+  Write schemas strictly: Codex sends yours to a provider that requires
+  `"additionalProperties": false` on every object, and rejects the request with a 400 before
+  the model runs otherwise. Claude is more forgiving, so a schema that works there can still
+  fail on Codex.
 - **`AuthStatus::check(agent)`** answers whether an agent is logged in without spending a
   request, which a missing login otherwise only revealed by running a turn and failing.
   Claude reports JSON, Codex reports prose, and Copilot offers neither: that case is

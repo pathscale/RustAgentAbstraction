@@ -34,6 +34,9 @@ pub struct Request {
     pub(crate) env: Vec<(String, String)>,
     pub(crate) extra_args: Vec<String>,
     pub(crate) env_policy: EnvPolicy,
+    pub(crate) schema: Option<String>,
+    /// Set by the runner for agents that read the schema from a file.
+    pub(crate) schema_file: Option<String>,
     pub(crate) timeout: Option<Duration>,
     /// Set when [`Request::session`] resolved a named session, so the runner
     /// knows to write the binding back.
@@ -69,6 +72,8 @@ impl Request {
             env: Vec::new(),
             extra_args: Vec::new(),
             env_policy: EnvPolicy::Minimal,
+            schema: None,
+            schema_file: None,
             timeout: None,
             binding: None,
         }
@@ -174,6 +179,44 @@ impl Request {
         self
     }
 
+    /// Constrain the answer to a JSON Schema.
+    ///
+    /// The agent is asked to return a value conforming to `schema`, which
+    /// [`Outcome::structured`] then carries already parsed. Useful when the
+    /// answer is data rather than prose: a set of review findings, an
+    /// extraction, a classification. Reading it beats parsing prose, which is
+    /// a guess about formatting the model never promised.
+    ///
+    /// The two CLIs that support this take it differently, and the difference
+    /// is hidden: Claude accepts the schema inline, Codex reads it from a file
+    /// this crate writes for the run and removes afterwards. **Copilot 1.0.75
+    /// has no schema support**, so asking is [`crate::Error::Unsupported`]
+    /// rather than a prose answer presented as data.
+    ///
+    /// The schema is passed through unvalidated; a malformed one surfaces as
+    /// the agent's own error.
+    ///
+    /// # Write the schema strictly
+    ///
+    /// Codex sends it to `OpenAI`'s structured-output API, which rejects anything
+    /// permissive. Every object needs `"additionalProperties": false` and every
+    /// property listed in `required`, or the request fails with a 400 before
+    /// the model runs:
+    ///
+    /// ```text
+    /// 'additionalProperties' is required to be supplied and to be false
+    /// ```
+    ///
+    /// Claude is more forgiving, so a schema that works there can still fail on
+    /// Codex. Writing to the stricter rule keeps one schema usable for both.
+    ///
+    /// [`Outcome::structured`]: crate::Outcome::structured
+    #[must_use]
+    pub fn schema(mut self, schema: impl Into<String>) -> Self {
+        self.schema = Some(schema.into());
+        self
+    }
+
     /// Continue an earlier conversation by its native id, bypassing the session
     /// store. Prefer [`Request::session`] unless you are tracking ids yourself.
     #[must_use]
@@ -264,6 +307,8 @@ impl Request {
         self.prompt.len()
             + self.system.as_ref().map_or(0, String::len)
             + self.extra_args.iter().map(String::len).sum::<usize>()
+            // Claude's schema rides the command line too.
+            + self.schema.as_ref().map_or(0, String::len)
     }
 
     /// The format this request will actually use.
@@ -304,6 +349,8 @@ impl Request {
             // system prompt rides its own argument. A small prompt with a large
             // system prompt would otherwise still hit E2BIG.
             stdin_prompt: self.argv_weight() >= STDIN_THRESHOLD,
+            schema: self.schema.clone(),
+            schema_file: self.schema_file.clone(),
         }
     }
 
