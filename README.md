@@ -10,7 +10,7 @@ things.
 
 ```toml
 [dependencies]
-agent-abstraction = "0.1"
+agent-abstraction = "0.2"
 ```
 
 Every flag mapping and output shape here was verified against the installed CLIs rather than
