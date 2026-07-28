@@ -19,7 +19,7 @@ use crate::agent::{Continue, EnvPolicy};
 use crate::error::{Error, Result};
 use crate::event::{Event, MAX_LINE, Parser, Terminal, append_capped};
 use crate::outcome::{Outcome, Stop};
-use crate::proc::kill_process_group;
+use crate::proc::{kill_group_by_pid, kill_process_group};
 use crate::request::Request;
 
 /// Read one line, giving up on a line that never ends.
@@ -90,6 +90,12 @@ pub struct Run {
     /// The typed command line, kept so both the plain and redacted views come
     /// from the same source.
     typed: Vec<crate::agent::Arg>,
+    /// The child's pid, so `Drop` can tear the group down itself rather than
+    /// depending on an aborted task being polled.
+    pid: Option<u32>,
+    /// Set by the driver once the child has been reaped, so `Drop` never
+    /// signals a pid the OS may since have handed to someone else.
+    reaped: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Dropping or firing this asks the driver to tear down in order. Held as
     /// an `Option` so `detach` can discard it without signalling.
     cancel: Option<tokio::sync::oneshot::Sender<()>>,
@@ -136,6 +142,8 @@ impl Run {
     /// # Errors
     /// Whatever the run failed with. See [`Error`].
     pub async fn finish(mut self) -> Result<Outcome> {
+        // The driver owns teardown from here; `Drop` must not also fire.
+        self.pid = None;
         while self.events.recv().await.is_some() {}
         // Taking the handle disarms the `Drop` guard: this run is settling
         // normally, not being abandoned.
@@ -172,6 +180,9 @@ impl Run {
     /// [`Error::Cancelled`] in the normal case, or whatever the run failed with
     /// if it failed before the request arrived.
     pub async fn cancel(mut self) -> Result<Outcome> {
+        // The driver tears down cooperatively and this awaits it, so `Drop`
+        // must not race that with a kill of its own.
+        self.pid = None;
         // Dropping the sender is itself the signal, so this cannot fail in a
         // way that leaves the driver waiting.
         drop(self.cancel.take());
@@ -197,6 +208,9 @@ impl Run {
     /// afterwards, so reach for this only when an unsupervised background run
     /// is genuinely intended.
     pub fn detach(mut self) {
+        // Disarm `Drop` before it runs, or detaching would immediately kill the
+        // run it exists to keep alive.
+        self.pid = None;
         // Leak the cancel signal rather than dropping it: a dropped sender is
         // read by the driver as "stop", which is the opposite of detaching.
         if let Some(cancel) = self.cancel.take() {
@@ -209,11 +223,19 @@ impl Run {
 
 impl Drop for Run {
     fn drop(&mut self) {
-        // Abandoned rather than finished, cancelled or detached. Signal the
-        // driver so it tears down in order if it gets the chance, then abort so
-        // the teardown happens even if nothing polls it again. `Drop` cannot
-        // await, so abort remains the backstop: it drops the driver's
-        // `ChildGuard`, which kills the process group synchronously.
+        // Abandoned rather than finished, cancelled or detached.
+        //
+        // Kill the group here, directly. Signalling the driver and aborting it
+        // is not enough on its own: that leaves teardown waiting on the runtime
+        // to poll the aborted task so its guard runs, and a dropped `Run` was
+        // observed leaving grandchildren alive and sleeping on Linux while the
+        // same teardown worked from `cancel`. `Drop` cannot await, so it does
+        // the one thing it can do synchronously.
+        if let Some(pid) = self.pid
+            && !self.reaped.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            kill_group_by_pid(pid);
+        }
         drop(self.cancel.take());
         if let Some(task) = self.task.take() {
             task.abort();
@@ -334,13 +356,23 @@ pub fn stream(request: &Request) -> Result<Run> {
         }
     })?;
 
+    let pid = child.id();
     let (tx, rx) = mpsc::channel(EVENT_BUFFER);
     let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+    let reaped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let request = request.clone();
-    let task = runtime.spawn(drive(child, request, tx, cancel_rx));
+    let task = runtime.spawn(drive(
+        child,
+        request,
+        tx,
+        cancel_rx,
+        std::sync::Arc::clone(&reaped),
+    ));
     Ok(Run {
         events: rx,
         typed,
+        pid,
+        reaped,
         cancel: Some(cancel_tx),
         task: Some(task),
         argv,
@@ -391,6 +423,7 @@ async fn drive(
     request: Request,
     events: mpsc::Sender<Event>,
     cancel: tokio::sync::oneshot::Receiver<()>,
+    reaped: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<Outcome> {
     // From here on the child is owned by a guard, so every exit path from this
     // task, including an abort, takes the process group with it.
@@ -495,6 +528,7 @@ async fn drive(
             // the child's pid, and the group kill needs that pid to target the
             // group, so the other order silently leaves grandchildren running.
             let partial = shut_down(&mut child, stderr_task).await;
+            reaped.store(true, std::sync::atomic::Ordering::SeqCst);
             return Err(Error::Timeout {
                 bin,
                 timeout: request.timeout.unwrap_or_default(),
@@ -506,6 +540,7 @@ async fn drive(
             // Cooperative teardown: the caller is waiting on this, so the tree
             // is signalled, reaped and joined before returning.
             shut_down(&mut child, stderr_task).await;
+            reaped.store(true, std::sync::atomic::Ordering::SeqCst);
             return Err(Error::Cancelled { bin });
         }
     }
@@ -514,8 +549,10 @@ async fn drive(
         source,
     })?;
 
-    // The child has been reaped, so its pid must not be signalled again.
+    // The child has been reaped, so its pid must not be signalled again, by the
+    // guard here or by `Run::drop` racing this.
     child.armed = false;
+    reaped.store(true, std::sync::atomic::Ordering::SeqCst);
 
     drop(events);
     let stderr = stderr_task.await.unwrap_or_default();

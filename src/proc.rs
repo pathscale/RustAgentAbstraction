@@ -42,6 +42,21 @@ pub(crate) fn kill_process_group(child: &tokio::process::Child) {
         // would risk hitting a pid the OS has since recycled.
         return;
     };
+    kill_group_by_pid(pid);
+}
+
+/// Signal a group by its leader pid, for a caller holding the pid rather than
+/// the [`tokio::process::Child`].
+///
+/// [`crate::Run`]'s `Drop` needs this. `Drop` cannot await, so its only other
+/// option is to abort the driver task and rely on the runtime polling that task
+/// so its guard runs. That makes teardown depend on scheduling, and it does not
+/// reliably happen: a dropped `Run` left grandchildren alive and *sleeping* on
+/// Linux, while the identical teardown worked from `cancel` and from a timeout,
+/// both of which call this directly. Killing here is synchronous and depends on
+/// nothing being polled.
+#[cfg(unix)]
+pub(crate) fn kill_group_by_pid(pid: u32) {
     let Ok(pid) = i32::try_from(pid) else {
         // Unreachable in practice: a pid always fits in an i32.
         return;
@@ -66,3 +81,7 @@ pub(crate) fn kill_process_group(child: &tokio::process::Child) {
 /// No-op: see the module docs. Only the direct child is killed on Windows.
 #[cfg(not(unix))]
 pub(crate) fn kill_process_group(_child: &tokio::process::Child) {}
+
+/// No-op counterpart for non-unix.
+#[cfg(not(unix))]
+pub(crate) fn kill_group_by_pid(_pid: u32) {}
