@@ -212,13 +212,15 @@ async fn a_minimal_environment_withholds_the_hosts_variables() {
             .format(agent_abstraction::Format::Text)
     };
 
-    let inherited = captured_env(&base()).await;
+    let inherited = captured_env(&base().env_policy(EnvPolicy::Inherit)).await;
     assert!(
         inherited.contains("CARGO"),
         "the control case is broken: Inherit should pass the host environment"
     );
 
-    let minimal = captured_env(&base().env_policy(EnvPolicy::Minimal)).await;
+    // No explicit policy: Minimal is the default, which is the property under
+    // test as much as the filtering itself.
+    let minimal = captured_env(&base()).await;
     assert!(
         !minimal.contains("CARGO"),
         "host variables leaked under EnvPolicy::Minimal:\n{minimal}"

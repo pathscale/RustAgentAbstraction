@@ -165,12 +165,14 @@ of this by design.
 
 ## Environment isolation
 
-By default the agent inherits the whole parent environment, which is how the CLIs find their
-credentials. In an embedded host that also hands the agent, and every command it runs, any
-unrelated secret the process happens to hold.
+**`EnvPolicy::Minimal` is the default.** Inheriting the whole environment is what a CLI gets
+from a shell, but this crate runs inside processes that hold unrelated secrets, and full
+inheritance hands every one of them to the agent and to every command the agent runs. That
+is worth deciding deliberately, so it is the opt-in:
 
 ```rust
-Request::new(Agent::Claude, "review this").env_policy(EnvPolicy::Minimal)
+Request::new(Agent::Claude, "review this")     // Minimal, nothing to configure
+Request::new(Agent::Claude, "review this").env_policy(EnvPolicy::Inherit)   // opt in
 ```
 
 `Minimal` passes through only what the selected agent needs. The crate owns that list per
