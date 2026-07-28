@@ -52,6 +52,18 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
+      # The published artifact is not what the other steps build: `exclude` can
+      # drop a file the crate needs, and nothing above would notice. Checked on
+      # every run rather than only on release PRs, because the mistake is made
+      # in the commit that edits `exclude`, not the one that bumps the version.
+      - name: The package builds from what would be published
+        run: cargo package
+
+      # The README links to it and a consumer reading it from a vendored crate
+      # is exactly who it is for, so it must not be excluded by accident.
+      - name: The changelog is in the package
+        run: cargo package --list | grep -Fx CHANGELOG.md
+
   audit:
     name: cargo audit
     runs-on: ubicloud-standard-2
