@@ -86,6 +86,7 @@
 //! is the caller's decision. See `docs/operating-limits.md`.
 
 mod agent;
+mod auth;
 mod error;
 mod event;
 mod outcome;
@@ -96,6 +97,7 @@ mod run;
 mod session;
 
 pub use agent::{Agent, Caps, EnvPolicy, Format, NETWORK_ENV, Permission, SessionSupport};
+pub use auth::{AuthState, AuthStatus};
 pub use error::{Error, Result};
 pub use event::{Event, MAX_CAPTURE, MAX_EVENT_BYTES, MAX_LINE, TRUNCATION_MARK};
 pub use outcome::{Outcome, RateLimit, Stop, Usage};

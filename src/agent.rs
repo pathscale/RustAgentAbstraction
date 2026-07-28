@@ -255,6 +255,36 @@ impl Agent {
         }
     }
 
+    /// The command that asks this agent whether it is logged in, or `None`
+    /// when it offers no way to ask.
+    ///
+    /// Verified against each CLI: Claude has `auth status`, which answers JSON
+    /// by default, and Codex has `login status`, which answers prose. Copilot
+    /// has neither, so its credentials cannot be confirmed without spending a
+    /// request.
+    #[must_use]
+    pub fn auth_status_argv(self) -> Option<&'static [&'static str]> {
+        match self {
+            Agent::Claude => Some(&["auth", "status", "--json"]),
+            Agent::Codex => Some(&["login", "status"]),
+            Agent::Copilot => None,
+        }
+    }
+
+    /// The environment variables this agent accepts a credential in, most
+    /// preferred first.
+    ///
+    /// Copilot documents its precedence explicitly: `COPILOT_GITHUB_TOKEN`,
+    /// then `GH_TOKEN`, then `GITHUB_TOKEN`.
+    #[must_use]
+    pub fn auth_env_vars(self) -> &'static [&'static str] {
+        match self {
+            Agent::Claude => &["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"],
+            Agent::Codex => &["CODEX_API_KEY", "OPENAI_API_KEY"],
+            Agent::Copilot => &["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"],
+        }
+    }
+
     /// The command that resolves a missing login for this agent.
     ///
     /// Verified against each CLI's own help: Codex and Copilot expose a `login`
@@ -360,7 +390,15 @@ impl Agent {
                 "OPENAI_API_KEY",
                 "OPENAI_BASE_URL",
             ],
-            Agent::Copilot => &["GH_TOKEN", "GITHUB_TOKEN", "XDG_CONFIG_HOME"],
+            // `COPILOT_GITHUB_TOKEN` takes precedence over the others per
+            // Copilot's own docs, and was missing here: a host using it would
+            // have failed to authenticate under EnvPolicy::Minimal.
+            Agent::Copilot => &[
+                "COPILOT_GITHUB_TOKEN",
+                "GH_TOKEN",
+                "GITHUB_TOKEN",
+                "XDG_CONFIG_HOME",
+            ],
         };
         BASE.iter().chain(WINDOWS).chain(agent).copied().collect()
     }

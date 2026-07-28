@@ -14,8 +14,8 @@
 use std::time::Duration;
 
 use agent_abstraction::{
-    Agent, EnvPolicy, Event, Format, Permission, Probe, Request, SessionStore, VersionStatus, run,
-    stream,
+    Agent, AuthState, AuthStatus, EnvPolicy, Event, Format, Permission, Probe, Request,
+    SessionStore, VersionStatus, run, stream,
 };
 
 /// A prompt with exactly one correct answer, so the assertion is about the
@@ -476,4 +476,40 @@ async fn installed_agents_match_the_versions_the_flags_were_verified_against() {
         );
     }
     eprintln!("probed {checked} installed agents");
+}
+
+/// Checking login costs no quota, so like the version probe this runs by
+/// default. It is the test that keeps the status parsing honest: both CLIs
+/// answer in their own shape, and a parser that silently stopped recognizing
+/// `Logged in using ChatGPT` would report a working setup as unknown.
+#[tokio::test]
+async fn installed_agents_report_their_login_state() {
+    for agent in Agent::ALL {
+        if !available(agent) {
+            continue;
+        }
+        let status = AuthStatus::check(agent).await.expect("check failed");
+
+        if agent.auth_status_argv().is_some() {
+            // Claude and Codex answer, so the result must be a real yes or no.
+            // Unknown here means the parsing no longer matches the CLI.
+            assert_ne!(
+                status.state,
+                AuthState::Unknown,
+                "{agent} answered {:?}, which this crate no longer recognizes",
+                status.detail
+            );
+            assert!(
+                status.is_logged_in(),
+                "{agent} is not logged in: {}",
+                status.summary()
+            );
+        } else {
+            // Copilot cannot be asked, and must say so rather than claiming a
+            // logout that would send someone to fix a working setup.
+            assert_eq!(status.state, AuthState::Unknown);
+            assert!(!status.needs_login());
+        }
+        eprintln!("{agent}: {}", status.summary());
+    }
 }
