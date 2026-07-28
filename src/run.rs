@@ -19,7 +19,7 @@ use crate::agent::{Continue, EnvPolicy};
 use crate::error::{Error, Result};
 use crate::event::{Event, MAX_LINE, Parser, Terminal, append_capped};
 use crate::outcome::{Outcome, Stop};
-use crate::proc::kill_process_group;
+use crate::proc::{kill_group_by_pid, kill_process_group};
 use crate::request::Request;
 
 /// Read one line, giving up on a line that never ends.
@@ -90,6 +90,12 @@ pub struct Run {
     /// The typed command line, kept so both the plain and redacted views come
     /// from the same source.
     typed: Vec<crate::agent::Arg>,
+    /// The child's pid, so `Drop` can tear the group down itself rather than
+    /// depending on an aborted task being polled.
+    pid: Option<u32>,
+    /// Set by the driver once the child has been reaped, so `Drop` never
+    /// signals a pid the OS may since have handed to someone else.
+    reaped: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Dropping or firing this asks the driver to tear down in order. Held as
     /// an `Option` so `detach` can discard it without signalling.
     cancel: Option<tokio::sync::oneshot::Sender<()>>,
@@ -136,6 +142,8 @@ impl Run {
     /// # Errors
     /// Whatever the run failed with. See [`Error`].
     pub async fn finish(mut self) -> Result<Outcome> {
+        // The driver owns teardown from here; `Drop` must not also fire.
+        self.pid = None;
         while self.events.recv().await.is_some() {}
         // Taking the handle disarms the `Drop` guard: this run is settling
         // normally, not being abandoned.
@@ -172,6 +180,9 @@ impl Run {
     /// [`Error::Cancelled`] in the normal case, or whatever the run failed with
     /// if it failed before the request arrived.
     pub async fn cancel(mut self) -> Result<Outcome> {
+        // The driver tears down cooperatively and this awaits it, so `Drop`
+        // must not race that with a kill of its own.
+        self.pid = None;
         // Dropping the sender is itself the signal, so this cannot fail in a
         // way that leaves the driver waiting.
         drop(self.cancel.take());
@@ -197,6 +208,9 @@ impl Run {
     /// afterwards, so reach for this only when an unsupervised background run
     /// is genuinely intended.
     pub fn detach(mut self) {
+        // Disarm `Drop` before it runs, or detaching would immediately kill the
+        // run it exists to keep alive.
+        self.pid = None;
         // Leak the cancel signal rather than dropping it: a dropped sender is
         // read by the driver as "stop", which is the opposite of detaching.
         if let Some(cancel) = self.cancel.take() {
@@ -209,11 +223,19 @@ impl Run {
 
 impl Drop for Run {
     fn drop(&mut self) {
-        // Abandoned rather than finished, cancelled or detached. Signal the
-        // driver so it tears down in order if it gets the chance, then abort so
-        // the teardown happens even if nothing polls it again. `Drop` cannot
-        // await, so abort remains the backstop: it drops the driver's
-        // `ChildGuard`, which kills the process group synchronously.
+        // Abandoned rather than finished, cancelled or detached.
+        //
+        // Kill the group here, directly. Signalling the driver and aborting it
+        // is not enough on its own: that leaves teardown waiting on the runtime
+        // to poll the aborted task so its guard runs, and a dropped `Run` was
+        // observed leaving grandchildren alive and sleeping on Linux while the
+        // same teardown worked from `cancel`. `Drop` cannot await, so it does
+        // the one thing it can do synchronously.
+        if let Some(pid) = self.pid
+            && !self.reaped.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            kill_group_by_pid(pid);
+        }
         drop(self.cancel.take());
         if let Some(task) = self.task.take() {
             task.abort();
@@ -334,13 +356,23 @@ pub fn stream(request: &Request) -> Result<Run> {
         }
     })?;
 
+    let pid = child.id();
     let (tx, rx) = mpsc::channel(EVENT_BUFFER);
     let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+    let reaped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let request = request.clone();
-    let task = runtime.spawn(drive(child, request, tx, cancel_rx));
+    let task = runtime.spawn(drive(
+        child,
+        request,
+        tx,
+        cancel_rx,
+        std::sync::Arc::clone(&reaped),
+    ));
     Ok(Run {
         events: rx,
         typed,
+        pid,
+        reaped,
         cancel: Some(cancel_tx),
         task: Some(task),
         argv,
@@ -391,6 +423,7 @@ async fn drive(
     request: Request,
     events: mpsc::Sender<Event>,
     cancel: tokio::sync::oneshot::Receiver<()>,
+    reaped: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<Outcome> {
     // From here on the child is owned by a guard, so every exit path from this
     // task, including an abort, takes the process group with it.
@@ -495,6 +528,7 @@ async fn drive(
             // the child's pid, and the group kill needs that pid to target the
             // group, so the other order silently leaves grandchildren running.
             let partial = shut_down(&mut child, stderr_task).await;
+            reaped.store(true, std::sync::atomic::Ordering::SeqCst);
             return Err(Error::Timeout {
                 bin,
                 timeout: request.timeout.unwrap_or_default(),
@@ -506,6 +540,7 @@ async fn drive(
             // Cooperative teardown: the caller is waiting on this, so the tree
             // is signalled, reaped and joined before returning.
             shut_down(&mut child, stderr_task).await;
+            reaped.store(true, std::sync::atomic::Ordering::SeqCst);
             return Err(Error::Cancelled { bin });
         }
     }
@@ -514,8 +549,10 @@ async fn drive(
         source,
     })?;
 
-    // The child has been reaped, so its pid must not be signalled again.
+    // The child has been reaped, so its pid must not be signalled again, by the
+    // guard here or by `Run::drop` racing this.
     child.armed = false;
+    reaped.store(true, std::sync::atomic::Ordering::SeqCst);
 
     drop(events);
     let stderr = stderr_task.await.unwrap_or_default();
@@ -563,8 +600,19 @@ async fn drive(
         .rate_limit
         .as_ref()
         .is_some_and(crate::outcome::RateLimit::is_blocking);
-    if exit_code != 0 || quota_blocked {
-        return Err(classify(&bin, exit_code, &stderr, &raw, &terminal));
+    // An unauthenticated Claude run exits 0 and reports the problem in its
+    // result text, so checking only the exit code would hand back a successful
+    // Outcome whose answer is "Please run /login".
+    let unauthenticated = looks_unauthenticated(&terminal.text);
+    if exit_code != 0 || quota_blocked || unauthenticated {
+        return Err(classify_run(
+            request.agent,
+            &bin,
+            exit_code,
+            &stderr,
+            &raw,
+            &terminal,
+        ));
     }
 
     // A fork lands on a *new* id the agent only reveals at the end, so the name
@@ -603,6 +651,55 @@ async fn shut_down(child: &mut ChildGuard, stderr_task: tokio::task::JoinHandle<
     stderr_task.await.unwrap_or_default()
 }
 
+/// Turn a failure into the most specific error available, agent included so an
+/// auth failure can carry the right login command.
+fn classify_run(
+    agent: crate::Agent,
+    bin: &str,
+    code: i32,
+    stderr: &str,
+    stdout: &str,
+    terminal: &Terminal,
+) -> Error {
+    // Checked before quota and before a plain failure: a login problem is the
+    // most specific reading of the output, and the only one a user can act on
+    // directly.
+    for source in [terminal.text.as_str(), stderr, stdout] {
+        if looks_unauthenticated(source) {
+            return Error::NotAuthenticated {
+                agent,
+                bin: bin.to_string(),
+                message: first_meaningful_line(source).unwrap_or_default(),
+                hint: agent.login_hint(),
+            };
+        }
+    }
+    classify(bin, code, stderr, stdout, terminal)
+}
+
+/// Whether text is an agent saying it has no usable credentials.
+///
+/// Narrow on purpose. Mislabelling an ordinary failure as an auth problem sends
+/// someone to re-login over something unrelated, so these are phrases the CLIs
+/// actually emit rather than every string containing "auth".
+fn looks_unauthenticated(text: &str) -> bool {
+    const PHRASES: &[&str] = &[
+        // Claude, verified: an unauthenticated run answers exactly this.
+        "not logged in",
+        "please run /login",
+        "invalid api key",
+        "authentication_error",
+        "unauthorized",
+        "not authenticated",
+        "no credentials",
+        "credentials not found",
+        "please log in",
+        "401",
+    ];
+    let lower = text.to_ascii_lowercase();
+    PHRASES.iter().any(|needle| lower.contains(needle))
+}
+
 /// Turn a non-zero exit into the most specific error available.
 fn classify(bin: &str, code: i32, stderr: &str, stdout: &str, terminal: &Terminal) -> Error {
     let quota_signalled = terminal
@@ -617,11 +714,41 @@ fn classify(bin: &str, code: i32, stderr: &str, stdout: &str, terminal: &Termina
                 .unwrap_or_else(|| "usage limit reached".to_string()),
         };
     }
+    // A rejected flag is not a failed request, it is this crate and the CLI
+    // disagreeing about what the CLI accepts. Naming that is the difference
+    // between "the run failed" and "your codex is a different version".
+    if let Some(detail) = rejected_flag(stderr).or_else(|| rejected_flag(stdout)) {
+        return Error::FlagRejected {
+            bin: bin.to_string(),
+            detail,
+        };
+    }
     Error::Failed {
         bin: bin.to_string(),
         code,
         stderr: first_meaningful_line(stderr).unwrap_or_default(),
     }
+}
+
+/// The CLI's complaint, if it refused an argument.
+///
+/// The phrasings are clap's and commander's, which is what all three CLIs are
+/// built on. Matched narrowly: a false positive would relabel a genuine failure
+/// as a version problem and send someone chasing the wrong thing.
+fn rejected_flag(text: &str) -> Option<String> {
+    const REJECTIONS: &[&str] = &[
+        "unexpected argument",
+        "unknown option",
+        "unrecognized option",
+        "unknown flag",
+        "invalid option",
+        "unexpected option",
+    ];
+    let lower = text.to_ascii_lowercase();
+    REJECTIONS
+        .iter()
+        .any(|needle| lower.contains(needle))
+        .then(|| first_meaningful_line(text).unwrap_or_default())
 }
 
 /// Whether text carries a provider quota refusal.
@@ -732,6 +859,103 @@ mod tests {
             classify("claude", 1, "boom", "", &terminal),
             Error::Failed { .. }
         ));
+    }
+
+    /// Verified against the real CLI: with `USER` withheld, claude answers
+    /// "Not logged in · Please run /login" and exits **0**. Checking only the
+    /// exit code hands back a successful Outcome whose answer is a login
+    /// prompt.
+    #[test]
+    fn an_unauthenticated_run_is_named_even_though_it_exits_zero() {
+        let terminal = Terminal {
+            text: "Not logged in · Please run /login".into(),
+            ..Terminal::default()
+        };
+        let err = classify_run(Agent::Claude, "claude", 0, "", "", &terminal);
+        let Error::NotAuthenticated { agent, hint, .. } = &err else {
+            panic!("expected NotAuthenticated, got {err:?}")
+        };
+        assert_eq!(*agent, Agent::Claude);
+        assert!(hint.contains("/login"), "{hint}");
+        assert!(err.is_auth_failure());
+    }
+
+    /// Each agent's hint has to name its own login route, since they differ:
+    /// Codex and Copilot have `login` subcommands, Claude does not.
+    #[test]
+    fn every_agent_offers_its_own_login_route() {
+        for (agent, expected) in [
+            (Agent::Claude, "setup-token"),
+            (Agent::Codex, "codex login"),
+            (Agent::Copilot, "copilot login"),
+        ] {
+            let err = classify_run(
+                agent,
+                agent.bin(),
+                1,
+                "error: unauthorized",
+                "",
+                &Terminal::default(),
+            );
+            let Error::NotAuthenticated { hint, .. } = &err else {
+                panic!("{agent}: expected NotAuthenticated, got {err:?}")
+            };
+            assert!(hint.contains(expected), "{agent}: {hint}");
+        }
+    }
+
+    /// Auth is the most specific reading, so it wins over a generic failure,
+    /// but must not swallow unrelated errors.
+    #[test]
+    fn ordinary_failures_are_not_mistaken_for_auth_problems() {
+        for stderr in [
+            "error: no such file or directory",
+            "model not found",
+            "rate limit exceeded",
+            "error: unexpected argument '--sandbox' found",
+        ] {
+            let err = classify_run(Agent::Codex, "codex", 1, stderr, "", &Terminal::default());
+            assert!(
+                !err.is_auth_failure(),
+                "{stderr:?} was misread as an auth failure: {err:?}"
+            );
+        }
+    }
+
+    /// The exact failure that cost a round of debugging: `codex exec resume`
+    /// rejects `--sandbox`, which `Error::Failed` reported as a generic
+    /// non-zero exit naming a flag rather than a version mismatch.
+    #[test]
+    fn a_rejected_flag_is_named_as_a_version_mismatch() {
+        let err = classify(
+            "codex",
+            2,
+            "error: unexpected argument '--sandbox' found",
+            "",
+            &Terminal::default(),
+        );
+        let Error::FlagRejected { bin, detail } = err else {
+            panic!("expected FlagRejected, got {err:?}")
+        };
+        assert_eq!(bin, "codex");
+        assert!(detail.contains("--sandbox"), "{detail}");
+    }
+
+    #[test]
+    fn ordinary_failures_are_not_mistaken_for_version_drift() {
+        for stderr in [
+            "error: no such file or directory",
+            "model not found",
+            "permission denied",
+        ] {
+            assert!(
+                matches!(
+                    classify("codex", 1, stderr, "", &Terminal::default()),
+                    Error::Failed { .. }
+                ),
+                "{stderr:?} should stay a plain failure"
+            );
+        }
     }
 
     #[test]

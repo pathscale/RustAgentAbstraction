@@ -262,6 +262,12 @@ run into an OOM instead of an answer. Individual lines are bounded separately at
 because a reader that accumulates until a newline can exhaust memory on one line that never
 ends, long before any total cap applies.
 
+Individual event payloads are bounded at `MAX_EVENT_BYTES` (64 KiB) and marked with
+`TRUNCATION_MARK` when shortened. The channel bounds how many events queue, not how large
+they are, so without this a stalled consumer could hold roughly 130 MiB; with it, about
+16 MiB. Identifiers are exempt: a shortened session id cannot resume anything and a
+shortened tool id cannot be matched to its call.
+
 Under a structured format there is no silent fallback to raw stdout: a run that produced no
 recognizable records, or never reached its terminal record, returns `Error::Parse` rather
 than a plausible-looking answer assembled from whatever was printed.

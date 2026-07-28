@@ -255,6 +255,46 @@ impl Agent {
         }
     }
 
+    /// The command that resolves a missing login for this agent.
+    ///
+    /// Verified against each CLI's own help: Codex and Copilot expose a `login`
+    /// subcommand, while Claude authenticates interactively or through a
+    /// long-lived token.
+    #[must_use]
+    pub fn login_hint(self) -> &'static str {
+        match self {
+            Agent::Claude => {
+                "run `claude` and use /login, or `claude setup-token` for a \
+                              long-lived token"
+            }
+            Agent::Codex => "run `codex login`",
+            Agent::Copilot => "run `copilot login`",
+        }
+    }
+
+    /// The release this crate's flag mappings were verified against.
+    ///
+    /// Every mapping in this module was checked by running these exact
+    /// versions, not by reading their documentation. [`crate::Probe`] compares
+    /// an installed CLI against this so drift is a question a host can ask up
+    /// front rather than something a failing run reveals.
+    #[must_use]
+    pub fn verified_version(self) -> crate::Version {
+        let (major, minor, patch) = match self {
+            // `claude --version` -> "2.1.205 (Claude Code)"
+            Agent::Claude => (2, 1, 205),
+            // `codex --version` -> "codex-cli 0.145.0"
+            Agent::Codex => (0, 145, 0),
+            // `copilot --version` -> "GitHub Copilot CLI 1.0.75."
+            Agent::Copilot => (1, 0, 75),
+        };
+        crate::Version {
+            major,
+            minor,
+            patch,
+        }
+    }
+
     /// The documented install command, surfaced by [`Error::NotInstalled`].
     #[must_use]
     pub fn install_hint(self) -> &'static str {

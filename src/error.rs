@@ -124,6 +124,42 @@ pub enum Error {
         detail: String,
     },
 
+    /// The agent has no usable credentials.
+    ///
+    /// Its own category because the remedy is a specific human action rather
+    /// than anything about the request, and because it is easy to reach by
+    /// accident: [`crate::EnvPolicy::Minimal`] withholds the environment by
+    /// default, so a credential this crate does not know to pass through
+    /// presents as a login failure rather than a configuration one.
+    #[error("`{bin}` is not authenticated: {message}. To fix: {hint}")]
+    NotAuthenticated {
+        /// The agent that refused.
+        agent: Agent,
+        /// The binary that refused.
+        bin: String,
+        /// The provider's own wording, unedited.
+        message: String,
+        /// The command that resolves it.
+        hint: &'static str,
+    },
+
+    /// The CLI rejected an argument this crate passed it.
+    ///
+    /// Almost always a version mismatch: the flag was verified against the
+    /// release named in [`crate::Agent::verified_version`] and the installed
+    /// one differs. Separated from [`Error::Failed`] because the remedy is
+    /// different: nothing about the request is wrong, the wrapper and the CLI
+    /// disagree. Run [`crate::Probe`] to confirm.
+    #[error(
+        "`{bin}` rejected an argument, which usually means its version differs from the one these flags were verified against: {detail}"
+    )]
+    FlagRejected {
+        /// The binary that refused.
+        bin: String,
+        /// Its own complaint, unedited.
+        detail: String,
+    },
+
     /// The run was stopped by [`crate::Run::cancel`] or by dropping its handle.
     ///
     /// Not a fault: the caller asked for this. Distinguished from
@@ -194,5 +230,14 @@ impl Error {
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
         matches!(self, Error::Cancelled { .. })
+    }
+
+    /// Whether this failed because the agent has no usable credentials.
+    ///
+    /// Worth branching on in a UI: unlike most failures, the user can fix it,
+    /// and [`Error::NotAuthenticated`] carries the command that does.
+    #[must_use]
+    pub fn is_auth_failure(&self) -> bool {
+        matches!(self, Error::NotAuthenticated { .. })
     }
 }

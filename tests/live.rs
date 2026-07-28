@@ -14,7 +14,8 @@
 use std::time::Duration;
 
 use agent_abstraction::{
-    Agent, EnvPolicy, Event, Format, Permission, Request, SessionStore, run, stream,
+    Agent, EnvPolicy, Event, Format, Permission, Probe, Request, SessionStore, VersionStatus, run,
+    stream,
 };
 
 /// A prompt with exactly one correct answer, so the assertion is about the
@@ -446,4 +447,33 @@ async fn a_missing_agent_reports_how_to_install_it() {
         !hint.is_empty(),
         "a missing agent must say how to install it"
     );
+}
+
+/// Probing costs no quota, just `--version`, so unlike the rest of this file it
+/// runs by default. It is also the test that catches flag drift *before* a run
+/// fails on it: if an agent updates underneath us, this goes red and names the
+/// version rather than leaving someone to decode an unexpected-argument error.
+#[tokio::test]
+async fn installed_agents_match_the_versions_the_flags_were_verified_against() {
+    let mut checked = 0;
+    for agent in Agent::ALL {
+        if !available(agent) {
+            continue;
+        }
+        let probe = Probe::run(agent).await.expect("probe failed");
+        checked += 1;
+
+        assert!(
+            probe.version.is_some(),
+            "{agent} reported {:?}, which carries no readable version",
+            probe.reported
+        );
+        assert_eq!(
+            probe.status,
+            VersionStatus::Verified,
+            "{}",
+            probe.advisory().unwrap_or_default()
+        );
+    }
+    eprintln!("probed {checked} installed agents");
 }
