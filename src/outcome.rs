@@ -89,8 +89,18 @@ pub struct Outcome {
     pub rate_limit: Option<RateLimit>,
     /// The process exit code.
     pub exit_code: i32,
-    /// Raw stderr, kept for diagnostics.
+    /// Raw stderr, kept for diagnostics and capped at
+    /// [`crate::MAX_CAPTURE`].
     pub stderr: String,
+    /// How many output lines could not be parsed, with the first as a sample.
+    ///
+    /// Agents interleave banners with their JSON, so a non-zero count is not
+    /// automatically a fault. It becomes one when paired with an empty [`Self::text`],
+    /// which is what a vendor changing its output shape looks like from here.
+    /// See [`Outcome::looks_like_a_format_change`].
+    pub unparsed: usize,
+    /// The first line that failed to parse.
+    pub first_unparsed: Option<String>,
 }
 
 impl Outcome {
@@ -98,5 +108,16 @@ impl Outcome {
     #[must_use]
     pub fn is_ok(&self) -> bool {
         self.exit_code == 0 && self.stop == Stop::Completed
+    }
+
+    /// Whether this run looks like the agent changed its output format.
+    ///
+    /// The signature is a process that exited successfully while every line it
+    /// printed was unreadable: the CLI is healthy and this crate's parser is
+    /// not. Worth logging loudly, because the alternative symptom is a
+    /// successful run that mysteriously returns nothing.
+    #[must_use]
+    pub fn looks_like_a_format_change(&self) -> bool {
+        self.exit_code == 0 && self.unparsed > 0 && self.text.trim().is_empty()
     }
 }

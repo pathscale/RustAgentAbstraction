@@ -157,6 +157,11 @@ impl Request {
     /// binding is written back once the run yields an id. `fork` branches a new
     /// conversation off the stored one instead of appending to it.
     ///
+    /// The store is cloned into the request so the run can write the binding
+    /// back without borrowing it. That clone is a [`PathBuf`], not the sessions
+    /// themselves: records are read and written on demand and never held in
+    /// memory, so this stays cheap however many sessions exist.
+    ///
     /// # Errors
     /// [`crate::Error::SessionConflict`] if the name belongs to another agent,
     /// or [`crate::Error::Unsupported`] if this agent cannot fork or has no

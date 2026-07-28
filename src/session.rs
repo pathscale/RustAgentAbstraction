@@ -28,7 +28,9 @@ use crate::error::{Error, Result};
 /// One named conversation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionRecord {
-    /// The caller's stable name, as stored (sanitized for a path).
+    /// The caller's stable name, exactly as they supplied it. The on-disk
+    /// filename is an encoded form of this; the record keeps the original so a
+    /// listing hands back the name the caller actually used.
     pub name: String,
     /// The project this session belongs to.
     pub project: String,
@@ -88,7 +90,7 @@ impl SessionStore {
     pub fn path_of(&self, project: &Path, name: &str) -> PathBuf {
         self.dir
             .join(project_slug(project))
-            .join(format!("{}.json", sanitize(name)))
+            .join(format!("{}.json", encode_segment(name)))
     }
 
     /// The stored record, or `None` when absent.
@@ -188,7 +190,7 @@ impl SessionStore {
     ) -> Result<SessionRecord> {
         let now = now_secs();
         let record = SessionRecord {
-            name: sanitize(name),
+            name: name.to_string(),
             project: project.display().to_string(),
             agent,
             token: token.to_string(),
@@ -240,32 +242,78 @@ fn now_secs() -> i64 {
         .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
 }
 
-/// Reduce an arbitrary name to one safe path segment.
-fn sanitize(name: &str) -> String {
-    let cleaned: String = name
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect();
-    let trimmed = cleaned.trim_matches('-').to_ascii_lowercase();
-    // Collapse runs of separators so `a//b` and `a-b` do not both appear.
-    let mut out = String::with_capacity(trimmed.len());
-    for c in trimmed.chars() {
-        if c == '-' && out.ends_with('-') {
-            continue;
+/// The longest encoded stem written before truncation applies. Filenames cap
+/// near 255 bytes on every filesystem this targets, leaving room for the
+/// disambiguating suffix and the extension.
+const MAX_STEM: usize = 200;
+
+/// Encode an arbitrary name as one filesystem-safe path segment, injectively.
+///
+/// Percent-encodes every byte outside `[a-z0-9._-]`, which keeps the mapping
+/// reversible and, more importantly, **collision-free**. A lossy scheme that
+/// folded unsafe characters to `-` would map `café` and `cafe-` onto one file,
+/// and the second session to use that name would silently resume the first
+/// one's conversation.
+///
+/// Uppercase letters are encoded rather than lowercased because macOS and
+/// Windows are case-insensitive: leaving them intact would let `Chat` and `chat`
+/// collide on exactly the platforms this crate targets. `%` is itself always
+/// encoded, so an escape marker is unambiguous and no literal character can be
+/// mistaken for one.
+///
+/// Names too long to encode whole are truncated and disambiguated with a hash of
+/// the full input, so the length bound costs readability but never uniqueness.
+fn encode_segment(name: &str) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::with_capacity(name.len());
+    for byte in name.bytes() {
+        if byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_' | b'.')
+        {
+            out.push(byte as char);
+        } else {
+            // Uppercase hex only, so an escape never varies by case either.
+            let _ = write!(out, "%{byte:02X}");
         }
-        out.push(c);
     }
     if out.is_empty() {
-        "unnamed".into()
-    } else {
-        out
+        return "unnamed".into();
     }
+    if out.len() > MAX_STEM {
+        // Cut between encoded units so a half-written `%4` is never emitted.
+        let mut cut = MAX_STEM;
+        while cut > 0 && !is_encoding_boundary(&out, cut) {
+            cut -= 1;
+        }
+        return format!("{}-{:016x}", &out[..cut], fnv1a(name.as_bytes()));
+    }
+    out
 }
 
-/// A directory path reduced to one path segment, so sessions partition by
-/// project without nesting the whole absolute path.
+/// Whether `at` splits `s` between encoded units rather than inside a `%XX`.
+fn is_encoding_boundary(s: &str, at: usize) -> bool {
+    let b = s.as_bytes();
+    !((at >= 1 && b[at - 1] == b'%') || (at >= 2 && b[at - 2] == b'%'))
+}
+
+/// FNV-1a, 64-bit. Chosen over [`std::hash::DefaultHasher`], whose algorithm is
+/// explicitly allowed to change between Rust releases: that would silently
+/// repoint every stored session on a toolchain upgrade. This is fixed forever.
+/// It is not cryptographic and does not need to be, since it only disambiguates
+/// names the caller chose.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// A project path reduced to one path segment, so sessions partition by project
+/// without nesting the whole absolute path.
 fn project_slug(project: &Path) -> String {
-    sanitize(&project.display().to_string())
+    encode_segment(&project.display().to_string())
 }
 
 #[cfg(test)]
@@ -284,21 +332,109 @@ mod tests {
 
     #[test]
     fn names_and_projects_reduce_to_one_safe_segment() {
-        assert_eq!(sanitize("Greet Flow"), "greet-flow");
-        assert_eq!(sanitize("../../etc/passwd"), "etc-passwd");
-        assert_eq!(sanitize("!!!"), "unnamed");
-        assert_eq!(
-            project_slug(Path::new("/home/me/My Proj")),
-            "home-me-my-proj"
-        );
+        // Readable names pass through untouched, which is the point of encoding
+        // only what has to be encoded.
+        assert_eq!(encode_segment("greet-flow"), "greet-flow");
+        assert_eq!(encode_segment("v1.2_final"), "v1.2_final");
+        assert_eq!(encode_segment(""), "unnamed");
+
+        // `.` stays literal for readability, so traversal safety rests entirely
+        // on the separator being encoded. A `..` embedded in a segment is inert.
+        for name in ["../../etc/passwd", "..", ".", "a/b", "a\\b"] {
+            let encoded = encode_segment(name);
+            assert!(!encoded.contains('/'), "{name:?} kept a separator");
+            assert!(!encoded.contains('\\'), "{name:?} kept a separator");
+            assert!(
+                Path::new(&encoded).components().count() == 1,
+                "{name:?} encoded to more than one component"
+            );
+        }
+        assert!(!project_slug(Path::new("/home/me/My Proj")).contains('/'));
+    }
+
+    /// The property that matters: distinct names never share a file. The old
+    /// fold-to-dash scheme mapped `café` and `cafe-` together, so the second
+    /// session to use that name silently resumed the first one's conversation.
+    #[test]
+    fn distinct_names_never_share_an_encoded_segment() {
+        let names = [
+            "café",
+            "cafe-",
+            "cafe",
+            "Chat",
+            "chat",
+            "CHAT",
+            "a/b",
+            "a-b",
+            "a b",
+            "..",
+            "%41",
+            "A",
+            "日本語",
+            "🙂",
+        ];
+        let mut seen = std::collections::HashMap::new();
+        for name in names {
+            // Compare case-insensitively: macOS and Windows would treat two
+            // segments differing only by case as the same file.
+            let key = encode_segment(name).to_ascii_lowercase();
+            if let Some(previous) = seen.insert(key.clone(), name) {
+                panic!("{name:?} and {previous:?} both encode to {key:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_very_long_name_stays_within_filename_limits_and_stays_unique() {
+        let a = "x".repeat(5_000);
+        let b = format!("{a}different");
+        let (ea, eb) = (encode_segment(&a), encode_segment(&b));
+
+        // Room for the `.json` extension under a 255-byte filename cap.
+        assert!(ea.len() < 250, "{}", ea.len());
+        assert!(eb.len() < 250);
+        assert_ne!(ea, eb, "truncation must not collapse distinct names");
+    }
+
+    #[test]
+    fn truncation_never_splits_an_escape_sequence() {
+        // All-uppercase encodes to three bytes per character, forcing the cut.
+        let encoded = encode_segment(&"A".repeat(2_000));
+        let stem = encoded.rsplit_once('-').unwrap().0;
+        // Every `%` in the stem must still be followed by two hex digits.
+        for (i, _) in stem.match_indices('%') {
+            assert!(i + 2 < stem.len(), "escape split at {i} in {stem:?}");
+        }
+    }
+
+    /// The record keeps the caller's name verbatim, so a listing can hand back
+    /// what they actually passed rather than a mangled path segment.
+    #[test]
+    fn the_record_preserves_the_original_name() {
+        let (store, project) = store("original-name");
+        store
+            .bind(Agent::Claude, &project, "Greet Flow ☕", "t-1")
+            .unwrap();
+        let record = store.get(&project, "Greet Flow ☕").unwrap();
+        assert_eq!(record.name, "Greet Flow ☕");
+        assert_eq!(store.list(&project)[0].name, "Greet Flow ☕");
+        fs::remove_dir_all(&store.dir).ok();
     }
 
     #[test]
     fn a_path_traversing_name_cannot_escape_the_store() {
         let (store, project) = store("escape");
-        let path = store.path_of(&project, "../../etc/passwd");
-        assert_eq!(path.file_name().unwrap(), "etc-passwd.json");
-        assert!(path.starts_with(&store.dir));
+        for name in ["../../etc/passwd", "..", "/etc/passwd", "a/../../b"] {
+            let path = store.path_of(&project, name);
+            assert!(path.starts_with(&store.dir), "{name:?} escaped to {path:?}");
+            // The whole name has to land in exactly one filename, so no part of
+            // it can be reinterpreted as a directory step.
+            assert_eq!(
+                path.strip_prefix(&store.dir).unwrap().components().count(),
+                2,
+                "{name:?} produced extra path components: {path:?}"
+            );
+        }
     }
 
     #[test]

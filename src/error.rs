@@ -123,6 +123,21 @@ pub enum Error {
         /// What specifically was wrong.
         detail: String,
     },
+
+    /// The task driving the run panicked or was cancelled, so there is no
+    /// outcome to report.
+    ///
+    /// Distinct from [`Error::Spawn`] on purpose: the process started fine, and
+    /// reporting this as a spawn failure would name the wrong cause. It is also
+    /// why this is not squeezed into an [`std::io::Error`], which a dropped
+    /// runtime task is not.
+    #[error("the run of `{bin}` was interrupted: {detail}")]
+    Interrupted {
+        /// The binary that was running.
+        bin: String,
+        /// Whether the task panicked or was cancelled.
+        detail: String,
+    },
 }
 
 impl Error {
