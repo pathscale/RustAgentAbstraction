@@ -89,6 +89,7 @@ mod agent;
 mod error;
 mod event;
 mod outcome;
+mod probe;
 mod proc;
 mod request;
 mod run;
@@ -98,6 +99,7 @@ pub use agent::{Agent, Caps, EnvPolicy, Format, NETWORK_ENV, Permission, Session
 pub use error::{Error, Result};
 pub use event::{Event, MAX_CAPTURE};
 pub use outcome::{Outcome, RateLimit, Stop, Usage};
+pub use probe::{Probe, Version, VersionStatus};
 pub use request::Request;
 pub use run::{Run, run, stream};
 pub use session::{Phase, SessionRecord, SessionStore};

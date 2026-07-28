@@ -255,6 +255,29 @@ impl Agent {
         }
     }
 
+    /// The release this crate's flag mappings were verified against.
+    ///
+    /// Every mapping in this module was checked by running these exact
+    /// versions, not by reading their documentation. [`crate::Probe`] compares
+    /// an installed CLI against this so drift is a question a host can ask up
+    /// front rather than something a failing run reveals.
+    #[must_use]
+    pub fn verified_version(self) -> crate::Version {
+        let (major, minor, patch) = match self {
+            // `claude --version` -> "2.1.205 (Claude Code)"
+            Agent::Claude => (2, 1, 205),
+            // `codex --version` -> "codex-cli 0.145.0"
+            Agent::Codex => (0, 145, 0),
+            // `copilot --version` -> "GitHub Copilot CLI 1.0.75."
+            Agent::Copilot => (1, 0, 75),
+        };
+        crate::Version {
+            major,
+            minor,
+            patch,
+        }
+    }
+
     /// The documented install command, surfaced by [`Error::NotInstalled`].
     #[must_use]
     pub fn install_hint(self) -> &'static str {

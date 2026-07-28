@@ -617,11 +617,41 @@ fn classify(bin: &str, code: i32, stderr: &str, stdout: &str, terminal: &Termina
                 .unwrap_or_else(|| "usage limit reached".to_string()),
         };
     }
+    // A rejected flag is not a failed request, it is this crate and the CLI
+    // disagreeing about what the CLI accepts. Naming that is the difference
+    // between "the run failed" and "your codex is a different version".
+    if let Some(detail) = rejected_flag(stderr).or_else(|| rejected_flag(stdout)) {
+        return Error::FlagRejected {
+            bin: bin.to_string(),
+            detail,
+        };
+    }
     Error::Failed {
         bin: bin.to_string(),
         code,
         stderr: first_meaningful_line(stderr).unwrap_or_default(),
     }
+}
+
+/// The CLI's complaint, if it refused an argument.
+///
+/// The phrasings are clap's and commander's, which is what all three CLIs are
+/// built on. Matched narrowly: a false positive would relabel a genuine failure
+/// as a version problem and send someone chasing the wrong thing.
+fn rejected_flag(text: &str) -> Option<String> {
+    const REJECTIONS: &[&str] = &[
+        "unexpected argument",
+        "unknown option",
+        "unrecognized option",
+        "unknown flag",
+        "invalid option",
+        "unexpected option",
+    ];
+    let lower = text.to_ascii_lowercase();
+    REJECTIONS
+        .iter()
+        .any(|needle| lower.contains(needle))
+        .then(|| first_meaningful_line(text).unwrap_or_default())
 }
 
 /// Whether text carries a provider quota refusal.
@@ -732,6 +762,42 @@ mod tests {
             classify("claude", 1, "boom", "", &terminal),
             Error::Failed { .. }
         ));
+    }
+
+    /// The exact failure that cost a round of debugging: `codex exec resume`
+    /// rejects `--sandbox`, which `Error::Failed` reported as a generic
+    /// non-zero exit naming a flag rather than a version mismatch.
+    #[test]
+    fn a_rejected_flag_is_named_as_a_version_mismatch() {
+        let err = classify(
+            "codex",
+            2,
+            "error: unexpected argument '--sandbox' found",
+            "",
+            &Terminal::default(),
+        );
+        let Error::FlagRejected { bin, detail } = err else {
+            panic!("expected FlagRejected, got {err:?}")
+        };
+        assert_eq!(bin, "codex");
+        assert!(detail.contains("--sandbox"), "{detail}");
+    }
+
+    #[test]
+    fn ordinary_failures_are_not_mistaken_for_version_drift() {
+        for stderr in [
+            "error: no such file or directory",
+            "model not found",
+            "permission denied",
+        ] {
+            assert!(
+                matches!(
+                    classify("codex", 1, stderr, "", &Terminal::default()),
+                    Error::Failed { .. }
+                ),
+                "{stderr:?} should stay a plain failure"
+            );
+        }
     }
 
     #[test]

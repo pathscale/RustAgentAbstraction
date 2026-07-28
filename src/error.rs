@@ -124,6 +124,23 @@ pub enum Error {
         detail: String,
     },
 
+    /// The CLI rejected an argument this crate passed it.
+    ///
+    /// Almost always a version mismatch: the flag was verified against the
+    /// release named in [`crate::Agent::verified_version`] and the installed
+    /// one differs. Separated from [`Error::Failed`] because the remedy is
+    /// different: nothing about the request is wrong, the wrapper and the CLI
+    /// disagree. Run [`crate::Probe`] to confirm.
+    #[error(
+        "`{bin}` rejected an argument, which usually means its version differs from the one these flags were verified against: {detail}"
+    )]
+    FlagRejected {
+        /// The binary that refused.
+        bin: String,
+        /// Its own complaint, unedited.
+        detail: String,
+    },
+
     /// The run was stopped by [`crate::Run::cancel`] or by dropping its handle.
     ///
     /// Not a fault: the caller asked for this. Distinguished from
