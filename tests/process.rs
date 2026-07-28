@@ -13,7 +13,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use agent_abstraction::{Agent, Request, stream};
+use agent_abstraction::{Agent, EnvPolicy, Request, stream};
 
 /// A scratch directory unique to one test.
 fn scratch(tag: &str) -> PathBuf {
@@ -163,5 +163,72 @@ async fn detach_lets_a_run_outlive_its_handle() {
     let _ = std::process::Command::new("kill")
         .args(["-9", &grandchild.to_string()])
         .status();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Write a script that dumps its own environment, as a stand-in for an agent
+/// (or any command an agent runs) observing what it inherited.
+fn env_dumping_agent(dir: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let script = dir.join("dump-env.sh");
+    std::fs::write(&script, "#!/bin/sh\nenv\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+    script
+}
+
+/// Collect everything the fake agent printed.
+async fn captured_env(request: &Request) -> String {
+    let mut running = stream(request).expect("spawn failed");
+    let mut seen = String::new();
+    while let Some(event) = running.recv().await {
+        if let agent_abstraction::Event::Text(line) = event {
+            seen.push_str(&line);
+            seen.push('\n');
+        }
+    }
+    let _ = running.finish().await;
+    seen
+}
+
+/// `EnvPolicy::Minimal` has to actually withhold the host's environment.
+///
+/// Cargo injects a pile of `CARGO_*` variables into this test process, which
+/// stand in for the unrelated secrets a Tauri or server host would be holding.
+/// Under `Inherit` they reach the agent; under `Minimal` they must not.
+#[tokio::test]
+async fn a_minimal_environment_withholds_the_hosts_variables() {
+    let dir = scratch("env");
+    let script = env_dumping_agent(&dir);
+    let base = || {
+        Request::new(Agent::Claude, "hi")
+            .bin(script.to_str().unwrap())
+            .format(agent_abstraction::Format::Text)
+    };
+
+    let inherited = captured_env(&base()).await;
+    assert!(
+        inherited.contains("CARGO"),
+        "the control case is broken: Inherit should pass the host environment"
+    );
+
+    let minimal = captured_env(&base().env_policy(EnvPolicy::Minimal)).await;
+    assert!(
+        !minimal.contains("CARGO"),
+        "host variables leaked under EnvPolicy::Minimal:\n{minimal}"
+    );
+    // ...while still passing what the agent needs to work at all.
+    assert!(minimal.contains("PATH="), "PATH must survive:\n{minimal}");
+    assert!(minimal.contains("HOME="), "HOME must survive:\n{minimal}");
+
+    // An explicit variable always wins over the policy.
+    let explicit = captured_env(
+        &base()
+            .env_policy(EnvPolicy::Minimal)
+            .env("AA_EXPLICIT", "kept"),
+    )
+    .await;
+    assert!(explicit.contains("AA_EXPLICIT=kept"), "{explicit}");
+
     std::fs::remove_dir_all(&dir).ok();
 }

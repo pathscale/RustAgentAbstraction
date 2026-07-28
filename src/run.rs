@@ -15,7 +15,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 
-use crate::agent::Continue;
+use crate::agent::{Continue, EnvPolicy};
 use crate::error::{Error, Result};
 use crate::event::{Event, Parser, Terminal, append_capped};
 use crate::outcome::{Outcome, Stop};
@@ -217,8 +217,18 @@ pub fn stream(request: &Request) -> Result<Run> {
     if let Some(cwd) = &request.cwd {
         command.current_dir(cwd);
     }
-    if request.clear_env {
-        command.env_clear();
+    // Narrow the environment first, then apply explicit variables, so an
+    // explicit `env()` always wins over the policy.
+    match &request.env_policy {
+        EnvPolicy::Inherit => {}
+        EnvPolicy::Minimal => {
+            command.env_clear();
+            inherit_named(&mut command, &request.agent.essential_env());
+        }
+        EnvPolicy::Only(names) => {
+            command.env_clear();
+            inherit_named(&mut command, names);
+        }
     }
     for (key, value) in &request.env {
         command.env(key, value);
@@ -260,6 +270,16 @@ pub fn stream(request: &Request) -> Result<Run> {
         task: Some(task),
         argv,
     })
+}
+
+/// Copy the named variables from this process into `command`, skipping any that
+/// are unset so nothing is invented.
+fn inherit_named<S: AsRef<str>>(command: &mut Command, names: &[S]) {
+    for name in names {
+        if let Some(value) = std::env::var_os(name.as_ref()) {
+            command.env(name.as_ref(), value);
+        }
+    }
 }
 
 /// Owns the child and tears down its whole process group when dropped.

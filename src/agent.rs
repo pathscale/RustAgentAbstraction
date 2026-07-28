@@ -92,6 +92,60 @@ pub enum Permission {
     Bypass,
 }
 
+/// Environment variables that route an agent's traffic through a corporate
+/// proxy or a custom certificate authority.
+///
+/// Not included in [`EnvPolicy::Minimal`]: they are situational, and the proxy
+/// URLs frequently carry credentials. Offered here so a host can present them
+/// as an explicit setting and forward the ones it wants with
+/// [`crate::Request::env`], rather than every caller rediscovering the names.
+///
+/// ```no_run
+/// # use agent_abstraction::{Agent, EnvPolicy, NETWORK_ENV, Request};
+/// let mut request = Request::new(Agent::Claude, "hi").env_policy(EnvPolicy::Minimal);
+/// // Forward only the proxy settings this host actually has.
+/// for name in NETWORK_ENV {
+///     if let Ok(value) = std::env::var(name) {
+///         request = request.env(*name, value);
+///     }
+/// }
+/// ```
+pub const NETWORK_ENV: &[&str] = &[
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "NODE_EXTRA_CA_CERTS",
+];
+
+/// Which of the host's environment variables reach the agent.
+///
+/// The default is [`EnvPolicy::Inherit`], matching how a CLI behaves when run
+/// from a shell. In an embedded host that also hands the agent, and every
+/// command it runs, whatever unrelated secrets the process happens to hold:
+/// cloud credentials, CI tokens, database URLs.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum EnvPolicy {
+    /// Pass the whole parent environment through.
+    #[default]
+    Inherit,
+    /// Pass through only what the selected agent needs, per
+    /// [`Agent::essential_env`], plus anything set with [`crate::Request::env`].
+    ///
+    /// The crate owns this list rather than the caller, because "what does this
+    /// CLI need to work" is knowledge about the agent, and an incomplete
+    /// hand-written list produces a run that fails in a way that looks like an
+    /// auth problem.
+    Minimal,
+    /// Pass through only these names, plus anything set with
+    /// [`crate::Request::env`]. Names unset in the parent are skipped.
+    Only(Vec<String>),
+}
+
 /// Output shape requested from the agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -145,7 +199,7 @@ pub struct Plan {
 /// Prompts at or above this many bytes are piped on stdin rather than placed on
 /// the argv. Well under the ~1 MiB `ARG_MAX` floor on macOS, with room for the
 /// rest of the command line and the inherited environment.
-pub const STDIN_THRESHOLD: usize = 128 * 1024;
+pub(crate) const STDIN_THRESHOLD: usize = 128 * 1024;
 
 impl Agent {
     /// Every agent, in a stable order.
@@ -179,6 +233,68 @@ impl Agent {
             Agent::Codex => "npm install -g @openai/codex",
             Agent::Copilot => "npm install -g @github/copilot",
         }
+    }
+
+    /// The environment variables this agent needs to function, used by
+    /// [`EnvPolicy::Minimal`].
+    ///
+    /// Two groups: what any process needs to start, and this agent's own
+    /// credential and config variables. A name absent from the parent
+    /// environment is skipped, so nothing here is fabricated.
+    ///
+    /// Proxy and custom-CA variables are deliberately **not** here. They are
+    /// environment-specific rather than required, and `HTTP_PROXY` /
+    /// `HTTPS_PROXY` routinely embed credentials (`http://user:pass@proxy`), so
+    /// passing them automatically would leak one through the very policy meant
+    /// to withhold secrets. A host that needs them should offer them as a
+    /// setting and pass them with [`crate::Request::env`]; [`NETWORK_ENV`] names
+    /// them so a settings screen does not have to hardcode the list.
+    ///
+    /// `PATH`, `HOME` and `USER` are the verified floor on macOS: all three CLIs
+    /// answer correctly with exactly those set, and Claude reports "Not logged
+    /// in" without `USER`, since its keychain lookup is keyed on it. The Windows
+    /// names are included on the same reasoning but are **not** verified, as
+    /// this crate has not been run there.
+    #[must_use]
+    pub fn essential_env(self) -> Vec<&'static str> {
+        // Needed by any child process, plus the locale and temp dir the CLIs
+        // use for scratch files.
+        const BASE: &[&str] = &[
+            "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "LANG", "LC_ALL",
+        ];
+        // Unverified: this crate has not been exercised on Windows.
+        const WINDOWS: &[&str] = &[
+            "USERPROFILE",
+            "APPDATA",
+            "LOCALAPPDATA",
+            "SystemRoot",
+            "SystemDrive",
+            "TEMP",
+            "TMP",
+            "PATHEXT",
+            "ComSpec",
+        ];
+        let agent: &[&str] = match self {
+            Agent::Claude => &[
+                "ANTHROPIC_API_KEY",
+                "ANTHROPIC_AUTH_TOKEN",
+                "ANTHROPIC_BASE_URL",
+                "CLAUDE_CONFIG_DIR",
+            ],
+            Agent::Codex => &[
+                "CODEX_HOME",
+                "CODEX_API_KEY",
+                "OPENAI_API_KEY",
+                "OPENAI_BASE_URL",
+            ],
+            Agent::Copilot => &[
+                "GH_TOKEN",
+                "GITHUB_TOKEN",
+                "COPILOT_ALLOW_ALL",
+                "XDG_CONFIG_HOME",
+            ],
+        };
+        BASE.iter().chain(WINDOWS).chain(agent).copied().collect()
     }
 
     /// What this agent supports.
@@ -437,10 +553,24 @@ fn argv_codex(plan: &Plan) -> Vec<String> {
     // `read-only` by default, so nothing is unrecoverable regardless.
     a.bare("--skip-git-repo-check");
 
-    match plan.permission {
-        Permission::Bypass => a.bare("--dangerously-bypass-approvals-and-sandbox"),
-        Permission::ReadOnly | Permission::Plan => a.pair("--sandbox", "read-only"),
-        Permission::Edit | Permission::Auto => a.pair("--sandbox", "workspace-write"),
+    // `codex exec` takes `--sandbox`, but `codex exec resume` does **not**: it
+    // rejects the flag outright and takes the same setting as a `-c` config
+    // override instead. Verified against codex-cli 0.145.0, where passing
+    // `--sandbox` to a resume fails with "unexpected argument '--sandbox'".
+    // Dropping the sandbox on resume would silently run a continued turn under a
+    // different posture than the caller asked for.
+    let resuming = matches!(plan.cont, Continue::Resume(_));
+    let sandbox = match plan.permission {
+        Permission::Bypass => None,
+        Permission::ReadOnly | Permission::Plan => Some("read-only"),
+        Permission::Edit | Permission::Auto => Some("workspace-write"),
+    };
+    match (sandbox, resuming) {
+        (None, _) => a.bare("--dangerously-bypass-approvals-and-sandbox"),
+        (Some(mode), false) => a.pair("--sandbox", mode),
+        // The value is TOML-parsed, falling back to a raw string, so the bare
+        // token is read as the mode name.
+        (Some(mode), true) => a.pair("-c", format!("sandbox_mode={mode}")),
     };
 
     a.opt("--model", plan.model.as_ref());
@@ -629,6 +759,47 @@ mod tests {
         assert_eq!(a.last().unwrap(), "hi");
     }
 
+    /// `Minimal` exists to withhold secrets, so nothing it passes through may
+    /// be a credential carrier. Proxy URLs in particular routinely embed
+    /// `user:pass`, which is why they are offered separately instead.
+    #[test]
+    fn the_minimal_environment_carries_no_proxy_variables() {
+        for agent in Agent::ALL {
+            let essential = agent.essential_env();
+            for name in NETWORK_ENV {
+                assert!(
+                    !essential.contains(name),
+                    "{agent} would pass {name} through EnvPolicy::Minimal"
+                );
+            }
+        }
+    }
+
+    /// The floor verified live on macOS: with exactly these set, all three CLIs
+    /// authenticate and answer. Claude reports "Not logged in" without `USER`.
+    #[test]
+    fn every_agent_asks_for_the_verified_floor() {
+        for agent in Agent::ALL {
+            let essential = agent.essential_env();
+            for name in ["PATH", "HOME", "USER"] {
+                assert!(essential.contains(&name), "{agent} omits {name}");
+            }
+        }
+    }
+
+    /// Each agent's own credentials, and nobody else's.
+    #[test]
+    fn agents_do_not_request_each_others_credentials() {
+        let claude = Agent::Claude.essential_env();
+        assert!(claude.contains(&"ANTHROPIC_API_KEY"));
+        assert!(!claude.contains(&"OPENAI_API_KEY"));
+        assert!(!claude.contains(&"GH_TOKEN"));
+
+        let codex = Agent::Codex.essential_env();
+        assert!(codex.contains(&"OPENAI_API_KEY"));
+        assert!(!codex.contains(&"ANTHROPIC_API_KEY"));
+    }
+
     /// The model is the caller's choice on every agent. It is forwarded
     /// verbatim and never defaulted, normalized, or validated here: a host with
     /// a model picker owns that list, and an unknown name must surface as the
@@ -672,6 +843,39 @@ mod tests {
                 argv(Agent::Codex, &p).contains(&"--skip-git-repo-check".to_string()),
                 "{cont:?} must still run outside a repo"
             );
+        }
+    }
+
+    /// `codex exec resume` rejects `--sandbox` and takes `-c sandbox_mode=`
+    /// instead. Getting this wrong makes every second turn fail with an
+    /// "unexpected argument" error, which only a multi-turn run reveals.
+    #[test]
+    fn codex_sets_the_sandbox_by_flag_when_fresh_and_by_config_when_resuming() {
+        let mut fresh = plan("codex");
+        fresh.permission = Permission::ReadOnly;
+        let a = argv(Agent::Codex, &fresh);
+        assert_eq!(a[pos(&a, "--sandbox").unwrap() + 1], "read-only");
+        assert!(pos(&a, "-c").is_none());
+
+        let mut resumed = fresh.clone();
+        resumed.cont = Continue::Resume("thread-9".into());
+        let a = argv(Agent::Codex, &resumed);
+        assert!(
+            pos(&a, "--sandbox").is_none(),
+            "resume rejects --sandbox: {a:?}"
+        );
+        assert_eq!(a[pos(&a, "-c").unwrap() + 1], "sandbox_mode=read-only");
+    }
+
+    #[test]
+    fn codex_bypass_uses_the_same_flag_on_both_paths() {
+        for cont in [Continue::New, Continue::Resume("t".into())] {
+            let mut p = plan("codex");
+            p.permission = Permission::Bypass;
+            p.cont = cont.clone();
+            let a = argv(Agent::Codex, &p);
+            assert!(a.contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()));
+            assert!(pos(&a, "--sandbox").is_none(), "{cont:?}: {a:?}");
         }
     }
 

@@ -93,7 +93,7 @@ mod request;
 mod run;
 mod session;
 
-pub use agent::{Agent, Caps, Continue, Format, Permission, Plan, STDIN_THRESHOLD, SessionSupport};
+pub use agent::{Agent, Caps, EnvPolicy, Format, NETWORK_ENV, Permission, SessionSupport};
 pub use error::{Error, Result};
 pub use event::{Event, MAX_CAPTURE};
 pub use outcome::{Outcome, RateLimit, Stop, Usage};
