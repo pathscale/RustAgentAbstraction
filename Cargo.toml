@@ -2,6 +2,8 @@
 name = "agent-abstraction"
 version = "0.1.0"
 edition = "2024"
+# The floor edition 2024 requires, and where the strictest dependencies (uuid,
+# getrandom) sit. Derived from the dependency graph rather than compile-tested.
 rust-version = "1.85"
 description = "Drive Claude Code, Codex and Copilot CLIs headlessly from Rust, as a library."
 license = "MIT"
@@ -35,6 +37,8 @@ which = "8"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+# The live tests mint UUIDs to prove a caller-assigned session id round-trips.
+uuid = { version = "1", features = ["v4"] }
 
 [lints.rust]
 missing_docs = "warn"

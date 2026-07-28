@@ -127,6 +127,93 @@ async fn codex_runs_outside_a_git_repository() {
     std::fs::remove_dir_all(&scratch).ok();
 }
 
+/// Claude and Copilot let the caller *assign* the session id up front. That is
+/// only worth relying on if the agent actually honours the id we hand it, so
+/// this asserts the round trip rather than trusting `--help`: the id we chose
+/// must come back unchanged, and must then be resumable.
+#[tokio::test]
+#[ignore = "spawns a real agent and consumes quota"]
+async fn a_caller_assigned_session_id_is_honoured_and_resumable() {
+    for agent in [Agent::Claude, Agent::Copilot] {
+        if !available(agent) {
+            continue;
+        }
+        // Both CLIs require a valid UUID.
+        let chosen = uuid::Uuid::new_v4().to_string();
+
+        let first = run(&ping(agent).session_id(&chosen))
+            .await
+            .unwrap_or_else(|e| panic!("{agent} rejected an assigned id: {e}"));
+        assert_eq!(
+            first.session.as_deref(),
+            Some(chosen.as_str()),
+            "{agent} did not honour the id it was given"
+        );
+
+        // The id is only useful if it also resumes the same conversation.
+        let second = run(&ping(agent).resume(&chosen))
+            .await
+            .unwrap_or_else(|e| panic!("{agent} could not resume the assigned id: {e}"));
+        assert_eq!(
+            second.session.as_deref(),
+            Some(chosen.as_str()),
+            "{agent} moved to a different session on resume"
+        );
+    }
+}
+
+/// Codex cannot be told an id: `codex exec` has no `--session-id`, so the only
+/// way to learn its `thread_id` is to read it back. Asking for an assigned one
+/// must fail loudly rather than silently starting an unrelated conversation.
+#[tokio::test]
+async fn codex_refuses_an_assigned_session_id() {
+    let err = Request::new(Agent::Codex, "hi")
+        .session_id("11111111-2222-3333-4444-555555555555")
+        .argv()
+        .unwrap_err();
+    assert!(
+        matches!(err, agent_abstraction::Error::Unsupported { .. }),
+        "got {err:?}"
+    );
+}
+
+/// Codex reports its `thread_id` in `thread.started`, which is the very first
+/// record of the stream and arrives *before* the model replies. A host can
+/// therefore persist the binding as soon as the stream opens rather than
+/// waiting for the turn to finish.
+#[tokio::test]
+#[ignore = "spawns a real agent and consumes quota"]
+async fn codex_reveals_its_thread_id_before_it_answers() {
+    if !available(Agent::Codex) {
+        return;
+    }
+    let mut running = stream(&ping(Agent::Codex).format(Format::Stream)).expect("spawn failed");
+
+    let mut first_event = None;
+    let mut text_seen_before_start = false;
+    while let Some(event) = running.recv().await {
+        match (&first_event, &event) {
+            (None, Event::Started { session, .. }) => {
+                assert!(!session.is_empty());
+                first_event = Some(session.clone());
+            }
+            (None, Event::Text(_)) => text_seen_before_start = true,
+            _ => {}
+        }
+    }
+    let outcome = running.finish().await.expect("run failed");
+
+    assert!(
+        first_event.is_some(),
+        "codex never announced a thread id on the stream"
+    );
+    assert!(
+        !text_seen_before_start,
+        "the id must arrive before any answer text, so a binding can be stored early"
+    );
+    assert_eq!(outcome.session, first_event);
+}
+
 /// The streaming path must deliver events *before* the run settles, and the
 /// terminal answer must still be authoritative afterwards.
 #[tokio::test]

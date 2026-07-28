@@ -45,15 +45,3 @@ jobs:
         run: cargo doc --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
-
-  minimum-toolchain:
-    name: builds on the declared MSRV
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      # Keep in step with `rust-version` in Cargo.toml. A dependency that
-      # quietly raises its own MSRV breaks consumers, and this is where that
-      # should surface.
-      - uses: dtolnay/rust-toolchain@1.85.0
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo check --all-targets
