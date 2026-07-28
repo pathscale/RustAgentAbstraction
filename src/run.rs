@@ -563,8 +563,19 @@ async fn drive(
         .rate_limit
         .as_ref()
         .is_some_and(crate::outcome::RateLimit::is_blocking);
-    if exit_code != 0 || quota_blocked {
-        return Err(classify(&bin, exit_code, &stderr, &raw, &terminal));
+    // An unauthenticated Claude run exits 0 and reports the problem in its
+    // result text, so checking only the exit code would hand back a successful
+    // Outcome whose answer is "Please run /login".
+    let unauthenticated = looks_unauthenticated(&terminal.text);
+    if exit_code != 0 || quota_blocked || unauthenticated {
+        return Err(classify_run(
+            request.agent,
+            &bin,
+            exit_code,
+            &stderr,
+            &raw,
+            &terminal,
+        ));
     }
 
     // A fork lands on a *new* id the agent only reveals at the end, so the name
@@ -601,6 +612,55 @@ async fn shut_down(child: &mut ChildGuard, stderr_task: tokio::task::JoinHandle<
     // The pipes are closed now that the child is gone, so this finishes
     // promptly rather than hanging the cancellation.
     stderr_task.await.unwrap_or_default()
+}
+
+/// Turn a failure into the most specific error available, agent included so an
+/// auth failure can carry the right login command.
+fn classify_run(
+    agent: crate::Agent,
+    bin: &str,
+    code: i32,
+    stderr: &str,
+    stdout: &str,
+    terminal: &Terminal,
+) -> Error {
+    // Checked before quota and before a plain failure: a login problem is the
+    // most specific reading of the output, and the only one a user can act on
+    // directly.
+    for source in [terminal.text.as_str(), stderr, stdout] {
+        if looks_unauthenticated(source) {
+            return Error::NotAuthenticated {
+                agent,
+                bin: bin.to_string(),
+                message: first_meaningful_line(source).unwrap_or_default(),
+                hint: agent.login_hint(),
+            };
+        }
+    }
+    classify(bin, code, stderr, stdout, terminal)
+}
+
+/// Whether text is an agent saying it has no usable credentials.
+///
+/// Narrow on purpose. Mislabelling an ordinary failure as an auth problem sends
+/// someone to re-login over something unrelated, so these are phrases the CLIs
+/// actually emit rather than every string containing "auth".
+fn looks_unauthenticated(text: &str) -> bool {
+    const PHRASES: &[&str] = &[
+        // Claude, verified: an unauthenticated run answers exactly this.
+        "not logged in",
+        "please run /login",
+        "invalid api key",
+        "authentication_error",
+        "unauthorized",
+        "not authenticated",
+        "no credentials",
+        "credentials not found",
+        "please log in",
+        "401",
+    ];
+    let lower = text.to_ascii_lowercase();
+    PHRASES.iter().any(|needle| lower.contains(needle))
 }
 
 /// Turn a non-zero exit into the most specific error available.
@@ -762,6 +822,67 @@ mod tests {
             classify("claude", 1, "boom", "", &terminal),
             Error::Failed { .. }
         ));
+    }
+
+    /// Verified against the real CLI: with `USER` withheld, claude answers
+    /// "Not logged in · Please run /login" and exits **0**. Checking only the
+    /// exit code hands back a successful Outcome whose answer is a login
+    /// prompt.
+    #[test]
+    fn an_unauthenticated_run_is_named_even_though_it_exits_zero() {
+        let terminal = Terminal {
+            text: "Not logged in · Please run /login".into(),
+            ..Terminal::default()
+        };
+        let err = classify_run(Agent::Claude, "claude", 0, "", "", &terminal);
+        let Error::NotAuthenticated { agent, hint, .. } = &err else {
+            panic!("expected NotAuthenticated, got {err:?}")
+        };
+        assert_eq!(*agent, Agent::Claude);
+        assert!(hint.contains("/login"), "{hint}");
+        assert!(err.is_auth_failure());
+    }
+
+    /// Each agent's hint has to name its own login route, since they differ:
+    /// Codex and Copilot have `login` subcommands, Claude does not.
+    #[test]
+    fn every_agent_offers_its_own_login_route() {
+        for (agent, expected) in [
+            (Agent::Claude, "setup-token"),
+            (Agent::Codex, "codex login"),
+            (Agent::Copilot, "copilot login"),
+        ] {
+            let err = classify_run(
+                agent,
+                agent.bin(),
+                1,
+                "error: unauthorized",
+                "",
+                &Terminal::default(),
+            );
+            let Error::NotAuthenticated { hint, .. } = &err else {
+                panic!("{agent}: expected NotAuthenticated, got {err:?}")
+            };
+            assert!(hint.contains(expected), "{agent}: {hint}");
+        }
+    }
+
+    /// Auth is the most specific reading, so it wins over a generic failure,
+    /// but must not swallow unrelated errors.
+    #[test]
+    fn ordinary_failures_are_not_mistaken_for_auth_problems() {
+        for stderr in [
+            "error: no such file or directory",
+            "model not found",
+            "rate limit exceeded",
+            "error: unexpected argument '--sandbox' found",
+        ] {
+            let err = classify_run(Agent::Codex, "codex", 1, stderr, "", &Terminal::default());
+            assert!(
+                !err.is_auth_failure(),
+                "{stderr:?} was misread as an auth failure: {err:?}"
+            );
+        }
     }
 
     /// The exact failure that cost a round of debugging: `codex exec resume`

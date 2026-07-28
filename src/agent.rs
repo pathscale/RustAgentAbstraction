@@ -255,6 +255,23 @@ impl Agent {
         }
     }
 
+    /// The command that resolves a missing login for this agent.
+    ///
+    /// Verified against each CLI's own help: Codex and Copilot expose a `login`
+    /// subcommand, while Claude authenticates interactively or through a
+    /// long-lived token.
+    #[must_use]
+    pub fn login_hint(self) -> &'static str {
+        match self {
+            Agent::Claude => {
+                "run `claude` and use /login, or `claude setup-token` for a \
+                              long-lived token"
+            }
+            Agent::Codex => "run `codex login`",
+            Agent::Copilot => "run `copilot login`",
+        }
+    }
+
     /// The release this crate's flag mappings were verified against.
     ///
     /// Every mapping in this module was checked by running these exact
