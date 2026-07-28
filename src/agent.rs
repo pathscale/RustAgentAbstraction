@@ -351,7 +351,7 @@ fn argv_claude(plan: &Plan) -> Vec<String> {
     a
 }
 
-/// `codex exec [resume <id>] [sandbox flags] [--model M] [--json] <prompt>`
+/// `codex exec [resume <id>] --skip-git-repo-check [sandbox flags] [--json] <prompt>`
 fn argv_codex(plan: &Plan) -> Vec<String> {
     let mut a = vec![plan.bin.clone(), "exec".into()];
     if let Continue::Resume(id) = &plan.cont {
@@ -359,6 +359,14 @@ fn argv_codex(plan: &Plan) -> Vec<String> {
         a.push("resume".into());
         a.push(id.clone());
     }
+
+    // `codex exec` aborts outside a git repository unless told not to. That
+    // check guards against an agent editing files with no way to undo them, but
+    // this crate is embedded in hosts that legitimately run against scratch
+    // directories, worktrees and review checkouts, and a hard abort there is
+    // useless to them. The real containment is the sandbox below, which is
+    // `read-only` by default, so nothing is unrecoverable regardless.
+    a.push("--skip-git-repo-check".into());
 
     match plan.permission {
         Permission::Bypass => a.push("--dangerously-bypass-approvals-and-sandbox".into()),
@@ -576,6 +584,21 @@ mod tests {
         let a = argv(Agent::Codex, &p);
         assert_eq!(a[0..4], ["codex", "exec", "resume", "thread-9"]);
         assert_eq!(a.last().unwrap(), "hi");
+    }
+
+    /// `codex exec` aborts outside a git repository. A host embedding this
+    /// crate runs against scratch dirs and review checkouts, so the check is
+    /// waived on every invocation; the sandbox is what actually contains a run.
+    #[test]
+    fn codex_always_waives_the_git_repo_check() {
+        for cont in [Continue::New, Continue::Resume("t-1".into())] {
+            let mut p = plan("codex");
+            p.cont = cont.clone();
+            assert!(
+                argv(Agent::Codex, &p).contains(&"--skip-git-repo-check".to_string()),
+                "{cont:?} must still run outside a repo"
+            );
+        }
     }
 
     #[test]

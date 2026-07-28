@@ -130,10 +130,9 @@ impl Request {
 
     /// Append raw arguments, after everything this crate builds.
     ///
-    /// The escape hatch for agent-specific flags with no unified spelling. For
-    /// example `codex exec` refuses to run outside a git repository unless given
-    /// `--skip-git-repo-check`. Arguments are passed straight to the binary
-    /// without a shell.
+    /// The escape hatch for agent-specific flags with no unified spelling, such
+    /// as `--add-dir` to widen file access or Codex's `-c key=value` config
+    /// overrides. Arguments are passed straight to the binary without a shell.
     #[must_use]
     pub fn args<I, S>(mut self, args: I) -> Self
     where
@@ -249,11 +248,11 @@ mod tests {
 
     #[test]
     fn extra_args_land_after_everything_the_crate_builds() {
-        let argv = Request::new(Agent::Codex, "hi")
-            .args(["--skip-git-repo-check"])
+        let argv = Request::new(Agent::Claude, "hi")
+            .args(["--add-dir", "/tmp/extra"])
             .argv()
             .unwrap();
-        assert_eq!(argv.last().unwrap(), "--skip-git-repo-check");
+        assert_eq!(argv[argv.len() - 2..], ["--add-dir", "/tmp/extra"]);
     }
 
     #[test]
