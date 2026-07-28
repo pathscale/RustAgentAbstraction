@@ -5,12 +5,24 @@ edition = "2024"
 # The floor edition 2024 requires, and where the strictest dependencies (uuid,
 # getrandom) sit. Derived from the dependency graph rather than compile-tested.
 rust-version = "1.85"
-description = "Drive Claude Code, Codex and Copilot CLIs headlessly from Rust, as a library."
+description = "Drive the Claude Code, Codex and GitHub Copilot CLIs headlessly from Rust. One request type, one event stream and one session model across all three, with resume and fork."
 license = "MIT"
 repository = "https://github.com/pathscale/RustAgentAbstraction"
 readme = "README.md"
-keywords = ["agent", "claude", "codex", "copilot", "cli"]
-categories = ["development-tools"]
+# The published package is the library. Tests that spawn real agents, CI config
+# and repo docs are noise in a downloaded crate and would fail for a consumer
+# who has none of the three CLIs installed.
+exclude = [
+    "tests/**",
+    ".github/**",
+    "AGENTS.md",
+    "CLAUDE.md",
+]
+# Five is the crates.io maximum. "llm" earns a slot over "cli" because it is how
+# someone finds this without already knowing the crate exists; the three agent
+# names are the other searches that should land here.
+keywords = ["agent", "claude", "codex", "copilot", "llm"]
+categories = ["development-tools", "api-bindings", "asynchronous"]
 
 # Library only, by design. There is no binary: the consumer (an agencyzero GUI,
 # a service, a test) links this crate and spawns the agent directly, so nothing
