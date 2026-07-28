@@ -1,8 +1,20 @@
-# RustAgentAbstraction
+# agent-abstraction
 
-`agent-abstraction` drives **Claude Code**, **Codex** and **GitHub Copilot** headlessly from
-Rust: one request type, one event vocabulary, one session model across three CLIs that agree
-on none of those things.
+[![crates.io](https://img.shields.io/crates/v/agent-abstraction.svg)](https://crates.io/crates/agent-abstraction)
+[![docs.rs](https://img.shields.io/docsrs/agent-abstraction)](https://docs.rs/agent-abstraction)
+[![license](https://img.shields.io/crates/l/agent-abstraction.svg)](LICENSE)
+
+Drive **Claude Code**, **Codex** and **GitHub Copilot** headlessly from Rust: one request
+type, one event vocabulary, one session model across three CLIs that agree on none of those
+things.
+
+```toml
+[dependencies]
+agent-abstraction = "0.1"
+```
+
+Every flag mapping and output shape here was verified against the installed CLIs rather than
+taken from documentation, which is the part that keeps being wrong.
 
 It is a **library, not a CLI**. Your program links it and spawns the agent directly, so
 nothing marshals a request through a command line and back out of stdout twice.
