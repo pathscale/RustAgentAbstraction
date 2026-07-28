@@ -141,16 +141,20 @@ impl SessionStore {
             .collect()
     }
 
-    /// Decide how `name` continues, and produce the [`Continue`] to run with.
+    /// Decide how `name` continues, and produce the continuation to run with.
     ///
     /// For a minting agent with no prior record this allocates the id here and
     /// now, so the caller can persist the binding before spawning.
+    ///
+    /// Crate-internal: it returns `Continue`, which is machinery rather than
+    /// API. Callers reach this through [`crate::Request::session`], and can see
+    /// the decision it made via [`crate::Request::session_phase`].
     ///
     /// # Errors
     /// [`Error::SessionConflict`] when the name already belongs to another
     /// agent; [`Error::Unsupported`] when `fork` is asked of an agent that
     /// cannot fork, or when the agent exposes no session id at all.
-    pub fn plan(
+    pub(crate) fn plan(
         &self,
         agent: Agent,
         project: &Path,
