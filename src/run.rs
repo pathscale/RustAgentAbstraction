@@ -11,16 +11,57 @@
 
 use std::process::Stdio;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 
 use crate::agent::{Continue, EnvPolicy};
 use crate::error::{Error, Result};
-use crate::event::{Event, Parser, Terminal, append_capped};
+use crate::event::{Event, MAX_LINE, Parser, Terminal, append_capped};
 use crate::outcome::{Outcome, Stop};
 use crate::proc::kill_process_group;
 use crate::request::Request;
+
+/// Read one line, giving up on a line that never ends.
+///
+/// `AsyncBufReadExt::lines` buffers until a newline arrives, so a stream that
+/// emits megabytes without one exhausts memory before any total cap applies.
+/// This reads a bounded amount and, past the limit, returns what it has and
+/// discards the remainder of that line. Returns `None` at end of input.
+async fn read_bounded_line<R>(reader: &mut R, buf: &mut String) -> std::io::Result<Option<bool>>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    buf.clear();
+    let mut bytes = Vec::new();
+    let mut truncated = false;
+    loop {
+        let mut byte = [0u8; 1];
+        match reader.read(&mut byte).await? {
+            // End of input: a trailing fragment still counts as a line.
+            0 => {
+                if bytes.is_empty() {
+                    return Ok(None);
+                }
+                break;
+            }
+            _ if byte[0] == b'\n' => break,
+            _ => {
+                if bytes.len() < MAX_LINE {
+                    bytes.push(byte[0]);
+                } else {
+                    // Keep draining to the newline so the pipe does not block,
+                    // but stop accumulating.
+                    truncated = true;
+                }
+            }
+        }
+    }
+    // Output is not guaranteed to be valid UTF-8, and one bad byte should not
+    // end a run.
+    buf.push_str(&String::from_utf8_lossy(&bytes));
+    Ok(Some(truncated))
+}
 
 /// How many events may queue before the producer waits for the consumer. Deep
 /// enough that a burst of tool events does not stall the agent, shallow enough
@@ -41,6 +82,12 @@ const EVENT_BUFFER: usize = 256;
 #[derive(Debug)]
 pub struct Run {
     events: mpsc::Receiver<Event>,
+    /// The typed command line, kept so both the plain and redacted views come
+    /// from the same source.
+    typed: Vec<crate::agent::Arg>,
+    /// Dropping or firing this asks the driver to tear down in order. Held as
+    /// an `Option` so `detach` can discard it without signalling.
+    cancel: Option<tokio::sync::oneshot::Sender<()>>,
     /// `None` only after [`Run::finish`], [`Run::cancel`] or [`Run::detach`]
     /// has taken ownership, which is what stops `Drop` from aborting a run that
     /// was already settled deliberately.
@@ -64,11 +111,16 @@ impl Run {
         &self.argv
     }
 
-    /// The command line with prompt and session id replaced by placeholders,
-    /// safe to log.
+    /// The command line with every non-public value replaced by a placeholder.
+    ///
+    /// Prompts, system prompts, session ids and anything from
+    /// [`crate::Request::unchecked_args`] are removed; flag names are kept so
+    /// the command stays recognisable. Sensitivity is recorded where each
+    /// argument is built rather than inferred from the finished line, so a
+    /// bare positional prompt or an opaque raw argument is covered too.
     #[must_use]
     pub fn redacted_argv(&self) -> Vec<String> {
-        redact(&self.argv)
+        redact(&self.typed)
     }
 
     /// Wait for the run to finish.
@@ -103,17 +155,34 @@ impl Run {
 
     /// Stop the run and wait until the agent is actually gone.
     ///
-    /// Deterministic, unlike dropping: when this returns, the process and its
-    /// children have been signalled and reaped. Prefer it over `drop` when you
-    /// need to know the agent has stopped before doing something else, such as
-    /// mutating the files it was working on.
-    pub async fn cancel(mut self) {
-        if let Some(task) = self.task.take() {
-            task.abort();
-            // Aborting drops the driver's `Child`, whose `kill_on_drop` and
-            // process-group teardown do the actual killing. Awaiting the
-            // JoinError is what guarantees that has happened.
-            let _ = task.await;
+    /// Cooperative rather than an abort: the driver is asked to stop, signals
+    /// the process group, reaps the child and joins its readers, and only then
+    /// does this return. So when it returns the tree really has exited, which
+    /// matters if the next thing you do touches the files it was working on.
+    ///
+    /// Returns the partial [`Outcome`] if the run happened to finish first,
+    /// otherwise [`Error::Cancelled`].
+    ///
+    /// # Errors
+    /// [`Error::Cancelled`] in the normal case, or whatever the run failed with
+    /// if it failed before the request arrived.
+    pub async fn cancel(mut self) -> Result<Outcome> {
+        // Dropping the sender is itself the signal, so this cannot fail in a
+        // way that leaves the driver waiting.
+        drop(self.cancel.take());
+        let Some(task) = self.task.take() else {
+            unreachable!("the handle is only taken by a consuming method")
+        };
+        match task.await {
+            Ok(result) => result,
+            Err(join) => Err(Error::Interrupted {
+                bin: self.argv.first().cloned().unwrap_or_default(),
+                detail: if join.is_panic() {
+                    "the driver task panicked".into()
+                } else {
+                    "the driver task was cancelled".into()
+                },
+            }),
         }
     }
 
@@ -123,6 +192,11 @@ impl Run {
     /// afterwards, so reach for this only when an unsupervised background run
     /// is genuinely intended.
     pub fn detach(mut self) {
+        // Leak the cancel signal rather than dropping it: a dropped sender is
+        // read by the driver as "stop", which is the opposite of detaching.
+        if let Some(cancel) = self.cancel.take() {
+            std::mem::forget(cancel);
+        }
         // Dropping the handle without aborting is what detaches a tokio task.
         drop(self.task.take());
     }
@@ -130,51 +204,35 @@ impl Run {
 
 impl Drop for Run {
     fn drop(&mut self) {
-        // Still holding the handle means the caller abandoned this run rather
-        // than finishing, cancelling or detaching it. Abort, which drops the
-        // driver's `Child` and triggers the kill path.
+        // Abandoned rather than finished, cancelled or detached. Signal the
+        // driver so it tears down in order if it gets the chance, then abort so
+        // the teardown happens even if nothing polls it again. `Drop` cannot
+        // await, so abort remains the backstop: it drops the driver's
+        // `ChildGuard`, which kills the process group synchronously.
+        drop(self.cancel.take());
         if let Some(task) = self.task.take() {
             task.abort();
         }
     }
 }
 
-/// Placeholders substituted for sensitive argv values.
+/// Placeholder substituted for a sensitive argv value.
 const REDACTED: &str = "<redacted>";
 
-/// Replace prompt and session-id values with a placeholder.
+/// Render a typed command line for logging, keeping flag names and replacing
+/// every value that is not `Public`.
 ///
-/// Flag *names* are kept so a redacted command line is still recognisable; only
-/// the values that carry user content or a resumable handle are removed.
-fn redact(argv: &[String]) -> Vec<String> {
-    /// Flags whose following argument is sensitive.
-    const SENSITIVE_FLAGS: &[&str] = &[
-        "-p",
-        "--prompt",
-        "--append-system-prompt",
-        "--system",
-        "--session-id",
-        "--resume",
-    ];
-    let mut out = Vec::with_capacity(argv.len());
-    let mut redact_next = false;
-    for (i, arg) in argv.iter().enumerate() {
-        if redact_next {
-            out.push(REDACTED.to_string());
-            redact_next = false;
-            continue;
-        }
-        redact_next = SENSITIVE_FLAGS.contains(&arg.as_str());
-        // Codex takes its prompt as the trailing positional rather than behind
-        // a flag, so the last argument is redacted unless it is a flag itself.
-        let trailing_prompt = i + 1 == argv.len() && !arg.starts_with('-') && i > 1;
-        out.push(if trailing_prompt {
-            REDACTED.to_string()
-        } else {
-            arg.clone()
-        });
-    }
-    out
+/// Derived from the sensitivity recorded where each argument was built, so it
+/// cannot miss a case the way matching on flag names and positions can.
+fn redact(argv: &[crate::agent::Arg]) -> Vec<String> {
+    use crate::agent::Sensitivity;
+
+    argv.iter()
+        .map(|arg| match arg.sensitivity {
+            Sensitivity::Public => arg.value.clone(),
+            _ => REDACTED.to_string(),
+        })
+        .collect()
 }
 
 /// Run `request` to completion, discarding the intermediate events.
@@ -199,7 +257,8 @@ pub fn stream(request: &Request) -> Result<Run> {
     let runtime = tokio::runtime::Handle::try_current().map_err(|_| Error::NoRuntime)?;
 
     let plan = request.plan();
-    let argv = request.argv()?;
+    let typed = request.typed_argv()?;
+    let argv: Vec<String> = typed.iter().map(|a| a.value.clone()).collect();
 
     let mut command = Command::new(&argv[0]);
     command
@@ -244,6 +303,13 @@ pub fn stream(request: &Request) -> Result<Run> {
     #[cfg(unix)]
     command.process_group(0);
 
+    // Reserve an assigned session id before the child exists. Doing it inside
+    // the driver leaves a window where a spawn that half-succeeds loses the
+    // binding, and this is the id the caller may already be showing in a UI.
+    if let Some(token) = preassigned_token(request) {
+        persist_session(request, &token)?;
+    }
+
     let child = command.spawn().map_err(|source| {
         // A missing binary is the common case and deserves an actionable error
         // with an install hint. Reading it off the spawn avoids resolving PATH
@@ -264,10 +330,13 @@ pub fn stream(request: &Request) -> Result<Run> {
     })?;
 
     let (tx, rx) = mpsc::channel(EVENT_BUFFER);
+    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
     let request = request.clone();
-    let task = runtime.spawn(drive(child, request, tx));
+    let task = runtime.spawn(drive(child, request, tx, cancel_rx));
     Ok(Run {
         events: rx,
+        typed,
+        cancel: Some(cancel_tx),
         task: Some(task),
         argv,
     })
@@ -312,19 +381,17 @@ impl Drop for ChildGuard {
               through helpers and obscure the ordering that matters, such as \
               killing the group before reaping."
 )]
-async fn drive(child: Child, request: Request, events: mpsc::Sender<Event>) -> Result<Outcome> {
+async fn drive(
+    child: Child,
+    request: Request,
+    events: mpsc::Sender<Event>,
+    cancel: tokio::sync::oneshot::Receiver<()>,
+) -> Result<Outcome> {
     // From here on the child is owned by a guard, so every exit path from this
     // task, including an abort, takes the process group with it.
     let mut child = ChildGuard { child, armed: true };
     let plan = request.plan();
     let bin = plan.bin.clone();
-
-    // An assigned id is known before anything runs, so record it now. This is
-    // what makes the session survive a run that times out, crashes, or is
-    // cancelled: the binding does not depend on reaching the end.
-    if let Some(token) = preassigned_token(&request) {
-        persist_session(&request, &token)?;
-    }
 
     // Deliver a piped prompt and close the pipe, or the agent waits on EOF.
     if plan.stdin_prompt {
@@ -347,10 +414,11 @@ async fn drive(child: Child, request: Request, events: mpsc::Sender<Event>) -> R
     let stderr_task = tokio::spawn(async move {
         let mut buf = String::new();
         if let Some(handle) = stderr {
-            let mut lines = BufReader::new(handle).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                // Keep draining after the cap is hit: an undrained pipe would
-                // block the child even though we no longer want the bytes.
+            let mut reader = BufReader::new(handle);
+            let mut line = String::new();
+            // Keep draining after the cap is hit: an undrained pipe blocks the
+            // child even though we no longer want the bytes.
+            while let Ok(Some(_)) = read_bounded_line(&mut reader, &mut line).await {
                 append_capped(&mut buf, &line);
             }
         }
@@ -371,8 +439,9 @@ async fn drive(child: Child, request: Request, events: mpsc::Sender<Event>) -> R
 
     let read_stdout = async {
         if let Some(handle) = stdout {
-            let mut lines = BufReader::new(handle).lines();
-            while let Some(line) = lines.next_line().await? {
+            let mut reader = BufReader::new(handle);
+            let mut line = String::new();
+            while read_bounded_line(&mut reader, &mut line).await?.is_some() {
                 append_capped(&mut raw, &line);
                 for event in parser.push(&line) {
                     // Bind a printed id the moment it appears rather than at the
@@ -395,37 +464,45 @@ async fn drive(child: Child, request: Request, events: mpsc::Sender<Event>) -> R
         Ok::<_, std::io::Error>(())
     };
 
-    // Apply the deadline to reading and waiting together, so a child that
-    // produces output forever is still bounded.
-    let status = match request.timeout {
-        Some(limit) => {
-            match tokio::time::timeout(limit, async {
-                read_stdout.await?;
-                child.child.wait().await
-            })
-            .await
-            {
-                Ok(result) => result,
-                Err(_elapsed) => {
-                    // Order matters: signal the group *before* reaping. Reaping
-                    // clears the child's pid, and the group kill needs that pid
-                    // to target the group, so doing it the other way round
-                    // silently leaves every grandchild running.
-                    kill_process_group(&child.child);
-                    let _ = child.child.kill().await;
-                    child.armed = false;
-                    return Err(Error::Timeout {
-                        bin,
-                        timeout: limit,
-                        partial: parser.finish().text,
-                    });
-                }
-            }
+    // Race three outcomes: the run finishing, the deadline, and a cancellation
+    // request. Reading and waiting are one future so a child that produces
+    // output forever is still bounded by the timeout.
+    let work = async {
+        read_stdout.await?;
+        child.child.wait().await
+    };
+    // A timeout is optional; `pending()` makes the un-timed case the same shape
+    // rather than duplicating the whole select.
+    let deadline = async {
+        match request.timeout {
+            Some(limit) => tokio::time::sleep(limit).await,
+            None => std::future::pending().await,
         }
-        None => match read_stdout.await {
-            Ok(()) => child.child.wait().await,
-            Err(source) => Err(source),
-        },
+    };
+
+    let status = tokio::select! {
+        // Biased so a finished run is reported as finished even if a deadline
+        // or cancellation lands in the same tick.
+        biased;
+        result = work => result,
+        () = deadline => {
+            // Order matters: signal the group *before* reaping. Reaping clears
+            // the child's pid, and the group kill needs that pid to target the
+            // group, so the other order silently leaves grandchildren running.
+            let partial = shut_down(&mut child, stderr_task).await;
+            return Err(Error::Timeout {
+                bin,
+                timeout: request.timeout.unwrap_or_default(),
+                partial: parser.finish().text,
+            })
+            .inspect_err(|_| drop(partial));
+        }
+        _ = cancel => {
+            // Cooperative teardown: the caller is waiting on this, so the tree
+            // is signalled, reaped and joined before returning.
+            shut_down(&mut child, stderr_task).await;
+            return Err(Error::Cancelled { bin });
+        }
     }
     .map_err(|source| Error::Spawn {
         bin: bin.clone(),
@@ -437,13 +514,39 @@ async fn drive(child: Child, request: Request, events: mpsc::Sender<Event>) -> R
 
     drop(events);
     let stderr = stderr_task.await.unwrap_or_default();
+    let saw_structured = parser.saw_structured_record();
+    let saw_terminal = parser.saw_terminal_record();
     let terminal = parser.finish();
     let exit_code = status.code().unwrap_or(-1);
 
-    // A run that produced no structured answer still has its raw stdout; better
-    // to hand back what the agent printed than an empty string.
+    // Under a structured format, silently handing back raw stdout would turn a
+    // protocol failure into a plausible-looking answer. A run that recognized
+    // nothing, or never reached its terminal record, did not produce a result
+    // this crate can vouch for, so it is reported rather than papered over.
+    let structured = plan.format != crate::Format::Text;
+    if structured && exit_code == 0 {
+        if !saw_structured {
+            return Err(Error::Parse {
+                agent: request.agent,
+                detail: format!(
+                    "no recognizable {} records in {} lines of output;                      the CLI's output shape has probably changed",
+                    request.agent,
+                    raw.lines().count()
+                ),
+            });
+        }
+        if !saw_terminal {
+            return Err(Error::Parse {
+                agent: request.agent,
+                detail: "the stream ended without its terminal record, so the turn                          did not complete"
+                    .into(),
+            });
+        }
+    }
+
+    // Plain text has no structure to validate: the stream is the answer.
     let mut terminal = terminal;
-    if terminal.text.is_empty() {
+    if terminal.text.is_empty() && !structured {
         terminal.text = raw.trim().to_string();
     }
 
@@ -479,6 +582,20 @@ async fn drive(child: Child, request: Request, events: mpsc::Sender<Event>) -> R
         unparsed: terminal.unparsed,
         first_unparsed: terminal.first_unparsed,
     })
+}
+
+/// Kill the process group, reap the child, and join the stderr reader.
+///
+/// The orderly teardown both cancellation and timeout share. Returns whatever
+/// stderr had been captured, so a caller can still report why a run was stopped.
+async fn shut_down(child: &mut ChildGuard, stderr_task: tokio::task::JoinHandle<String>) -> String {
+    kill_process_group(&child.child);
+    // Reap, so the caller is not left with a zombie once this returns.
+    let _ = child.child.kill().await;
+    child.armed = false;
+    // The pipes are closed now that the child is gone, so this finishes
+    // promptly rather than hanging the cancellation.
+    stderr_task.await.unwrap_or_default()
 }
 
 /// Turn a non-zero exit into the most specific error available.
@@ -632,12 +749,10 @@ mod tests {
     /// it. The redacted form must keep the shape while dropping the content.
     #[test]
     fn redaction_removes_prompts_and_session_ids_but_keeps_flags() {
-        let argv = crate::Request::new(Agent::Claude, "my secret prompt")
+        let request = crate::Request::new(Agent::Claude, "my secret prompt")
             .system("secret system")
-            .session_id("11111111-2222-3333-4444-555555555555")
-            .argv()
-            .unwrap();
-        let safe = redact(&argv);
+            .session_id("11111111-2222-3333-4444-555555555555");
+        let safe = redact(&request.typed_argv().unwrap());
 
         for secret in [
             "my secret prompt",
@@ -657,12 +772,37 @@ mod tests {
 
     #[test]
     fn codex_trailing_prompt_is_redacted_even_without_a_flag() {
-        let argv = crate::Request::new(Agent::Codex, "my secret prompt")
-            .argv()
-            .unwrap();
-        let safe = redact(&argv);
+        let request = crate::Request::new(Agent::Codex, "my secret prompt");
+        let safe = redact(&request.typed_argv().unwrap());
         assert_eq!(safe.last().unwrap(), REDACTED);
         assert_eq!(safe[1], "exec", "the subcommand must survive");
+    }
+
+    /// Redaction must cover the two shapes positional guesswork misses: Codex's
+    /// bare trailing prompt, and raw arguments whose contents are unknowable.
+    #[test]
+    fn redaction_covers_positional_prompts_and_unchecked_arguments() {
+        let request = crate::Request::new(Agent::Codex, "my secret prompt")
+            .unchecked_args(["-c", "api_key=hunter2"]);
+        let safe = redact(&request.typed_argv().unwrap());
+        assert!(!safe.iter().any(|a| a.contains("my secret prompt")));
+        assert!(
+            !safe.iter().any(|a| a.contains("hunter2")),
+            "unchecked arguments may hold secrets: {safe:?}"
+        );
+        assert_eq!(safe[1], "exec", "the subcommand must survive");
+    }
+
+    /// A resume id is a capability: it continues someone's conversation.
+    #[test]
+    fn redaction_covers_the_codex_positional_resume_id() {
+        let request = crate::Request::new(Agent::Codex, "hi").resume("thread-secret-9");
+        let safe = redact(&request.typed_argv().unwrap());
+        assert!(
+            !safe.iter().any(|a| a.contains("thread-secret-9")),
+            "{safe:?}"
+        );
+        assert!(safe.contains(&"resume".to_string()));
     }
 
     /// `stream` is synchronous but spawns a task. Outside a runtime that would

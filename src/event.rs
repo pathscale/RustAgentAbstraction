@@ -30,6 +30,7 @@ use crate::outcome::{RateLimit, Stop, Usage};
 /// across all three.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum Event {
     /// The session is live. Emitted once, as early as the agent reveals it.
     Started {
@@ -72,6 +73,20 @@ pub enum Event {
 /// A megabyte is far more prose than any consumer displays, and the fields this
 /// bounds are for reading and diagnosis, never for reconstructing the stream.
 pub const MAX_CAPTURE: usize = 1024 * 1024;
+
+/// The ceiling on a single output line before it is truncated.
+///
+/// [`MAX_CAPTURE`] bounds the *total* kept, but a reader that accumulates until
+/// a newline can exhaust memory on one line that never ends. An agent emitting a
+/// huge tool result as one JSON object is the ordinary case; a broken or hostile
+/// one emitting an endless line is the case this exists for.
+pub const MAX_LINE: usize = 512 * 1024;
+
+/// The ceiling on how many tool calls may be tracked at once.
+///
+/// Entries are removed as results arrive, so this only bites when an agent
+/// announces calls it never completes.
+pub(crate) const MAX_PENDING_TOOLS: usize = 1024;
 
 /// Append `line` and a newline to `buf`, stopping once [`MAX_CAPTURE`] is
 /// reached. Returns whether anything was written.
@@ -133,6 +148,10 @@ pub(crate) struct Parser {
     tools: HashMap<String, String>,
     /// True once a [`Event::Started`] has been emitted, so it fires only once.
     started: bool,
+    /// Whether any record was recognized as this agent's own shape.
+    structured: bool,
+    /// Whether the agent's terminal record was seen.
+    terminal_seen: bool,
 }
 
 impl Parser {
@@ -145,6 +164,8 @@ impl Parser {
             term: Terminal::default(),
             tools: HashMap::new(),
             started: false,
+            structured: false,
+            terminal_seen: false,
         }
     }
 
@@ -180,6 +201,13 @@ impl Parser {
             }
             return Vec::new();
         };
+        // A record that names a type this parser knows is evidence the stream
+        // really is the shape we asked for.
+        if let Some(ty) = value.get("type").and_then(Value::as_str)
+            && self.recognizes(ty)
+        {
+            self.structured = true;
+        }
         let mut out = match self.agent {
             Agent::Claude => self.claude(&value),
             Agent::Codex => self.codex(&value),
@@ -200,6 +228,48 @@ impl Parser {
             }
         }
         out
+    }
+
+    /// Whether `ty` is a record type this agent's parser understands.
+    fn recognizes(&self, ty: &str) -> bool {
+        match self.agent {
+            Agent::Claude => matches!(
+                ty,
+                "system" | "assistant" | "user" | "result" | "rate_limit_event"
+            ),
+            Agent::Codex => {
+                ty.starts_with("thread.") || ty.starts_with("turn.") || ty.starts_with("item.")
+            }
+            Agent::Copilot => {
+                ty == "result"
+                    || ty.starts_with("assistant.")
+                    || ty.starts_with("tool.")
+                    || ty.starts_with("session.")
+            }
+        }
+    }
+
+    /// Track a tool call so its result can be attributed, bounded so an agent
+    /// that announces calls it never finishes cannot grow this without limit.
+    fn remember_tool(&mut self, id: &str, name: &str) {
+        if self.tools.len() >= MAX_PENDING_TOOLS {
+            return;
+        }
+        self.tools.insert(id.to_string(), name.to_string());
+    }
+
+    /// Whether any structured record has been recognized on this stream.
+    ///
+    /// A structured run that recognized nothing did not merely fail to answer;
+    /// it means the output was not the shape this parser understands.
+    pub(crate) fn saw_structured_record(&self) -> bool {
+        self.structured
+    }
+
+    /// Whether the stream carried its terminal record, the one that closes a
+    /// turn and carries the answer and usage.
+    pub(crate) fn saw_terminal_record(&self) -> bool {
+        self.terminal_seen
     }
 
     /// Consume the parser for everything only knowable at the end.
@@ -231,6 +301,7 @@ impl Parser {
             // tool_use, `user` carries the tool_result observations back.
             "assistant" | "user" => self.content_blocks(v),
             "result" => {
+                self.terminal_seen = true;
                 if let Some(text) = v.get("result").and_then(Value::as_str) {
                     self.term.text = text.to_string();
                 }
@@ -281,7 +352,7 @@ impl Parser {
                         .to_string();
                     let id = block.get("id").and_then(Value::as_str).map(str::to_string);
                     if let Some(id) = &id {
-                        self.tools.insert(id.clone(), name.clone());
+                        self.remember_tool(id, &name);
                     }
                     out.push(Event::ToolCall {
                         id,
@@ -293,6 +364,10 @@ impl Parser {
                     id: block
                         .get("tool_use_id")
                         .and_then(Value::as_str)
+                        .inspect(|id| {
+                            // The call has been answered, so stop tracking it.
+                            self.tools.remove(*id);
+                        })
                         .map(str::to_string),
                     ok: block
                         .get("is_error")
@@ -320,10 +395,12 @@ impl Parser {
         }
         match ty {
             "turn.completed" => {
+                self.terminal_seen = true;
                 self.term.usage = codex_usage(v.get("usage"));
                 Vec::new()
             }
             "turn.failed" => {
+                self.terminal_seen = true;
                 self.term.stop = Stop::Error;
                 Vec::new()
             }
@@ -372,6 +449,9 @@ impl Parser {
                         // Only the finished record carries real output: the
                         // in-progress one has an empty string and a null code.
                         if done {
+                            if let Some(id) = &id {
+                                self.tools.remove(id);
+                            }
                             out.push(Event::ToolResult {
                                 id,
                                 ok: item
@@ -432,7 +512,7 @@ impl Parser {
                 let id = field("toolCallId");
                 let name = field("toolName").unwrap_or_else(|| "tool".into());
                 if let Some(id) = &id {
-                    self.tools.insert(id.clone(), name.clone());
+                    self.remember_tool(id, &name);
                 }
                 vec![Event::ToolCall {
                     id,
@@ -444,7 +524,9 @@ impl Parser {
                 }]
             }
             "tool.execution_complete" => vec![Event::ToolResult {
-                id: field("toolCallId"),
+                id: field("toolCallId").inspect(|id| {
+                    self.tools.remove(id);
+                }),
                 ok: data.and_then(|d| d.get("success")).and_then(Value::as_bool),
                 output: data
                     .and_then(|d| d.get("result"))
@@ -455,6 +537,7 @@ impl Parser {
             }],
             // Copilot's terminal record is flat, not nested under `data`.
             "result" => {
+                self.terminal_seen = true;
                 if let Some(id) = v.get("sessionId").and_then(Value::as_str) {
                     self.term.session = Some(id.to_string());
                 }

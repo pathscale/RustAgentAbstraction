@@ -11,6 +11,7 @@ use crate::agent::Agent;
 /// Copilot reports premium requests and no tokens at all. An absent field means
 /// "this agent did not say", never zero.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Usage {
     /// Non-cached input tokens.
     pub input_tokens: Option<u64>,
@@ -40,6 +41,7 @@ impl Usage {
 /// Surfaced rather than acted on: this crate reports what the provider said and
 /// leaves backing off to the caller. See `docs/operating-limits.md`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct RateLimit {
     /// The provider's status word, e.g. `allowed`, `rejected`.
     pub status: String,
@@ -61,6 +63,7 @@ impl RateLimit {
 /// Why the agent stopped.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum Stop {
     /// Completed normally.
     #[default]
@@ -73,6 +76,7 @@ pub enum Stop {
 
 /// The result of one completed run.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Outcome {
     /// Which agent produced it.
     pub agent: Agent,

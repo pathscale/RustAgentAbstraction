@@ -40,6 +40,7 @@ pub enum SessionSupport {
 /// What an agent supports. Used to reject an impossible request before spawning
 /// rather than silently doing something weaker than asked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Caps {
     /// How a native session id is obtained, if at all.
     pub session: SessionSupport,
@@ -142,6 +143,7 @@ pub const NETWORK_ENV: &[&str] = &[
 /// command it runs, whatever unrelated secrets the process happens to hold:
 /// cloud credentials, CI tokens, database URLs.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum EnvPolicy {
     /// Pass the whole parent environment through.
     #[default]
@@ -214,6 +216,14 @@ pub struct Plan {
 /// rest of the command line and the inherited environment.
 pub(crate) const STDIN_THRESHOLD: usize = 128 * 1024;
 
+/// The budget for everything on one command line.
+///
+/// `ARG_MAX` is about 1 MiB on macOS and covers the environment as well as the
+/// arguments, so half of it leaves room for a large inherited environment. Over
+/// this the spawn fails with a bare `E2BIG` that names nothing; the crate checks
+/// first so the error can say which input was too big.
+pub(crate) const MAX_COMMAND_LINE: usize = 512 * 1024;
+
 impl Agent {
     /// Every agent, in a stable order.
     pub const ALL: [Agent; 3] = [Agent::Claude, Agent::Codex, Agent::Copilot];
@@ -252,7 +262,10 @@ impl Agent {
     /// [`EnvPolicy::Minimal`].
     ///
     /// Two groups: what any process needs to start, and this agent's own
-    /// credential and config variables. A name absent from the parent
+    /// credential and config variables. Permission-controlling variables are
+    /// excluded on principle: `COPILOT_ALLOW_ALL` is Copilot's env equivalent
+    /// of `--allow-all-tools`, so inheriting it would let the host's ambient
+    /// environment widen a run's permissions behind [`Permission`]'s back. A name absent from the parent
     /// environment is skipped, so nothing here is fabricated.
     ///
     /// Proxy and custom-CA variables are deliberately **not** here. They are
@@ -300,12 +313,7 @@ impl Agent {
                 "OPENAI_API_KEY",
                 "OPENAI_BASE_URL",
             ],
-            Agent::Copilot => &[
-                "GH_TOKEN",
-                "GITHUB_TOKEN",
-                "COPILOT_ALLOW_ALL",
-                "XDG_CONFIG_HOME",
-            ],
+            Agent::Copilot => &["GH_TOKEN", "GITHUB_TOKEN", "XDG_CONFIG_HOME"],
         };
         BASE.iter().chain(WINDOWS).chain(agent).copied().collect()
     }
@@ -407,6 +415,18 @@ impl Agent {
     /// # Errors
     /// [`Error::Unsupported`] if the plan needs a capability this agent lacks.
     pub fn argv(self, plan: &Plan) -> Result<Vec<String>> {
+        Ok(self
+            .typed_argv(plan)?
+            .into_iter()
+            .map(|arg| arg.value)
+            .collect())
+    }
+
+    /// The command line with each argument's sensitivity attached.
+    ///
+    /// # Errors
+    /// [`Error::Unsupported`] if the plan needs a capability this agent lacks.
+    pub(crate) fn typed_argv(self, plan: &Plan) -> Result<Vec<Arg>> {
         self.check(plan)?;
         Ok(match self {
             Agent::Claude => argv_claude(plan),
@@ -432,27 +452,68 @@ impl fmt::Display for Agent {
     }
 }
 
+/// How sensitive one argument's value is, decided where the argument is built
+/// rather than guessed back afterwards.
+///
+/// Reconstructing this from a finished command line means pattern-matching flag
+/// names and positions, which misses exactly the cases that matter: Codex's
+/// prompt is a bare trailing positional, and anything from `unchecked_args` has
+/// no recognizable shape at all. Recording it at construction cannot miss.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Sensitivity {
+    /// A flag name or fixed token. Safe to show.
+    Public,
+    /// User or caller content: prompts and system prompts.
+    Prompt,
+    /// A session handle, which resumes a conversation.
+    SessionId,
+    /// Caller-supplied raw arguments. Unknowable, so assumed sensitive.
+    Unchecked,
+}
+
+/// One argument and how sensitive it is.
+#[derive(Debug, Clone)]
+pub(crate) struct Arg {
+    pub(crate) value: String,
+    pub(crate) sensitivity: Sensitivity,
+}
+
 /// Builds an argv, keeping every flag name literal at its call site so the flag
-/// list for an agent stays greppable and auditable against `--help`.
-struct Argv(Vec<String>);
+/// list for an agent stays greppable and auditable against `--help`, and
+/// recording per-argument sensitivity so the executable and redacted forms come
+/// from one source.
+pub(crate) struct Argv(Vec<Arg>);
 
 impl Argv {
     /// Start with the binary.
     fn new(bin: &str) -> Self {
-        Self(vec![bin.to_string()])
+        Self(vec![Arg {
+            value: bin.to_string(),
+            sensitivity: Sensitivity::Public,
+        }])
+    }
+
+    fn push(&mut self, value: impl Into<String>, sensitivity: Sensitivity) -> &mut Self {
+        self.0.push(Arg {
+            value: value.into(),
+            sensitivity,
+        });
+        self
     }
 
     /// A bare flag with no value.
     fn bare(&mut self, flag: &str) -> &mut Self {
-        self.0.push(flag.to_string());
-        self
+        self.push(flag, Sensitivity::Public)
     }
 
-    /// A flag and its value, as two arguments.
+    /// A flag and a value that is safe to show.
     fn pair(&mut self, flag: &str, value: impl AsRef<str>) -> &mut Self {
-        self.0.push(flag.to_string());
-        self.0.push(value.as_ref().to_string());
-        self
+        self.bare(flag).push(value.as_ref(), Sensitivity::Public)
+    }
+
+    /// A flag and a value that must not be logged.
+    fn secret(&mut self, flag: &str, value: impl AsRef<str>, kind: Sensitivity) -> &mut Self {
+        self.bare(flag).push(value.as_ref(), kind)
     }
 
     /// A flag and its value, only when the value is present.
@@ -463,13 +524,17 @@ impl Argv {
         self
     }
 
-    /// A positional argument.
+    /// A positional argument that is safe to show.
     fn arg(&mut self, value: impl Into<String>) -> &mut Self {
-        self.0.push(value.into());
-        self
+        self.push(value, Sensitivity::Public)
     }
 
-    fn done(&mut self) -> Vec<String> {
+    /// A positional argument carrying caller content.
+    fn arg_sensitive(&mut self, value: impl Into<String>, kind: Sensitivity) -> &mut Self {
+        self.push(value, kind)
+    }
+
+    fn done(&mut self) -> Vec<Arg> {
         std::mem::take(&mut self.0)
     }
 }
@@ -491,7 +556,7 @@ fn claude_mode(p: Permission) -> &'static str {
 }
 
 /// `claude -p <prompt> --permission-mode M --output-format F [...]`
-fn argv_claude(plan: &Plan) -> Vec<String> {
+fn argv_claude(plan: &Plan) -> Vec<Arg> {
     let mut a = Argv::new(&plan.bin);
     a.bare("-p");
     if plan.stdin_prompt {
@@ -499,7 +564,7 @@ fn argv_claude(plan: &Plan) -> Vec<String> {
         // large prompt never has to fit on the argv.
         a.pair("--input-format", "text");
     } else {
-        a.arg(Agent::Claude.effective_prompt(plan));
+        a.arg_sensitive(Agent::Claude.effective_prompt(plan), Sensitivity::Prompt);
     }
 
     a.pair("--permission-mode", claude_mode(plan.permission));
@@ -515,20 +580,23 @@ fn argv_claude(plan: &Plan) -> Vec<String> {
     }
 
     a.opt("--model", plan.model.as_ref());
-    a.opt("--append-system-prompt", plan.system.as_ref());
+    if let Some(system) = &plan.system {
+        a.secret("--append-system-prompt", system, Sensitivity::Prompt);
+    }
 
     match &plan.cont {
         Continue::New => {}
         Continue::NewWith(id) => {
-            a.pair("--session-id", id);
+            a.secret("--session-id", id, Sensitivity::SessionId);
         }
         Continue::Resume(id) => {
-            a.pair("--resume", id);
+            a.secret("--resume", id, Sensitivity::SessionId);
         }
         Continue::Fork(id) => {
             // Mints a new id off `id`, leaving the original and its cached
             // prefix untouched. The new id comes back in the output.
-            a.pair("--resume", id).bare("--fork-session");
+            a.secret("--resume", id, Sensitivity::SessionId)
+                .bare("--fork-session");
         }
     }
 
@@ -550,12 +618,13 @@ fn argv_claude(plan: &Plan) -> Vec<String> {
 
 /// `codex exec [resume <id>] --skip-git-repo-check [sandbox flags] [--model M]
 /// [--json] <prompt>`
-fn argv_codex(plan: &Plan) -> Vec<String> {
+fn argv_codex(plan: &Plan) -> Vec<Arg> {
     let mut a = Argv::new(&plan.bin);
     a.bare("exec");
     if let Continue::Resume(id) = &plan.cont {
         // Continuation is a subcommand, not a flag.
-        a.bare("resume").arg(id.clone());
+        a.bare("resume")
+            .arg_sensitive(id.clone(), Sensitivity::SessionId);
     }
 
     // `codex exec` aborts outside a git repository unless told not to. That
@@ -594,11 +663,13 @@ fn argv_codex(plan: &Plan) -> Vec<String> {
     // Codex has no system flag, so the system text rides the prompt. A literal
     // `-` makes it read the prompt from stdin instead, keeping a large one off
     // the argv.
-    a.arg(if plan.stdin_prompt {
-        "-".to_string()
+    // Codex takes the prompt as a bare trailing positional, which is exactly
+    // the shape positional redaction guesswork gets wrong.
+    if plan.stdin_prompt {
+        a.arg("-");
     } else {
-        Agent::Codex.effective_prompt(plan)
-    });
+        a.arg_sensitive(Agent::Codex.effective_prompt(plan), Sensitivity::Prompt);
+    }
     a.done()
 }
 
@@ -608,12 +679,16 @@ fn argv_codex(plan: &Plan) -> Vec<String> {
 /// `--allow-all-tools` is *required* for non-interactive mode, and the
 /// repeatable tool filters are declared `--allow-tool[=tools...]`, an optional
 /// value, which only binds with `=`, never across a space.
-fn argv_copilot(plan: &Plan) -> Vec<String> {
+fn argv_copilot(plan: &Plan) -> Vec<Arg> {
     // Copilot reads stdin as the prompt only when `-p` is absent: a `-p` value
     // makes the pipe be ignored. So a piped prompt drops the flag entirely.
     let mut a = Argv::new(&plan.bin);
     if !plan.stdin_prompt {
-        a.pair("-p", Agent::Copilot.effective_prompt(plan));
+        a.secret(
+            "-p",
+            Agent::Copilot.effective_prompt(plan),
+            Sensitivity::Prompt,
+        );
     }
 
     // Without this, a headless run stops at the first tool confirmation.
@@ -635,7 +710,7 @@ fn argv_copilot(plan: &Plan) -> Vec<String> {
     // resumes an existing one by id.
     match &plan.cont {
         Continue::NewWith(id) | Continue::Resume(id) => {
-            a.pair("--session-id", id);
+            a.secret("--session-id", id, Sensitivity::SessionId);
         }
         // `Fork` is rejected by `Agent::check` before reaching here.
         Continue::New | Continue::Fork(_) => {}

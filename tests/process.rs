@@ -112,10 +112,16 @@ async fn cancel_stops_the_whole_tree_before_returning() {
         .expect("spawn failed");
     let grandchild = grandchild_pid(&dir).await;
 
-    running.cancel().await;
-    settle().await;
+    let err = running.cancel().await.unwrap_err();
+    assert!(err.is_cancelled(), "cancel should report itself: {err:?}");
 
-    assert!(!alive(grandchild), "cancel left a grandchild alive");
+    // No settle(): cooperative cancellation must have reaped the tree before
+    // returning, so the check is immediate rather than after a grace period.
+    assert!(
+        !alive(grandchild),
+        "cancel returned while a grandchild was still alive, so it is not \
+         awaiting its own cleanup"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -230,5 +236,41 @@ async fn a_minimal_environment_withholds_the_hosts_variables() {
     .await;
     assert!(explicit.contains("AA_EXPLICIT=kept"), "{explicit}");
 
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A line with no newline must not be buffered without limit. `lines()` would
+/// accumulate the whole thing, so a stream that never emits `\n` could exhaust
+/// memory long before any total cap applied.
+#[tokio::test]
+async fn an_endless_line_does_not_exhaust_memory() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = scratch("longline");
+    let script = dir.join("flood.sh");
+    // 64 MiB on a single line, no trailing newline until the very end.
+    std::fs::write(
+        &script,
+        "#!/bin/sh\nawk 'BEGIN{for(i=0;i<1000000;i++)printf \"%s\", \"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"; print \"\"}'\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let request = Request::new(Agent::Claude, "hi")
+        .bin(script.to_str().unwrap())
+        .format(agent_abstraction::Format::Text)
+        .timeout(Duration::from_secs(60));
+    let outcome = stream(&request)
+        .expect("spawn failed")
+        .finish()
+        .await
+        .expect("run failed");
+
+    // Whatever is kept must respect the cap rather than the 64 MiB produced.
+    assert!(
+        outcome.text.len() <= agent_abstraction::MAX_CAPTURE,
+        "kept {} bytes, over the cap",
+        outcome.text.len()
+    );
     std::fs::remove_dir_all(&dir).ok();
 }

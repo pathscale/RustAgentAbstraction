@@ -3,7 +3,9 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::agent::{Agent, Continue, EnvPolicy, Format, Permission, Plan, STDIN_THRESHOLD};
+use crate::agent::{
+    Agent, Continue, EnvPolicy, Format, MAX_COMMAND_LINE, Permission, Plan, STDIN_THRESHOLD,
+};
 use crate::error::Result;
 use crate::session::{Phase, SessionStore};
 
@@ -311,8 +313,54 @@ impl Request {
     /// # Errors
     /// [`crate::Error::Unsupported`] if the agent cannot honour this request.
     pub fn argv(&self) -> Result<Vec<String>> {
-        let mut argv = self.agent.argv(&self.plan())?;
-        argv.extend(self.extra_args.iter().cloned());
+        Ok(self
+            .typed_argv()?
+            .into_iter()
+            .map(|arg| arg.value)
+            .collect())
+    }
+
+    /// The command line with per-argument sensitivity, the single source both
+    /// the executable and the redacted forms are derived from.
+    pub(crate) fn typed_argv(&self) -> Result<Vec<crate::agent::Arg>> {
+        use crate::agent::{Arg, Sensitivity};
+
+        let plan = self.plan();
+        let mut argv = self.agent.typed_argv(&plan)?;
+        // Raw arguments have no known shape, so they are assumed to carry
+        // secrets rather than assumed not to.
+        argv.extend(self.extra_args.iter().map(|value| Arg {
+            value: value.clone(),
+            sensitivity: Sensitivity::Unchecked,
+        }));
+
+        // Moving the prompt to stdin does not move anything else: Claude keeps
+        // the system prompt on its own argument, and raw arguments are always on
+        // the line, so a small prompt with a large system prompt still
+        // overflows. Name the culprit rather than letting the OS answer E2BIG.
+        let total: usize = argv.iter().map(|a| a.value.len()).sum();
+        if total > MAX_COMMAND_LINE {
+            let system = self.system.as_ref().map_or(0, String::len);
+            let extra: usize = self.extra_args.iter().map(String::len).sum();
+            let prompt = if plan.stdin_prompt {
+                0
+            } else {
+                self.prompt.len()
+            };
+            let (what, size) = if system >= extra && system >= prompt {
+                ("the system prompt", system)
+            } else if extra >= prompt {
+                ("the unchecked arguments", extra)
+            } else {
+                ("the prompt", prompt)
+            };
+            return Err(crate::Error::CommandLineTooLarge {
+                agent: self.agent,
+                what,
+                size,
+                limit: MAX_COMMAND_LINE,
+            });
+        }
         Ok(argv)
     }
 }
@@ -349,6 +397,36 @@ mod tests {
             !argv.iter().any(|a| a.len() > STDIN_THRESHOLD),
             "a large prompt must not ride the argv"
         );
+    }
+
+    /// Moving the prompt to stdin does not move the system prompt, so a small
+    /// prompt with a huge system prompt still overflows the command line. The
+    /// OS would answer `E2BIG` naming nothing; this names the culprit.
+    #[test]
+    fn an_oversized_system_prompt_is_reported_rather_than_left_to_e2big() {
+        let err = Request::new(Agent::Claude, "tiny")
+            .system("s".repeat(MAX_COMMAND_LINE + 1))
+            .argv()
+            .unwrap_err();
+        let crate::Error::CommandLineTooLarge { what, .. } = err else {
+            panic!("expected CommandLineTooLarge, got {err:?}")
+        };
+        assert_eq!(what, "the system prompt");
+    }
+
+    #[test]
+    fn oversized_unchecked_arguments_are_named_too() {
+        let err = Request::new(Agent::Claude, "tiny")
+            .unchecked_args([format!("--x={}", "y".repeat(MAX_COMMAND_LINE))])
+            .argv()
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::Error::CommandLineTooLarge {
+                what: "the unchecked arguments",
+                ..
+            }
+        ));
     }
 
     #[test]
