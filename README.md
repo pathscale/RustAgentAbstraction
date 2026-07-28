@@ -122,11 +122,15 @@ quota and writing files with nobody watching.
 
 ```rust
 let running = stream(&request)?;
-// ... user closes the tab
-drop(running);              // agent and its child processes are gone
-running.cancel().await;     // same, but waits until they are actually dead
-running.detach();           // opt out: keep running unsupervised
+drop(running);                  // agent and its children are killed
+running.cancel().await?;        // cooperative: returns only once the tree has exited
+running.detach();               // opt out: keep running unsupervised
 ```
+
+`cancel` is cooperative rather than an abort: the driver signals the process group, reaps
+the child and joins its readers before returning `Error::Cancelled`. So when it returns the
+tree really is gone, which matters if the next thing you do touches the files it was working
+on. `drop` cannot await, so it signals and then aborts as a backstop.
 
 Each run gets its own process group on Unix, and cancellation, drop and timeout all tear
 down the whole group. Killing only the CLI would orphan the commands *it* started, which
@@ -236,7 +240,13 @@ signature worth alerting on.
 
 Captured buffers (`text`, raw stdout, stderr) are bounded at `MAX_CAPTURE`, 1 MiB, keeping
 the earliest output. An agent can stream for hours, and an unbounded capture turns a long
-run into an OOM instead of an answer.
+run into an OOM instead of an answer. Individual lines are bounded separately at `MAX_LINE`,
+because a reader that accumulates until a newline can exhaust memory on one line that never
+ends, long before any total cap applies.
+
+Under a structured format there is no silent fallback to raw stdout: a run that produced no
+recognizable records, or never reached its terminal record, returns `Error::Parse` rather
+than a plausible-looking answer assembled from whatever was printed.
 
 ## No shell, ever
 

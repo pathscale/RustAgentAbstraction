@@ -27,6 +27,7 @@ use crate::error::{Error, Result};
 
 /// One named conversation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct SessionRecord {
     /// The caller's stable name, exactly as they supplied it. The on-disk
     /// filename is an encoded form of this; the record keeps the original so a
@@ -128,8 +129,50 @@ impl SessionStore {
     }
 
     /// Every session recorded for `project`, in unspecified order.
+    ///
+    /// A record that cannot be read or parsed is an error rather than an
+    /// omission: silently returning a short list makes a corrupt store look
+    /// like a store with fewer sessions. Use [`SessionStore::list_lossy`] when
+    /// skipping bad records is genuinely what you want.
+    ///
+    /// # Errors
+    /// [`Error::Store`] if the directory or any record within it is unreadable.
+    pub fn list(&self, project: &Path) -> Result<Vec<SessionRecord>> {
+        let dir = self.dir.join(project_slug(project));
+        let store_err = |path: &Path, source| Error::Store {
+            path: path.display().to_string(),
+            source,
+        };
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            // No directory means no sessions, which is not a fault.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(store_err(&dir, e)),
+        };
+        let mut out = Vec::new();
+        for entry in entries {
+            let path = entry.map_err(|e| store_err(&dir, e))?.path();
+            // Skip the temp files a concurrent write may have in flight.
+            if path.extension().is_some_and(|ext| ext == "tmp") {
+                continue;
+            }
+            let text = fs::read_to_string(&path).map_err(|e| store_err(&path, e))?;
+            out.push(serde_json::from_str(&text).map_err(|e| {
+                store_err(
+                    &path,
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, e),
+                )
+            })?);
+        }
+        Ok(out)
+    }
+
+    /// Every readable session for `project`, skipping any that are not.
+    ///
+    /// The deliberately lossy counterpart to [`SessionStore::list`], for a UI
+    /// that would rather show the sessions it can than fail the whole listing.
     #[must_use]
-    pub fn list(&self, project: &Path) -> Vec<SessionRecord> {
+    pub fn list_lossy(&self, project: &Path) -> Vec<SessionRecord> {
         let dir = self.dir.join(project_slug(project));
         let Ok(entries) = fs::read_dir(dir) else {
             return Vec::new();
@@ -265,6 +308,12 @@ impl SessionStore {
             let _ = fs::remove_file(&tmp);
             store_err(e)
         })?;
+        // Syncing the file persists its contents, not the directory entry that
+        // names it. Without this a crash can leave the rename unrecorded and
+        // the session lost, which is the failure this store exists to avoid.
+        if let Some(parent) = path.parent() {
+            sync_dir(parent).map_err(store_err)?;
+        }
         Ok(record)
     }
 
@@ -316,6 +365,18 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     file.sync_all()
 }
 
+/// Flush a directory entry to disk. A no-op where directories cannot be opened
+/// for syncing, which is the case on Windows.
+fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        fs::File::open(dir)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
+}
+
 /// Restrict a directory to its owner. A no-op on platforms without Unix modes,
 /// where the parent directory's inherited ACL governs instead.
 fn restrict_to_owner(dir: &Path) -> std::io::Result<()> {
@@ -364,8 +425,14 @@ const MAX_STEM: usize = 200;
 /// names distinguishable first and legible second, and a caller who wants
 /// pretty filenames should choose ASCII names.
 ///
-/// Names too long to encode whole are truncated and disambiguated with a hash of
-/// the full input, so the length bound costs readability but never uniqueness.
+/// Names too long to encode whole are truncated and disambiguated with a 64-bit
+/// FNV-1a of the full input. Note the weaker guarantee there: encoding is
+/// injective, but any fixed-width digest of unbounded input cannot be, so two
+/// names sharing a 200-character encoded prefix *and* a hash would collide.
+/// That needs on the order of 2^32 such names to become likely, which is not a
+/// concern for names a host chooses. It is not a cryptographic guarantee: if
+/// session names are attacker-controlled, hash them yourself before passing
+/// them here.
 fn encode_segment(name: &str) -> String {
     use std::fmt::Write as _;
 
@@ -380,7 +447,11 @@ fn encode_segment(name: &str) -> String {
         }
     }
     if out.is_empty() {
-        return "unnamed".into();
+        // Only the empty name reaches here, and it needs a segment no other
+        // input can produce. A bare `%` qualifies: every literal `%` escapes to
+        // `%25`, so no non-empty name ever encodes to it. Mapping empty to a
+        // word like "unnamed" would collide with the literal name `unnamed`.
+        return "%".into();
     }
     if out.len() > MAX_STEM {
         // Cut between encoded units so a half-written `%4` is never emitted.
@@ -439,7 +510,10 @@ mod tests {
         // only what has to be encoded.
         assert_eq!(encode_segment("greet-flow"), "greet-flow");
         assert_eq!(encode_segment("v1.2_final"), "v1.2_final");
-        assert_eq!(encode_segment(""), "unnamed");
+        // The empty name gets a segment no other input can produce. Mapping it
+        // to a word would collide with a caller who literally used that word.
+        assert_eq!(encode_segment(""), "%");
+        assert_ne!(encode_segment(""), encode_segment("unnamed"));
 
         // `.` stays literal for readability, so traversal safety rests entirely
         // on the separator being encoded. A `..` embedded in a segment is inert.
@@ -473,6 +547,8 @@ mod tests {
             "..",
             "%41",
             "A",
+            "",
+            "unnamed",
             "日本語",
             "🙂",
         ];
@@ -520,7 +596,7 @@ mod tests {
             .unwrap();
         let record = store.get(&project, "Greet Flow ☕").unwrap().unwrap();
         assert_eq!(record.name, "Greet Flow ☕");
-        assert_eq!(store.list(&project)[0].name, "Greet Flow ☕");
+        assert_eq!(store.list(&project).unwrap()[0].name, "Greet Flow ☕");
         fs::remove_dir_all(&store.dir).ok();
     }
 
@@ -656,7 +732,12 @@ mod tests {
         let (store, project) = store("list");
         store.bind(Agent::Claude, &project, "a", "t-a").unwrap();
         store.bind(Agent::Claude, &project, "b", "t-b").unwrap();
-        let mut names: Vec<_> = store.list(&project).into_iter().map(|r| r.name).collect();
+        let mut names: Vec<_> = store
+            .list(&project)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.name)
+            .collect();
         names.sort();
         assert_eq!(names, ["a", "b"]);
 
@@ -664,7 +745,7 @@ mod tests {
         assert!(store.get(&project, "a").unwrap().is_none());
         // Forgetting twice is not an error.
         store.forget(&project, "a").unwrap();
-        assert_eq!(store.list(&project).len(), 1);
+        assert_eq!(store.list(&project).unwrap().len(), 1);
         fs::remove_dir_all(&store.dir).ok();
     }
 

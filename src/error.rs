@@ -124,6 +124,37 @@ pub enum Error {
         detail: String,
     },
 
+    /// The run was stopped by [`crate::Run::cancel`] or by dropping its handle.
+    ///
+    /// Not a fault: the caller asked for this. Distinguished from
+    /// [`Error::Interrupted`], which means the driver died unexpectedly, and
+    /// from [`Error::Timeout`], which is a deadline rather than a request.
+    #[error("the run of `{bin}` was cancelled")]
+    Cancelled {
+        /// The binary that was stopped.
+        bin: String,
+    },
+
+    /// A prompt, system prompt or raw argument too large for the command line,
+    /// on an agent with no way to deliver it off the argv.
+    ///
+    /// Returned rather than letting the OS reject the spawn with a bare
+    /// `E2BIG`, which says nothing about which input was the problem.
+    #[error(
+        "{what} is {size} bytes, over the {limit} byte command-line budget for {agent}, \
+         and it has no way to take it off the command line"
+    )]
+    CommandLineTooLarge {
+        /// The agent the request targeted.
+        agent: Agent,
+        /// Which input overflowed.
+        what: &'static str,
+        /// Its size in bytes.
+        size: usize,
+        /// The budget it exceeded.
+        limit: usize,
+    },
+
     /// [`crate::stream`] was called outside a Tokio runtime.
     ///
     /// Spawning the driver task needs a runtime context. Reporting this rather
@@ -156,5 +187,12 @@ impl Error {
     #[must_use]
     pub fn is_transient(&self) -> bool {
         matches!(self, Error::RateLimited { .. } | Error::Timeout { .. })
+    }
+
+    /// Whether this run was stopped because the caller asked, rather than
+    /// because anything went wrong. A UI should not show it as a failure.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        matches!(self, Error::Cancelled { .. })
     }
 }
