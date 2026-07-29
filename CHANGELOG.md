@@ -8,6 +8,33 @@ appear in a patch rather than inflating the version toward 1.0 on a crate still 
 shape. **Where that happens the entry says so at the top**, because a version number that
 under-signals is only acceptable if the changelog over-signals to compensate.
 
+## 0.3.4
+
+### Added
+
+- **A human in the loop.** `Request::approvals` routes gated tool calls to the caller instead
+  of letting the posture answer them: the call arrives as `Event::ApprovalRequest` carrying
+  the tool and its arguments, the run blocks mid-turn, and `Run::respond` answers with
+  `Decision::Allow` or `Decision::Deny`. A denial is not a failed run; the model is told no
+  and carries on.
+
+  Claude only, over its `--permission-prompt-tool stdio` control channel, verified end to end
+  against 2.1.212 by denying a `touch` and confirming the file was never created.
+
+  Four combinations are refused up front rather than met as a hang or a silence: Codex and
+  Copilot, which have no headless approval channel; `run()`, which discards events so nobody
+  could answer; `Permission::ReadOnly`, which removes the mutating tools outright so there
+  would be nothing to ask about; and `respond` on a run that did not opt in.
+
+  Two findings worth knowing. Claude decides what needs asking, and read-only commands run
+  without a question, so the absence of a request is not proof that nothing ran. And under
+  `--input-format stream-json` Claude keeps the session open for another message, so stdin is
+  closed once the turn settles; without that the run only ended at its timeout even though
+  the answer had already arrived.
+
+  A note on scope: this is not the general duplex/background support deferred earlier. Stdin
+  stays open only for the life of one run, and only when approvals were asked for.
+
 ## 0.3.3
 
 ### Added
