@@ -172,6 +172,75 @@ async fn agents_without_a_headless_listing_refuse_to_guess() {
     }
 }
 
+/// The catalogue advertises effort levels; this proves each CLI actually takes
+/// the one this crate sends, and takes it the way this crate sends it. Codex is
+/// the interesting case: no flag, a config override, so a wrong key would be
+/// silently ignored rather than refused.
+///
+/// Copilot is absent on purpose. Its only plan-permitted model is `auto`, which
+/// rejects the flag outright; that is asserted separately below.
+///
+/// Each agent runs at the lowest level it documents, which is also the cheapest.
+#[tokio::test]
+#[ignore = "spawns a real agent and consumes quota"]
+async fn effort_reaches_the_agents_that_take_it() {
+    for agent in [Agent::Claude, Agent::Codex] {
+        if !available(agent) {
+            continue;
+        }
+        let outcome = run(&ping(agent).effort("low"))
+            .await
+            .unwrap_or_else(|e| panic!("{agent} rejected effort low: {e}"));
+        assert!(
+            outcome.is_ok(),
+            "{agent} did not finish cleanly at effort low: {outcome:?}"
+        );
+    }
+}
+
+/// Effort support is not uniform across an agent even where `--help` documents
+/// one set of levels. Copilot's `auto` exits 1 rather than ignoring the flag:
+///
+/// ```text
+/// Error: Model "auto" does not support reasoning effort configuration
+/// ```
+///
+/// Which is why the catalogue leaves `auto` with no levels. This asserts the
+/// behaviour that decision rests on, so a future Copilot release that starts
+/// accepting it shows up here.
+#[tokio::test]
+#[ignore = "spawns a real agent"]
+async fn copilot_auto_still_refuses_an_effort() {
+    if !available(Agent::Copilot) {
+        return;
+    }
+    let err = run(&ping(Agent::Copilot).model("auto").effort("low"))
+        .await
+        .expect_err("auto should still refuse an effort");
+    assert!(
+        err.to_string().to_lowercase().contains("reasoning effort"),
+        "the CLI's own complaint should survive: {err}"
+    );
+}
+
+/// The levels are the provider's to define, so a bad one must surface rather
+/// than be swallowed. Cheap: refused before any tokens are spent.
+#[tokio::test]
+#[ignore = "spawns a real agent"]
+async fn a_bogus_effort_is_reported_not_ignored() {
+    if !available(Agent::Codex) {
+        return;
+    }
+    let err = run(&ping(Agent::Codex).effort("bogus-level"))
+        .await
+        .expect_err("an invalid effort must not pass silently");
+    let message = err.to_string().to_lowercase();
+    assert!(
+        message.contains("effort") || message.contains("invalid"),
+        "the provider's complaint should survive: {err}"
+    );
+}
+
 #[tokio::test]
 #[ignore = "spawns a real agent and consumes quota"]
 async fn codex_answers_and_reports_usage() {
