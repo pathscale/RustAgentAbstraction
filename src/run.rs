@@ -1020,6 +1020,8 @@ mod tests {
                 status: "rejected".into(),
                 window: Some("five_hour".into()),
                 resets_at: None,
+                overage_status: None,
+                is_using_overage: None,
             }),
             ..Terminal::default()
         };
@@ -1036,6 +1038,8 @@ mod tests {
                 status: "allowed".into(),
                 window: None,
                 resets_at: None,
+                overage_status: None,
+                is_using_overage: None,
             }),
             ..Terminal::default()
         };
@@ -1096,6 +1100,8 @@ mod tests {
                 status: "allowed".into(),
                 window: Some("five_hour".into()),
                 resets_at: Some(1_785_331_800),
+                overage_status: None,
+                is_using_overage: None,
             }),
             ..Terminal::default()
         };
@@ -1115,6 +1121,8 @@ mod tests {
                 status: "rejected".into(),
                 window: Some("five_hour".into()),
                 resets_at: None,
+                overage_status: None,
+                is_using_overage: None,
             }),
             ..Terminal::default()
         };
@@ -1173,6 +1181,8 @@ mod tests {
                 status: "rejected".into(),
                 window: None,
                 resets_at: None,
+                overage_status: None,
+                is_using_overage: None,
             }),
             ..Terminal::default()
         };

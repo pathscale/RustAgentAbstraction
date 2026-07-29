@@ -230,6 +230,8 @@ fn enforce_bounds(event: Event) -> Event {
             status: bound_identifier(limit.status),
             window: limit.window.map(bound_identifier),
             resets_at: limit.resets_at,
+            overage_status: limit.overage_status.map(bound_identifier),
+            is_using_overage: limit.is_using_overage,
         }),
     }
 }
@@ -829,6 +831,21 @@ impl Parser {
                     .unwrap_or_default()
                     .to_string(),
             }],
+            // Copilot reports spend on its own event rather than only at the
+            // end, so a long run can show a running figure. Verified against
+            // Copilot CLI 1.0.75; the value is session-scoped and restarts each
+            // run rather than accruing across them.
+            "session.usage_checkpoint" => {
+                if let Some(data) = v.get("data") {
+                    self.term.usage.ai_credits_nano =
+                        data.get("totalNanoAiu").and_then(Value::as_u64);
+                    if let Some(premium) = data.get("totalPremiumRequests").and_then(Value::as_u64)
+                    {
+                        self.term.usage.premium_requests = Some(premium);
+                    }
+                }
+                Vec::new()
+            }
             // Copilot's terminal record is flat, not nested under `data`.
             "result" => {
                 self.seen.terminal = true;
@@ -840,6 +857,10 @@ impl Parser {
                 if let Some(usage) = v.get("usage") {
                     self.term.usage.premium_requests =
                         usage.get("premiumRequests").and_then(Value::as_u64);
+                    self.term.usage.duration_ms =
+                        usage.get("sessionDurationMs").and_then(Value::as_u64);
+                    self.term.usage.api_duration_ms =
+                        usage.get("totalApiDurationMs").and_then(Value::as_u64);
                 }
                 if let Some(code) = v.get("exitCode").and_then(Value::as_i64)
                     && code != 0
@@ -883,6 +904,11 @@ fn claude_rate_limit(v: Option<&Value>) -> Option<RateLimit> {
             .and_then(Value::as_str)
             .map(str::to_string),
         resets_at: v.get("resetsAt").and_then(Value::as_i64),
+        overage_status: v
+            .get("overageStatus")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        is_using_overage: v.get("isUsingOverage").and_then(Value::as_bool),
     })
 }
 
@@ -890,13 +916,37 @@ fn claude_rate_limit(v: Option<&Value>) -> Option<RateLimit> {
 fn claude_usage(v: &Value) -> Usage {
     let u = v.get("usage");
     let get = |key: &str| u.and_then(|u| u.get(key)).and_then(Value::as_u64);
+    let (input, read, write) = (
+        get("input_tokens"),
+        get("cache_read_input_tokens"),
+        get("cache_creation_input_tokens"),
+    );
+    // The window and output ceiling are reported per model rather than on the
+    // usage block, and a turn names exactly one model, so the first entry is
+    // that model's.
+    let per_model = v
+        .get("modelUsage")
+        .and_then(Value::as_object)
+        .and_then(|models| models.values().next());
+    let of_model = |key: &str| per_model.and_then(|m| m.get(key)).and_then(Value::as_u64);
     Usage {
-        input_tokens: get("input_tokens"),
+        input_tokens: input,
         output_tokens: get("output_tokens"),
-        cache_read_tokens: get("cache_read_input_tokens"),
-        cache_write_tokens: get("cache_creation_input_tokens"),
+        cache_read_tokens: read,
+        cache_write_tokens: write,
+        // Claude's `input_tokens` excludes cache, so the whole prompt is the
+        // sum. Absent unless it reported at least one of the three, so that
+        // "did not say" never becomes a zero.
+        context_tokens: (input.is_some() || read.is_some() || write.is_some())
+            .then(|| input.unwrap_or(0) + read.unwrap_or(0) + write.unwrap_or(0)),
+        context_window: of_model("contextWindow"),
+        max_output_tokens: of_model("maxOutputTokens"),
+        reasoning_tokens: None,
         cost_usd: v.get("total_cost_usd").and_then(Value::as_f64),
         premium_requests: None,
+        ai_credits_nano: None,
+        duration_ms: v.get("duration_ms").and_then(Value::as_u64),
+        api_duration_ms: v.get("duration_api_ms").and_then(Value::as_u64),
     }
 }
 
@@ -904,13 +954,31 @@ fn claude_usage(v: &Value) -> Usage {
 /// `cost_usd` stays absent rather than being derived from a local table.
 fn codex_usage(v: Option<&Value>) -> Usage {
     let get = |key: &str| v.and_then(|u| u.get(key)).and_then(Value::as_u64);
+    let (prompt, cached) = (get("input_tokens"), get("cached_input_tokens"));
     Usage {
-        input_tokens: get("input_tokens"),
+        // Codex counts the other way round from Claude: its `input_tokens` is
+        // the whole prompt with the cached part inside it. Verified across two
+        // turns of one thread, where input rose 15342 -> 30703 while cached
+        // rose 13056 -> 28160; had cached been separate, the second turn would
+        // have meant 30k *new* tokens for a four-word question. Subtracting
+        // makes `input_tokens` mean the same thing on both agents, and
+        // `context_tokens` keeps the figure Codex actually reported.
+        input_tokens: match (prompt, cached) {
+            (Some(prompt), Some(cached)) => Some(prompt.saturating_sub(cached)),
+            (prompt, _) => prompt,
+        },
         output_tokens: get("output_tokens"),
-        cache_read_tokens: get("cached_input_tokens"),
+        cache_read_tokens: cached,
         cache_write_tokens: get("cache_write_input_tokens"),
+        context_tokens: prompt,
+        context_window: None,
+        max_output_tokens: None,
+        reasoning_tokens: get("reasoning_output_tokens"),
         cost_usd: None,
         premium_requests: None,
+        ai_credits_nano: None,
+        duration_ms: None,
+        api_duration_ms: None,
     }
 }
 
@@ -1134,6 +1202,8 @@ mod tests {
             status: "allowed".into(),
             window: Some("five_hour".into()),
             resets_at: Some(1_785_260_400),
+            overage_status: None,
+            is_using_overage: None,
         };
         assert!(events.contains(&Event::RateLimit(limit.clone())));
         assert_eq!(term.rate_limit, Some(limit.clone()));
@@ -1260,8 +1330,13 @@ mod tests {
         );
         assert_eq!(term.session.as_deref(), Some("0199-xyz"));
         assert_eq!(term.text, "pong");
-        assert_eq!(term.usage.input_tokens, Some(12));
+        // Codex reports the whole prompt as `input_tokens` with the cached
+        // part inside it, so 12 total minus 9 cached is 3 tokens of new input.
+        // `input_tokens` means the same thing here as it does on Claude, and
+        // `context_tokens` keeps the figure Codex actually sent.
+        assert_eq!(term.usage.input_tokens, Some(3));
         assert_eq!(term.usage.cache_read_tokens, Some(9));
+        assert_eq!(term.usage.context_tokens, Some(12));
     }
 
     #[test]
