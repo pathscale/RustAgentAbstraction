@@ -787,11 +787,22 @@ fn classify(
         .rate_limit
         .as_ref()
         .is_some_and(crate::outcome::RateLimit::is_blocking);
-    if quota_signalled || looks_rate_limited(stderr) || looks_rate_limited(stdout) {
+    // Scanning the *raw* stream for quota wording is a false-positive machine:
+    // under `stream-json` Claude prints a `rate_limit_event` record on every
+    // run, including one whose status is `allowed`, so the substring
+    // `rate_limit` is present in perfectly healthy output. Where the stream
+    // parsed, the parsed signal and the agent's own prose decide; the raw scan
+    // is only the fallback for output that produced neither.
+    let prose = match (&terminal.error_message, terminal.text.as_str()) {
+        (Some(message), text) => format!("{message}\n{text}"),
+        (None, text) if !text.is_empty() => text.to_string(),
+        _ => stdout.to_string(),
+    };
+    if quota_signalled || looks_rate_limited(stderr) || looks_rate_limited(&prose) {
         return Error::RateLimited {
             bin: bin.to_string(),
             message: first_meaningful_line(stderr)
-                .or_else(|| first_meaningful_line(stdout))
+                .or_else(|| first_meaningful_line(&prose))
                 .unwrap_or_else(|| "usage limit reached".to_string()),
         };
     }
@@ -1006,6 +1017,50 @@ mod tests {
         assert!(matches!(
             classify(Agent::Claude, "claude", 1, "boom", "", &terminal),
             Error::Failed { .. }
+        ));
+    }
+
+    /// Verbatim from a healthy claude 2.1.205 run. Every `stream-json` run
+    /// carries this record, and its status is `allowed`: nothing is refused.
+    /// Scanning the raw stream for `rate_limit` matched it anyway, so any
+    /// Claude failure was reported as a quota refusal, sending a caller to back
+    /// off when the real cause was something they could fix.
+    #[test]
+    fn a_healthy_rate_limit_heartbeat_is_not_a_refusal() {
+        let stdout = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":1785331800,"rateLimitType":"five_hour","overageStatus":"rejected","isUsingOverage":false}}"#;
+        let terminal = Terminal {
+            stop: Stop::Error,
+            error_status: Some(404),
+            text: "There's an issue with the selected model (bogus-model-xyz).".into(),
+            rate_limit: Some(crate::outcome::RateLimit {
+                status: "allowed".into(),
+                window: Some("five_hour".into()),
+                resets_at: Some(1_785_331_800),
+            }),
+            ..Terminal::default()
+        };
+        let err = classify_run(Agent::Claude, "claude", 0, "", stdout, &terminal);
+        assert!(
+            matches!(err, Error::AgentError { .. }),
+            "the heartbeat must not mask the real cause: {err:?}"
+        );
+    }
+
+    /// The counterpart: a refusal the parser did read must still be one, even
+    /// though it arrives with the same zero exit code.
+    #[test]
+    fn a_rejected_quota_signal_is_still_a_refusal() {
+        let terminal = Terminal {
+            rate_limit: Some(crate::outcome::RateLimit {
+                status: "rejected".into(),
+                window: Some("five_hour".into()),
+                resets_at: None,
+            }),
+            ..Terminal::default()
+        };
+        assert!(matches!(
+            classify_run(Agent::Claude, "claude", 0, "", "", &terminal),
+            Error::RateLimited { .. }
         ));
     }
 

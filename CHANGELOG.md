@@ -60,6 +60,12 @@ already rendering events, check the first item.
 
 ### Fixed
 
+- **A healthy quota heartbeat is no longer read as a refusal.** Every Claude `stream-json`
+  run prints a `rate_limit_event` record, and on a healthy run its status is `allowed`.
+  Classification scanned the raw stream for the substring `rate_limit`, which that record
+  contains, so any Claude failure came back as `Error::RateLimited`: a caller was told to
+  back off when the real cause was one they could fix. The parsed signal and the agent's own
+  prose now decide, and the raw scan is only the fallback for output that produced neither.
 - **A failure reports its cause rather than a status line.** The first line of stderr was taken
   as the explanation, but CLIs open with progress chatter: a rejected Codex schema reported
   "Reading additional input from stdin...", which is not what went wrong. A line that looks
