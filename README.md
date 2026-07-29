@@ -295,6 +295,10 @@ own variables do not reach the child.
   as a positional and the deny is silently lost. This crate always emits the combined form.
 - **Copilot needs `--allow-all-tools` to run headlessly at all**, or it stalls at the first
   tool confirmation. It is always emitted; `Permission` then narrows via denies.
+- **A failed turn still exits 0.** Ask Claude for a model that does not exist and it exits
+  cleanly, reports `subtype: "success"`, and puts "There's an issue with the selected model"
+  where the answer belongs. Codex does the same and wraps the upstream body in a JSON string.
+  Both come back as `Error::AgentError`; see below.
 - **Claude's `stream-json` requires `--verbose`**, or it refuses to start. Handled.
 - **Large prompts move to stdin automatically** above 128 KiB, so a long prompt never fails
   with `E2BIG`.
@@ -333,6 +337,35 @@ shortened tool id cannot be matched to its call.
 Under a structured format there is no silent fallback to raw stdout: a run that produced no
 recognizable records, or never reached its terminal record, returns `Error::Parse` rather
 than a plausible-looking answer assembled from whatever was printed.
+
+## A clean exit is not a successful turn
+
+All three agents report some failures with exit code 0, with the explanation where the answer
+should be. An unknown model, a rejected schema and an upstream outage all arrive this way, so
+a caller checking only `Result::is_ok` renders the error as the model's reply.
+
+These are `Error::AgentError`, carrying the agent's own wording and the provider's status
+where one was reported:
+
+```rust
+match run(&request).await {
+    Err(Error::AgentError { status: Some(404), message, .. }) => {
+        // Typically a model the account cannot reach. `message` is the agent's wording.
+        eprintln!("{message}");
+    }
+    Err(e) if e.is_auth_failure() => { /* prompt for login */ }
+    Err(e) if e.is_transient() => { /* back off */ }
+    other => { /* ... */ }
+}
+```
+
+`NotAuthenticated` and `RateLimited` are the two members of this family that predate it and
+keep their own variants, because the remedy differs. Everything else in it lands here.
+
+Codex needs one extra step: it forwards the provider's response body as a *string*, so its
+`turn.failed` message is JSON containing the sentence and the status. This crate unwraps it,
+so `message` is the sentence and `status` is the code. A message that is not that shape is
+passed through untouched.
 
 ## No shell, ever
 

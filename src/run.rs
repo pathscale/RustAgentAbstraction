@@ -659,7 +659,11 @@ async fn drive(
     // result text, so checking only the exit code would hand back a successful
     // Outcome whose answer is "Please run /login".
     let unauthenticated = looks_unauthenticated(&terminal.text);
-    if exit_code != 0 || quota_blocked || unauthenticated {
+    // The agent saying its turn failed is as much a failure as a non-zero exit,
+    // and Claude reports an unknown model exactly this way: exit 0, `is_error`
+    // true, and the explanation where the answer would be.
+    let turn_failed = terminal.stop == Stop::Error;
+    if exit_code != 0 || quota_blocked || unauthenticated || turn_failed {
         return Err(classify_run(
             request.agent,
             &bin,
@@ -740,7 +744,7 @@ fn classify_run(
             };
         }
     }
-    classify(bin, code, stderr, stdout, terminal)
+    classify(agent, bin, code, stderr, stdout, terminal)
 }
 
 /// Whether text is an agent saying it has no usable credentials.
@@ -771,7 +775,14 @@ fn looks_unauthenticated(text: &str) -> bool {
 }
 
 /// Turn a non-zero exit into the most specific error available.
-fn classify(bin: &str, code: i32, stderr: &str, stdout: &str, terminal: &Terminal) -> Error {
+fn classify(
+    agent: crate::Agent,
+    bin: &str,
+    code: i32,
+    stderr: &str,
+    stdout: &str,
+    terminal: &Terminal,
+) -> Error {
     let quota_signalled = terminal
         .rate_limit
         .as_ref()
@@ -793,6 +804,24 @@ fn classify(bin: &str, code: i32, stderr: &str, stdout: &str, terminal: &Termina
             detail,
         };
     }
+    // Checked before the generic failure but after quota and a rejected flag,
+    // which are more specific readings of the same output.
+    if terminal.stop == Stop::Error {
+        return Error::AgentError {
+            agent,
+            bin: bin.to_string(),
+            status: terminal.error_status,
+            // Codex reports the reason apart from the answer; Claude puts it
+            // where the answer would be.
+            message: terminal
+                .error_message
+                .clone()
+                .or_else(|| first_meaningful_line(&terminal.text))
+                .or_else(|| first_meaningful_line(stderr))
+                .unwrap_or_else(|| "the agent reported a failure without explaining it".into()),
+        };
+    }
+
     Error::Failed {
         bin: bin.to_string(),
         code,
@@ -959,7 +988,7 @@ mod tests {
             ..Terminal::default()
         };
         assert!(matches!(
-            classify("claude", 1, "", "", &terminal),
+            classify(Agent::Claude, "claude", 1, "", "", &terminal),
             Error::RateLimited { .. }
         ));
     }
@@ -975,9 +1004,70 @@ mod tests {
             ..Terminal::default()
         };
         assert!(matches!(
-            classify("claude", 1, "boom", "", &terminal),
+            classify(Agent::Claude, "claude", 1, "boom", "", &terminal),
             Error::Failed { .. }
         ));
+    }
+
+    /// Verbatim from a real run with an unknown model. Claude exits **0** with
+    /// `subtype: "success"` while `is_error` is true and the explanation sits
+    /// where the answer would be, so a caller checking only `Result::is_ok`
+    /// renders "There's an issue with the selected model" as the answer.
+    #[test]
+    fn a_failed_turn_is_an_error_even_though_the_process_exited_cleanly() {
+        let terminal = Terminal {
+            stop: Stop::Error,
+            error_status: Some(404),
+            text: "There's an issue with the selected model (bogus-model-xyz). \
+                   It may not exist or you may not have access to it."
+                .into(),
+            ..Terminal::default()
+        };
+        let err = classify_run(Agent::Claude, "claude", 0, "", "", &terminal);
+        let Error::AgentError {
+            agent,
+            status,
+            message,
+            ..
+        } = &err
+        else {
+            panic!("expected AgentError, got {err:?}")
+        };
+        assert_eq!(*agent, Agent::Claude);
+        assert_eq!(*status, Some(404), "the provider status must survive");
+        assert!(message.contains("selected model"), "{message}");
+    }
+
+    /// A quota refusal and a missing login are more specific readings of the
+    /// same shape, so they must not be swallowed by the general case.
+    #[test]
+    fn a_failed_turn_does_not_mask_a_more_specific_cause() {
+        let auth = Terminal {
+            stop: Stop::Error,
+            text: "Not logged in · Please run /login".into(),
+            ..Terminal::default()
+        };
+        assert!(
+            classify_run(Agent::Claude, "claude", 0, "", "", &auth).is_auth_failure(),
+            "an unauthenticated failed turn must stay an auth failure"
+        );
+
+        let quota = Terminal {
+            stop: Stop::Error,
+            rate_limit: Some(crate::outcome::RateLimit {
+                status: "rejected".into(),
+                window: None,
+                resets_at: None,
+            }),
+            ..Terminal::default()
+        };
+        assert!(
+            matches!(
+                classify_run(Agent::Claude, "claude", 0, "", "", &quota),
+                Error::RateLimited { .. }
+            ),
+            "a quota-blocked failed turn must stay a rate limit"
+        );
     }
 
     /// Verified against the real CLI: with `USER` withheld, claude answers
@@ -1075,6 +1165,7 @@ mod tests {
     #[test]
     fn a_rejected_flag_is_named_as_a_version_mismatch() {
         let err = classify(
+            Agent::Codex,
             "codex",
             2,
             "error: unexpected argument '--sandbox' found",
@@ -1097,7 +1188,7 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    classify("codex", 1, stderr, "", &Terminal::default()),
+                    classify(Agent::Codex, "codex", 1, stderr, "", &Terminal::default()),
                     Error::Failed { .. }
                 ),
                 "{stderr:?} should stay a plain failure"
@@ -1152,6 +1243,7 @@ mod tests {
     #[test]
     fn failures_report_the_first_useful_line() {
         let err = classify(
+            Agent::Claude,
             "claude",
             2,
             "\n\n  real problem  \nstack",

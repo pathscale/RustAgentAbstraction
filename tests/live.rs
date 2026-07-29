@@ -61,6 +61,68 @@ async fn claude_answers_and_reports_usage() {
     assert!(outcome.usage.cost_usd.is_some(), "{:?}", outcome.usage);
 }
 
+/// The failure this crate most has to get right: claude exits **0** for an
+/// unknown model and puts the explanation where the answer goes. Before this
+/// was classified, a caller checking `Result::is_ok` rendered "There's an issue
+/// with the selected model" as the model's reply.
+///
+/// Cheap: the turn is refused before any tokens are spent.
+#[tokio::test]
+#[ignore = "spawns a real agent"]
+async fn an_unknown_model_is_an_error_not_an_answer() {
+    if !available(Agent::Claude) {
+        return;
+    }
+    let request = ping(Agent::Claude).model("bogus-model-xyz");
+    let err = run(&request)
+        .await
+        .expect_err("an unknown model must not come back as an answer");
+
+    let agent_abstraction::Error::AgentError {
+        status, message, ..
+    } = &err
+    else {
+        panic!("expected AgentError, got {err:?}")
+    };
+    // Not asserted as exactly 404: the status is passed through from the
+    // provider, and the point is that whatever it sends survives.
+    assert!(
+        status.is_some(),
+        "the provider status should survive: {err:?}"
+    );
+    assert!(
+        message.to_lowercase().contains("model"),
+        "the agent's own wording should survive: {message}"
+    );
+}
+
+/// Codex fails the same way and adds a wrinkle: it forwards the upstream error
+/// body as a JSON string, so without unwrapping, the caller is handed JSON
+/// instead of a sentence.
+#[tokio::test]
+#[ignore = "spawns a real agent"]
+async fn codex_reports_an_unknown_model_as_a_sentence_not_json() {
+    if !available(Agent::Codex) {
+        return;
+    }
+    let request = ping(Agent::Codex).model("bogus-model-xyz");
+    let err = run(&request)
+        .await
+        .expect_err("an unknown model must not come back as an answer");
+
+    let agent_abstraction::Error::AgentError { message, .. } = &err else {
+        panic!("expected AgentError, got {err:?}")
+    };
+    assert!(
+        !message.trim_start().starts_with('{'),
+        "the upstream envelope should have been unwrapped: {message}"
+    );
+    assert!(
+        message.to_lowercase().contains("model"),
+        "the agent's own wording should survive: {message}"
+    );
+}
+
 #[tokio::test]
 #[ignore = "spawns a real agent and consumes quota"]
 async fn codex_answers_and_reports_usage() {
