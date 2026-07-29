@@ -15,7 +15,9 @@ of that line, so a future change does not quietly cross it.
   unedited, and surfaces Claude's `rate_limit_event` as an ordinary `Event::RateLimit`
   during a run.
 - **Passes model names through verbatim.** An unknown model is the provider's error to
-  raise, not this crate's to guess around.
+  raise, not this crate's to guess around. It is reported as [`Error::AgentError`] with the
+  provider's status, since the agents answer an unknown model with a clean exit and an
+  explanation where the answer belongs.
 
 ## What this crate deliberately does not do
 
