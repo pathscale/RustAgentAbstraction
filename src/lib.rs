@@ -85,6 +85,7 @@
 //! [`Error::RateLimited`], carrying the provider's own wording, and backing off
 //! is the caller's decision. See `docs/operating-limits.md`.
 
+mod account;
 mod agent;
 mod auth;
 mod error;
@@ -97,6 +98,7 @@ mod request;
 mod run;
 mod session;
 
+pub use account::{AccountUsage, Credits, DailyUsage, Lifetime, UsageWindow};
 pub use agent::{Agent, Caps, EnvPolicy, Format, NETWORK_ENV, Permission, SessionSupport};
 pub use auth::{AuthState, AuthStatus};
 pub use error::{Error, Result};

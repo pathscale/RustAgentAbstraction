@@ -241,6 +241,102 @@ async fn a_bogus_effort_is_reported_not_ignored() {
     );
 }
 
+/// Cheap and free of tokens: `codex app-server` answers from the account, not
+/// the model. Pins the shape a quota panel depends on.
+#[tokio::test]
+async fn codex_reports_account_usage_without_a_terminal() {
+    if !available(Agent::Codex) {
+        return;
+    }
+    assert!(Agent::Codex.reports_account_usage());
+    let usage = Agent::Codex
+        .account_usage()
+        .await
+        .expect("codex should report account usage");
+
+    assert!(
+        usage.plan.is_some(),
+        "a plan name should survive: {usage:?}"
+    );
+    let window = usage
+        .windows
+        .first()
+        .unwrap_or_else(|| panic!("at least one quota window: {usage:?}"));
+    assert!(
+        window.used_percent.is_some(),
+        "a percentage is the point of asking: {window:?}"
+    );
+    assert!(window.window_minutes.is_some(), "{window:?}");
+}
+
+/// Claude's context tracker, end to end: it is the one agent that reports the
+/// window alongside the tokens, so a share of it is knowable.
+#[tokio::test]
+#[ignore = "spawns a real agent and consumes quota"]
+async fn claude_reports_enough_to_track_context() {
+    if !available(Agent::Claude) {
+        return;
+    }
+    let outcome = run(&ping(Agent::Claude)).await.expect("claude run failed");
+    let usage = &outcome.usage;
+
+    let context = usage.context_tokens.expect("context tokens");
+    let window = usage.context_window.expect("context window");
+    assert!(context > 0 && window > 0, "{usage:?}");
+    assert!(
+        context <= window,
+        "context cannot exceed the window: {usage:?}"
+    );
+    let share = usage.context_used().expect("both halves present");
+    assert!((0.0..=1.0).contains(&share), "share out of range: {share}");
+    assert!(usage.max_output_tokens.is_some(), "{usage:?}");
+}
+
+/// The accounting difference this release exists to fix. Codex sends the whole
+/// prompt as `input_tokens`; after normalizing, the parts must add back up to
+/// the total it reported.
+#[tokio::test]
+#[ignore = "spawns a real agent and consumes quota"]
+async fn codex_token_parts_reconcile_with_the_total_it_reported() {
+    if !available(Agent::Codex) {
+        return;
+    }
+    let outcome = run(&ping(Agent::Codex)).await.expect("codex run failed");
+    let usage = &outcome.usage;
+
+    let context = usage.context_tokens.expect("context tokens");
+    let uncached = usage.input_tokens.expect("input tokens");
+    let cached = usage.cache_read_tokens.unwrap_or(0);
+    assert_eq!(
+        uncached + cached,
+        context,
+        "normalized input plus cache should equal the prompt codex reported: {usage:?}"
+    );
+    assert!(
+        usage.reasoning_tokens.is_some(),
+        "codex separates reasoning tokens: {usage:?}"
+    );
+}
+
+/// Copilot reports spend in AI credits, the unit that replaced premium
+/// requests, on its own event rather than only at the end.
+#[tokio::test]
+#[ignore = "spawns a real agent and consumes quota"]
+async fn copilot_reports_its_credit_spend() {
+    if !available(Agent::Copilot) {
+        return;
+    }
+    let outcome = run(&ping(Agent::Copilot))
+        .await
+        .expect("copilot run failed");
+    assert!(
+        outcome.usage.ai_credits_nano.is_some(),
+        "the checkpoint event should reach the outcome: {:?}",
+        outcome.usage
+    );
+    assert!(outcome.usage.duration_ms.is_some(), "{:?}", outcome.usage);
+}
+
 #[tokio::test]
 #[ignore = "spawns a real agent and consumes quota"]
 async fn codex_answers_and_reports_usage() {

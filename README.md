@@ -435,6 +435,67 @@ Codex needs one extra step: it forwards the provider's response body as a *strin
 so `message` is the sentence and `status` is the code. A message that is not that shape is
 passed through untouched.
 
+## Usage and quota
+
+Two questions with two answers. `Outcome::usage` measures the run; `Agent::account_usage()`
+measures the plan behind it. Everything is a value, never a formatted string or a rendered
+bar, so a host presents it however it likes.
+
+### Per run, and per session
+
+```rust
+let outcome = run(&request).await?;
+let used = outcome.usage.context_used();   // Option<f64>, 0.0 to 1.0
+```
+
+**Do not sum usage across turns in a loop.** An agent re-sends the whole conversation each
+turn and reports it, mostly as cache reads, so adding the context figures counts the same
+conversation once per turn and the error grows with the session. `Usage::accumulate` applies
+the right rule per field:
+
+```rust
+let mut session = Usage::default();
+session.accumulate(&outcome.usage);   // cost and output add; context takes the latest
+```
+
+The vendors also disagree on what "input" counts: Claude reports the uncached remainder,
+Codex reports the whole prompt with the cached part inside it. `input_tokens` is normalized
+to the first meaning on both, and `context_tokens` carries the whole prompt.
+
+| | Claude | Codex | Copilot |
+|---|---|---|---|
+| tokens in / out | yes | yes | no |
+| cache read / write | yes | yes | no |
+| `context_tokens` | yes | yes | no |
+| `context_window`, `max_output_tokens` | yes | no | no |
+| `reasoning_tokens` | no | yes | no |
+| `cost_usd` | yes | no | no |
+| `ai_credits_nano`, `premium_requests` | no | no | yes |
+| `duration_ms`, `api_duration_ms` | yes | no | yes |
+
+`context_used()` needs both the tokens and the window, so today it answers only on Claude.
+
+### Account-wide
+
+```rust
+if agent.reports_account_usage() {
+    let account = agent.account_usage().await?;
+    for window in &account.windows {
+        // window.used_percent, window.window_minutes, window.resets_at
+    }
+}
+```
+
+Only Codex can answer, through its `codex app-server` JSON-RPC interface: quota windows with
+percentages and reset times, credit balance, per-day token buckets and lifetime totals.
+
+Claude and Copilot return `Error::Unsupported`. Claude reports quota only *during* a run, as
+`Event::RateLimit`, and only the window, its reset time and whether the request was allowed;
+the percentages on its `/usage` screen are not on the wire, and that screen itself says its
+figures are approximate and cover one machine's local sessions. Copilot reports session
+spend and nothing account-wide. Ask `reports_account_usage()` first rather than discovering
+this from an error.
+
 ## No shell, ever
 
 Arguments are built as a `Vec<String>` and passed straight to `exec`. There is no shell in
