@@ -23,6 +23,12 @@ Copilot CLIs headlessly behind one API. Consumed as a direct dependency by the
 - **Never invent usage numbers.** `Usage` fields are `Option` because the three agents
   report different subsets. Absent means "the agent did not say", never zero, and never a
   figure derived from a local price table.
+- **Context-shaped usage figures are already cumulative and must never be summed.** An agent
+  re-sends the whole conversation each turn and reports it, mostly as cache reads, so adding
+  `context_tokens` or `cache_read_tokens` across turns counts the same conversation once per
+  turn. `Usage::accumulate` holds the per-field rule; extend it rather than hand-rolling a
+  total. The vendors also disagree on what "input" counts, so a new field must say which
+  convention it follows and normalize to one.
 - **This crate is a library. It has no binary and no CLI.** If something seems to need a
   command-line entry point, it belongs in the consumer, not here.
 - **No shell.** Arguments are built as a `Vec<String>` and handed to `exec`. Never
@@ -100,6 +106,7 @@ Pure logic and I/O are kept apart so the mappings are testable without spawning 
 | `src/run.rs` | Spawning, streaming, timeouts, failure classification. |
 | `src/proc.rs` | Process-group teardown. The crate's only `unsafe`. |
 | `src/outcome.rs` | What a finished run produced. |
+| `src/account.rs` | Account-wide quota and usage, where a CLI exposes it. |
 | `src/error.rs` | One error type; one variant per case a caller must branch on. |
 
 Anything pure gets ordinary unit tests in the same file. Keep it that way: a mapping that
