@@ -367,6 +367,10 @@ own variables do not reach the child.
   cleanly, reports `subtype: "success"`, and puts "There's an issue with the selected model"
   where the answer belongs. Codex does the same and wraps the upstream body in a JSON string.
   Both come back as `Error::AgentError`; see below.
+- **`claude-opus-5` defaults to a 200k window while every other 5-series model is 1M.**
+  Verified by running each id: `claude-sonnet-5` and `claude-fable-5` report a 1,000,000
+  token window natively, `claude-opus-5` reports 200,000 and needs the `[1m]` suffix
+  (`claude-opus-5[1m]`) to widen. The catalogue carries both forms.
 - **Claude's `stream-json` requires `--verbose`**, or it refuses to start. Handled.
 - **Large prompts move to stdin automatically** above 128 KiB, so a long prompt never fails
   with `E2BIG`.

@@ -8,6 +8,16 @@ appear in a patch rather than inflating the version toward 1.0 on a crate still 
 shape. **Where that happens the entry says so at the top**, because a version number that
 under-signals is only acceptable if the changelog over-signals to compensate.
 
+## 0.3.3
+
+### Added
+
+- **`claude-opus-5[1m]` is catalogued**, and the Claude entries now state their context
+  window. Running every id on claude 2.1.212 showed `claude-opus-5` is the odd one out:
+  `claude-sonnet-5` and `claude-fable-5` are 1M natively, while it defaults to 200k and
+  takes the `[1m]` suffix to widen. A picker can now offer both forms explicitly rather
+  than leaving the suffix to be discovered.
+
 ## 0.3.2
 
 ### Fixed

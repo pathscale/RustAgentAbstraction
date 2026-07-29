@@ -272,7 +272,7 @@ fn claude_aliases() -> Vec<Model> {
         Model::new(
             "fable",
             "Fable",
-            "For the hardest and longest-running tasks",
+            "For the hardest and longest-running tasks (1M context)",
             Kind::Alias,
             CLAUDE_EFFORTS,
             false,
@@ -333,10 +333,22 @@ fn claude_aliases() -> Vec<Model> {
 /// account resolves it to, which is not always the newest model.
 fn claude_pinned() -> Vec<Model> {
     vec![
+        // Windows verified by running each id on claude 2.1.212 (2026-07-30).
+        // `claude-opus-5` is the odd one out: every other 5-series model is 1M
+        // natively, while it defaults to 200k and needs the suffix. Both forms
+        // are catalogued so a picker can offer the choice explicitly.
         Model::new(
             "claude-opus-5",
             "Claude Opus 5",
-            "For complex agentic coding and enterprise work",
+            "For complex agentic coding and enterprise work (200k context)",
+            Kind::Pinned,
+            CLAUDE_EFFORTS,
+            false,
+        ),
+        Model::new(
+            "claude-opus-5[1m]",
+            "Claude Opus 5 (1M context)",
+            "Opus 5 with a 1M token context window",
             Kind::Pinned,
             CLAUDE_EFFORTS,
             false,
@@ -344,7 +356,7 @@ fn claude_pinned() -> Vec<Model> {
         Model::new(
             "claude-sonnet-5",
             "Claude Sonnet 5",
-            "The best combination of speed and intelligence",
+            "The best combination of speed and intelligence (1M context)",
             Kind::Pinned,
             CLAUDE_EFFORTS,
             false,
@@ -352,7 +364,7 @@ fn claude_pinned() -> Vec<Model> {
         Model::new(
             "claude-fable-5",
             "Claude Fable 5",
-            "Next-generation intelligence for long-running agents",
+            "Next-generation intelligence for long-running agents (1M context)",
             Kind::Pinned,
             CLAUDE_EFFORTS,
             false,
