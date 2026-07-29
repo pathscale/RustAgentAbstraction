@@ -259,6 +259,55 @@ down the whole group. Killing only the CLI would orphan the commands *it* starte
 keep holding files and credentials afterwards. Windows has no equivalent here yet: only the
 direct child is killed, since containing a tree there needs a Job Object.
 
+## Human in the loop
+
+Every `Permission` answers the approval question up front, which is what lets a headless run
+finish unattended. For a desktop app the point is to *ask*. `Request::approvals` routes
+gated tool calls to the caller instead:
+
+```rust
+let request = Request::new(Agent::Claude, prompt)
+    .permission(Permission::Edit)
+    .approvals();
+
+let mut run = stream(&request)?;
+while let Some(event) = run.recv().await {
+    if let Event::ApprovalRequest(approval) = event {
+        // approval.tool is "Bash"; approval.input carries the actual command
+        let decision = if user_said_yes(&approval) {
+            Decision::Allow
+        } else {
+            Decision::deny()
+        };
+        run.respond(&approval.id, &decision).await?;
+    }
+}
+let outcome = run.finish().await?;
+```
+
+**Show `approval.input` before deciding.** For `Bash` it carries the command; approving on the
+tool name alone approves an unseen command.
+
+Four things are refused up front rather than met as a hang or a silence:
+
+| combination | why |
+|---|---|
+| Codex or Copilot | neither has a headless approval channel. Codex's sandbox mode is decided before the run; Copilot needs `--allow-all-tools` to run headlessly at all |
+| `run()` instead of `stream()` | `run` discards events, so nobody could answer |
+| `Permission::ReadOnly` | it removes the mutating tools outright, so there is nothing left to be asked about, and a caller would never be asked |
+| `respond` on a run that did not opt in | there is no channel to answer on |
+
+A denial is not a failure: the model is told no, works around it, and the turn completes.
+Claude also lists every refusal in its terminal record.
+
+**Claude decides what needs asking, not this crate.** Read-only commands run without a
+question: verified on 2.1.212, `whoami` runs unasked while `touch some-file` asks. So the
+absence of a request is not proof that nothing ran.
+
+The user's own settings stay loaded. Suppressing them with `--setting-sources ""` would
+discard their CLAUDE.md, and it is not needed: a mutating command still asks with those
+settings in place.
+
 ## Permissions
 
 `Permission` maps one posture onto each agent's own vocabulary:

@@ -366,6 +366,102 @@ async fn copilot_reports_its_credit_spend() {
     assert!(outcome.usage.duration_ms.is_some(), "{:?}", outcome.usage);
 }
 
+/// The whole human-in-the-loop round trip against the real CLI: a gated tool
+/// call arrives as an event, the decision goes back mid-turn, and the denial is
+/// honoured. The file is the proof: if the answer had not reached claude, it
+/// would exist.
+#[tokio::test]
+#[ignore = "spawns a real agent and consumes quota"]
+async fn a_denied_approval_stops_the_tool_from_running() {
+    if !available(Agent::Claude) {
+        return;
+    }
+    let dir =
+        std::env::temp_dir().join(format!("agent-abstraction-approval-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let target = dir.join("must-not-exist.txt");
+    let _ = std::fs::remove_file(&target);
+
+    let request = Request::new(
+        Agent::Claude,
+        "Use the Bash tool to run exactly: touch must-not-exist.txt",
+    )
+    .model("haiku")
+    .cwd(&dir)
+    // Not `ReadOnly`: that removes Bash outright, so there would be nothing
+    // to be asked about. Here the human is the gate instead.
+    .permission(Permission::Edit)
+    .approvals()
+    .timeout(Duration::from_secs(180));
+
+    let mut run = stream(&request).expect("stream should start");
+    let mut asked = Vec::new();
+    while let Some(event) = run.recv().await {
+        if let Event::ApprovalRequest(approval) = event {
+            asked.push(approval.tool.clone());
+            run.respond(&approval.id, &agent_abstraction::Decision::deny())
+                .await
+                .expect("the decision should reach claude");
+        }
+    }
+    let outcome = run.finish().await.expect("a denial is not a failed run");
+
+    assert!(
+        asked.iter().any(|tool| tool == "Bash"),
+        "claude should have asked before running a mutating command, asked: {asked:?}"
+    );
+    assert!(
+        !target.exists(),
+        "the denial was not honoured: the file was created anyway"
+    );
+    assert!(
+        outcome.is_ok(),
+        "the turn should still complete: {outcome:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Both refusals, checked without spawning: neither other agent can ask, and
+/// `run` cannot carry the question to anyone.
+#[tokio::test]
+async fn approvals_are_refused_where_they_cannot_work() {
+    for agent in [Agent::Codex, Agent::Copilot] {
+        let request = Request::new(agent, PING)
+            .permission(Permission::Edit)
+            .approvals();
+        assert!(
+            matches!(
+                request.argv(),
+                Err(agent_abstraction::Error::Unsupported { .. })
+            ),
+            "{agent} has no approval channel and should say so"
+        );
+    }
+    let discarded = Request::new(Agent::Claude, PING)
+        .permission(Permission::Edit)
+        .approvals();
+
+    // Read-only removes the tools that would be asked about, so it is refused
+    // rather than silently never asking.
+    assert!(
+        matches!(
+            Request::new(Agent::Claude, PING)
+                .permission(Permission::ReadOnly)
+                .approvals()
+                .argv(),
+            Err(agent_abstraction::Error::Unsupported { .. })
+        ),
+        "approvals under read-only should be refused"
+    );
+    assert!(
+        matches!(
+            run(&discarded).await,
+            Err(agent_abstraction::Error::Unsupported { .. })
+        ),
+        "`run` discards events, so nobody could answer"
+    );
+}
+
 #[tokio::test]
 #[ignore = "spawns a real agent and consumes quota"]
 async fn codex_answers_and_reports_usage() {

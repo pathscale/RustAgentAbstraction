@@ -63,6 +63,24 @@ where
     Ok(Some(truncated))
 }
 
+/// Aborts a task when dropped.
+///
+/// The decision forwarder holds the child's stdin, so leaving it running past
+/// the run would keep a pipe open to a process that is gone.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// How many decisions may queue on the way back to the agent.
+///
+/// Small on purpose: the agent asks one question at a time and waits, so a deep
+/// queue here would only mean answers piling up for questions nobody asked.
+const APPROVAL_BUFFER: usize = 8;
+
 /// How many events may queue before the producer waits for the consumer. Deep
 /// enough that a burst of tool events does not stall the agent, shallow enough
 /// that a consumer which stops reading does not grow without bound.
@@ -88,6 +106,8 @@ const EVENT_BUFFER: usize = 256;
 #[derive(Debug)]
 pub struct Run {
     events: mpsc::Receiver<Event>,
+    /// Which agent this is, so `respond` can name it in an error.
+    agent: crate::Agent,
     /// The typed command line, kept so both the plain and redacted views come
     /// from the same source.
     typed: Vec<crate::agent::Arg>,
@@ -97,6 +117,10 @@ pub struct Run {
     /// Set by the driver once the child has been reaped, so `Drop` never
     /// signals a pid the OS may since have handed to someone else.
     reaped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Decisions on the way back to the agent. `None` unless the request asked
+    /// for approvals, which is what makes [`Run::respond`] refuse rather than
+    /// silently do nothing on an ordinary run.
+    decisions: Option<mpsc::Sender<String>>,
     /// Dropping or firing this asks the driver to tear down in order. Held as
     /// an `Option` so `detach` can discard it without signalling.
     cancel: Option<tokio::sync::oneshot::Sender<()>>,
@@ -111,6 +135,36 @@ impl Run {
     /// The next event, or `None` once the agent has finished producing them.
     pub async fn recv(&mut self) -> Option<Event> {
         self.events.recv().await
+    }
+
+    /// Answer an [`Event::ApprovalRequest`].
+    ///
+    /// The agent is blocked until this is called, so a consumer that receives an
+    /// approval request and never responds stalls the run until its timeout.
+    ///
+    /// The id must be the one from the request. The agent ignores an answer
+    /// carrying any other id and keeps waiting, so a mismatch presents as a
+    /// hang rather than an error; this passes the id straight through and does
+    /// not invent one.
+    ///
+    /// # Errors
+    /// [`Error::Unsupported`] on a run that did not ask for approvals, since
+    /// there is no channel to answer on. [`Error::Cancelled`] if the run has
+    /// already finished or been torn down, which is the same reason a decision
+    /// can no longer be delivered.
+    pub async fn respond(&self, id: &str, decision: &crate::Decision) -> Result<()> {
+        let Some(channel) = &self.decisions else {
+            return Err(Error::Unsupported {
+                agent: self.agent,
+                what: "answering an approval on a run that did not request them",
+            });
+        };
+        channel
+            .send(decision.wire(id))
+            .await
+            .map_err(|_| Error::Cancelled {
+                bin: self.argv.first().cloned().unwrap_or_default(),
+            })
     }
 
     /// The exact command line that was spawned.
@@ -268,7 +322,17 @@ fn redact(argv: &[crate::agent::Arg]) -> Vec<String> {
 /// # Errors
 /// See [`Error`]; notably [`Error::NotInstalled`], [`Error::Timeout`],
 /// [`Error::RateLimited`] and [`Error::Failed`].
+///
+/// [`Error::Unsupported`] for a request that asked for approvals: this entry
+/// point discards events, so an approval request would reach nobody and the run
+/// would sit blocked until its timeout. Use [`stream`] instead.
 pub async fn run(request: &Request) -> Result<Outcome> {
+    if request.plan().approvals {
+        return Err(Error::Unsupported {
+            agent: request.agent,
+            what: "approvals on a run whose events are discarded; use `stream`",
+        });
+    }
     stream(request)?.finish().await
 }
 
@@ -307,7 +371,10 @@ pub fn stream(request: &Request) -> Result<Run> {
     let mut command = Command::new(&argv[0]);
     command
         .args(&argv[1..])
-        .stdin(if plan.stdin_prompt {
+        .stdin(if plan.stdin_prompt || plan.approvals {
+            // An approvals run needs stdin for the whole turn, not just to
+            // deliver a prompt: it is the channel every decision travels back
+            // on.
             Stdio::piped()
         } else {
             // Close stdin so an agent that would otherwise wait on it exits
@@ -373,8 +440,17 @@ pub fn stream(request: &Request) -> Result<Run> {
         }
     })?;
 
+    let request_agent = request.agent;
     let pid = child.id();
     let (tx, rx) = mpsc::channel(EVENT_BUFFER);
+    // Only created for an approvals run, so `respond` can tell "no channel" from
+    // "channel closed" and refuse the first rather than hanging on it.
+    let (decisions_tx, decisions_rx) = if plan.approvals {
+        let (tx, rx) = mpsc::channel::<String>(APPROVAL_BUFFER);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
     let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
     let reaped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let reaped_for_task = std::sync::Arc::clone(&reaped);
@@ -382,14 +458,16 @@ pub fn stream(request: &Request) -> Result<Run> {
     let task = runtime.spawn(async move {
         // Moved in so the file outlives the run and is removed with it.
         let _schema_file = schema_file;
-        drive(child, request, tx, cancel_rx, reaped_for_task).await
+        drive(child, request, tx, cancel_rx, reaped_for_task, decisions_rx).await
     });
     Ok(Run {
         events: rx,
+        agent: request_agent,
         typed,
         pid,
         reaped,
         cancel: Some(cancel_tx),
+        decisions: decisions_tx,
         task: Some(task),
         argv,
     })
@@ -479,12 +557,65 @@ async fn drive(
     events: mpsc::Sender<Event>,
     cancel: tokio::sync::oneshot::Receiver<()>,
     reaped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    decisions: Option<mpsc::Receiver<String>>,
 ) -> Result<Outcome> {
     // From here on the child is owned by a guard, so every exit path from this
     // task, including an abort, takes the process group with it.
     let mut child = ChildGuard { child, armed: true };
     let plan = request.plan();
     let bin = plan.bin.clone();
+
+    // An approvals run owns stdin for the whole turn: the handshake and the
+    // prompt go out first, then it stays open carrying decisions until the run
+    // ends. Closing it after the prompt, as the plain piped path does, would
+    // take the answer channel with it.
+    let mut decision_task = None;
+    let mut close_stdin = None;
+    if plan.approvals {
+        let Some(mut stdin) = child.child.stdin.take() else {
+            return Err(Error::Spawn {
+                bin: bin.clone(),
+                source: std::io::Error::other("stdin was not piped for an approvals run"),
+            });
+        };
+        let opening = format!(
+            "{}{}",
+            crate::approval::handshake(),
+            crate::approval::user_message(&request.agent.effective_prompt(&plan)),
+        );
+        stdin
+            .write_all(opening.as_bytes())
+            .await
+            .map_err(|source| Error::Spawn {
+                bin: bin.clone(),
+                source,
+            })?;
+        let _ = stdin.flush().await;
+        // Forwarding runs on its own task so a decision can be written while
+        // stdout is being read. It ends on whichever comes first: the channel
+        // closing, or the turn settling.
+        let (close_tx, mut close_rx) = tokio::sync::oneshot::channel::<()>();
+        close_stdin = Some(close_tx);
+        decision_task = decisions.map(|mut rx| {
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        reply = rx.recv() => {
+                            let Some(reply) = reply else { break };
+                            if stdin.write_all(reply.as_bytes()).await.is_err() {
+                                break;
+                            }
+                            let _ = stdin.flush().await;
+                        }
+                        // The turn is over. Dropping stdin is what lets claude
+                        // exit rather than wait for another message.
+                        _ = &mut close_rx => break,
+                    }
+                }
+                drop(stdin);
+            })
+        });
+    }
 
     // Deliver a piped prompt and close the pipe, or the agent waits on EOF.
     if plan.stdin_prompt {
@@ -503,6 +634,10 @@ async fn drive(
 
     // Drain stderr on its own task: a full stderr pipe blocks the child even
     // while stdout still has room.
+    // Aborted on every exit path from here, so a forwarder never survives the
+    // run it belongs to.
+    let _decision_guard = decision_task.map(AbortOnDrop);
+
     let stderr = child.child.stderr.take();
     let stderr_task = tokio::spawn(async move {
         let mut buf = String::new();
@@ -536,7 +671,17 @@ async fn drive(
             let mut line = String::new();
             while read_bounded_line(&mut reader, &mut line).await?.is_some() {
                 append_capped(&mut raw, &line);
-                for event in parser.push(&line) {
+                let parsed = parser.push(&line);
+                // Close stdin as soon as the turn settles. Under stream-json
+                // input claude waits for another message otherwise, so the run
+                // would only end at its timeout even though the answer already
+                // arrived.
+                if parser.saw_terminal()
+                    && let Some(close) = close_stdin.take()
+                {
+                    let _ = close.send(());
+                }
+                for event in parsed {
                     // Bind a printed id the moment it appears rather than at the
                     // end. Codex announces its thread before answering, so a
                     // turn killed mid-answer stays resumable.

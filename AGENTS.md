@@ -107,6 +107,7 @@ Pure logic and I/O are kept apart so the mappings are testable without spawning 
 | `src/proc.rs` | Process-group teardown. The crate's only `unsafe`. |
 | `src/outcome.rs` | What a finished run produced. |
 | `src/account.rs` | Account-wide quota and usage, where a CLI exposes it. |
+| `src/approval.rs` | The human-in-the-loop approval channel. **Pure.** |
 | `src/error.rs` | One error type; one variant per case a caller must branch on. |
 
 Anything pure gets ordinary unit tests in the same file. Keep it that way: a mapping that

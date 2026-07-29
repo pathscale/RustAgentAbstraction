@@ -244,6 +244,9 @@ pub struct Plan {
     pub cont: Continue,
     /// True when the prompt is piped on stdin instead of riding the argv.
     pub stdin_prompt: bool,
+    /// True when gated tool calls are routed to the caller for a decision
+    /// rather than resolved by the posture.
+    pub approvals: bool,
     /// A JSON Schema the answer must conform to, as text.
     ///
     /// Delivered differently per agent: Claude takes it inline, Codex takes a
@@ -563,6 +566,32 @@ impl Agent {
     /// # Errors
     /// [`Error::Unsupported`] if the plan needs a capability this agent lacks.
     pub(crate) fn typed_argv(self, plan: &Plan) -> Result<Vec<Arg>> {
+        // Verified against codex-cli 0.145.0 and Copilot CLI 1.0.75: `codex
+        // exec` has no approval callback, its sandbox mode being the answer
+        // decided before the run starts, and Copilot needs `--allow-all-tools`
+        // to run headlessly at all and gates only through `--deny-tool`. A run
+        // that quietly never asked would be the worst outcome here, since a
+        // caller would read silence as "nothing needed approval".
+        if plan.approvals && self != Agent::Claude {
+            return Err(Error::Unsupported {
+                agent: self,
+                what: "routing tool approvals to the caller",
+            });
+        }
+        // `ReadOnly` keeps its guarantee by removing the mutating tools
+        // outright, so under it there is nothing left to be asked about: a
+        // caller would opt into approvals and then never be asked, and read the
+        // silence as "the agent wanted nothing". Refused rather than quietly
+        // dropping either half, since dropping the tool removal would weaken a
+        // posture the caller asked for by name.
+        if plan.approvals && plan.permission == Permission::ReadOnly {
+            return Err(Error::Unsupported {
+                agent: self,
+                what: "approvals under a read-only posture, which removes the \
+                       tools that would be asked about; use `Permission::Edit` \
+                       and decide per call",
+            });
+        }
         self.check(plan)?;
         Ok(match self {
             Agent::Claude => argv_claude(plan),
@@ -695,7 +724,10 @@ fn claude_mode(p: Permission) -> &'static str {
 fn argv_claude(plan: &Plan) -> Vec<Arg> {
     let mut a = Argv::new(&plan.bin);
     a.bare("-p");
-    if plan.stdin_prompt {
+    if plan.approvals {
+        // Under `--input-format stream-json` the prompt is a JSON message on
+        // stdin, so it must not also ride the argv.
+    } else if plan.stdin_prompt {
         // With `--input-format text` claude reads the prompt from stdin, so a
         // large prompt never has to fit on the argv.
         a.pair("--input-format", "text");
@@ -703,7 +735,24 @@ fn argv_claude(plan: &Plan) -> Vec<Arg> {
         a.arg_sensitive(Agent::Claude.effective_prompt(plan), Sensitivity::Prompt);
     }
 
-    a.pair("--permission-mode", claude_mode(plan.permission));
+    if plan.approvals {
+        // The control channel that carries a `can_use_tool` question out and a
+        // decision back. Verified against claude 2.1.212: `manual` is the mode
+        // that asks, `stdio` names this process as the answerer, and the
+        // handshake in `crate::approval` is what actually switches the requests
+        // on.
+        //
+        // Deliberately *not* `--setting-sources ""`. It would suppress the
+        // user's own settings, including their CLAUDE.md, and it is not needed:
+        // verified that a mutating command still asks with their settings
+        // loaded. Read-only commands are allowed without asking either way,
+        // which is Claude's decision to make and not this crate's to override.
+        a.pair("--permission-mode", "manual");
+        a.pair("--permission-prompt-tool", "stdio");
+        a.pair("--input-format", "stream-json");
+    } else {
+        a.pair("--permission-mode", claude_mode(plan.permission));
+    }
     if plan.permission == Permission::ReadOnly {
         // Remove the mutating built-ins outright. Reads still run via
         // Read/Grep/Glob. `mcp__*` covers every MCP tool: denying only the
@@ -912,6 +961,7 @@ mod tests {
             format: Format::Json,
             cont: Continue::New,
             stdin_prompt: false,
+            approvals: false,
             schema: None,
             schema_file: None,
         }
@@ -946,6 +996,81 @@ mod tests {
 
     /// Each agent takes the level a different way, and Codex takes it as a
     /// config override because it has no flag for it at all.
+    /// The approvals posture rewires how Claude is invoked: the control channel
+    /// replaces the posture flag, and the prompt leaves the argv because it
+    /// travels as a JSON message on stdin instead.
+    #[test]
+    fn approvals_switch_claude_to_the_control_channel() {
+        let mut p = plan("claude");
+        p.approvals = true;
+        p.permission = Permission::Edit;
+        let a = argv(Agent::Claude, &p);
+
+        assert_eq!(a[pos(&a, "--permission-mode").unwrap() + 1], "manual");
+        assert_eq!(a[pos(&a, "--permission-prompt-tool").unwrap() + 1], "stdio");
+        assert_eq!(a[pos(&a, "--input-format").unwrap() + 1], "stream-json");
+        assert!(
+            !a.iter().any(|arg| arg == "hi"),
+            "the prompt must not ride the argv as well: {a:?}"
+        );
+        // Suppressing the user's own settings is not part of this: it would
+        // discard their CLAUDE.md, and a mutating command asks without it.
+        assert!(
+            pos(&a, "--setting-sources").is_none(),
+            "the user's settings stay loaded: {a:?}"
+        );
+    }
+
+    /// Neither other agent has a headless approval channel, so asking must fail
+    /// loudly. A run that quietly never asked is the dangerous outcome: silence
+    /// would read as "nothing needed approval".
+    #[test]
+    fn agents_without_an_approval_channel_refuse_before_spawning() {
+        let mut p = plan("x");
+        p.approvals = true;
+        p.permission = Permission::Edit;
+        for agent in [Agent::Codex, Agent::Copilot] {
+            assert!(
+                matches!(agent.typed_argv(&p), Err(Error::Unsupported { .. })),
+                "{agent} should refuse to pretend it can ask"
+            );
+        }
+        assert!(Agent::Claude.typed_argv(&p).is_ok());
+    }
+
+    /// Read-only removes the mutating tools outright, so there is nothing left
+    /// to ask about. Opting into approvals there would mean never being asked,
+    /// which reads as "the agent wanted nothing".
+    #[test]
+    fn approvals_under_read_only_are_refused_rather_than_silent() {
+        let mut p = plan("claude");
+        p.approvals = true;
+        p.permission = Permission::ReadOnly;
+        assert!(matches!(
+            Agent::Claude.typed_argv(&p),
+            Err(Error::Unsupported { .. })
+        ));
+
+        // Every posture that leaves the tools in place is fine.
+        for permission in [Permission::Edit, Permission::Auto, Permission::Bypass] {
+            p.permission = permission;
+            assert!(
+                Agent::Claude.typed_argv(&p).is_ok(),
+                "{permission:?} should allow approvals"
+            );
+        }
+    }
+
+    /// An ordinary run is untouched, so nothing about the default path changes.
+    #[test]
+    fn without_approvals_claude_keeps_its_posture_flag() {
+        let mut p = plan("claude");
+        p.permission = Permission::ReadOnly;
+        let a = argv(Agent::Claude, &p);
+        assert_eq!(a[pos(&a, "--permission-mode").unwrap() + 1], "dontAsk");
+        assert!(pos(&a, "--permission-prompt-tool").is_none());
+    }
+
     #[test]
     fn effort_reaches_each_cli_the_way_that_cli_takes_it() {
         let mut p = plan("x");

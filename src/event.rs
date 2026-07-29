@@ -62,6 +62,13 @@ pub enum Event {
         /// The observation the model saw.
         output: String,
     },
+    /// The agent is waiting for permission to make a tool call.
+    ///
+    /// Only emitted when the request asked for it via
+    /// [`crate::Request::approvals`]. **The run is blocked until
+    /// [`crate::Run::respond`] answers it**, so a consumer that ignores this
+    /// stalls until the run's timeout.
+    ApprovalRequest(crate::approval::Approval),
     /// A quota signal. Reported, never acted on.
     RateLimit(RateLimit),
 }
@@ -226,6 +233,16 @@ fn enforce_bounds(event: Event) -> Event {
             session,
             model: model.map(bound_identifier),
         },
+        Event::ApprovalRequest(approval) => {
+            Event::ApprovalRequest(crate::approval::Approval {
+                // The id has to survive intact or the answer cannot be matched
+                // to the question, so an unusable one is rejected upstream
+                // rather than shortened here.
+                id: approval.id,
+                tool: bound_identifier(approval.tool),
+                input: bound_value(approval.input),
+            })
+        }
         Event::RateLimit(limit) => Event::RateLimit(RateLimit {
             status: bound_identifier(limit.status),
             window: limit.window.map(bound_identifier),
@@ -432,12 +449,22 @@ impl Parser {
         out
     }
 
+    /// Whether the agent's terminal record has arrived, so the turn is over.
+    ///
+    /// Needed by the runner for an approvals run: under `--input-format
+    /// stream-json` Claude keeps the session open waiting for another message,
+    /// so stdin has to be closed once the turn settles or the run only ends at
+    /// its timeout.
+    pub(crate) fn saw_terminal(&self) -> bool {
+        self.seen.terminal
+    }
+
     /// Whether `ty` is a record type this agent's parser understands.
     fn recognizes(&self, ty: &str) -> bool {
         match self.agent {
             Agent::Claude => matches!(
                 ty,
-                "system" | "assistant" | "user" | "result" | "rate_limit_event"
+                "system" | "assistant" | "user" | "result" | "rate_limit_event" | "control_request"
             ),
             Agent::Codex => {
                 ty.starts_with("thread.") || ty.starts_with("turn.") || ty.starts_with("item.")
@@ -530,6 +557,37 @@ impl Parser {
             "stream_event" => self.claude_delta(v),
             // Both roles carry content blocks: `assistant` holds text/thinking/
             // tool_use, `user` carries the tool_result observations back.
+            // The approval question, carried on Claude's control channel.
+            // Verified against claude 2.1.212:
+            //   {"type":"control_request","request_id":"...",
+            //    "request":{"subtype":"can_use_tool","tool_name":"Bash",
+            //               "input":{"command":"touch f","description":"..."}}}
+            "control_request" => {
+                let Some(request) = v.get("request") else {
+                    return Vec::new();
+                };
+                if request.get("subtype").and_then(Value::as_str) != Some("can_use_tool") {
+                    return Vec::new();
+                }
+                let Some(id) = v.get("request_id").and_then(Value::as_str) else {
+                    // Without an id the answer cannot be routed back, so the
+                    // question is unanswerable and dropping it is the only
+                    // honest option.
+                    return Vec::new();
+                };
+                if !usable_identifier(id) {
+                    return Vec::new();
+                }
+                vec![Event::ApprovalRequest(crate::approval::Approval {
+                    id: id.to_string(),
+                    tool: request
+                        .get("tool_name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_string(),
+                    input: request.get("input").cloned().unwrap_or(Value::Null),
+                })]
+            }
             "assistant" | "user" => self.content_blocks(v),
             "result" => {
                 self.seen.terminal = true;
@@ -1250,6 +1308,58 @@ mod tests {
             ok: None,
             output: "a.txt".into(),
         }));
+    }
+
+    /// Verbatim from claude 2.1.212 under `--permission-prompt-tool stdio`.
+    /// The Bash input carries the command, which is the part a user has to see
+    /// before deciding: approving on the tool name alone approves an unseen
+    /// command.
+    #[test]
+    fn an_approval_request_carries_the_tool_and_its_arguments() {
+        let (events, _) = run(
+            Agent::Claude,
+            &[
+                r#"{"type":"control_request","request_id":"req-7","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"touch created-by-probe.txt","description":"Create an empty file"}}}"#,
+            ],
+        );
+        let [Event::ApprovalRequest(approval)] = &events[..] else {
+            panic!("expected one approval request, got {events:?}")
+        };
+        assert_eq!(approval.id, "req-7");
+        assert_eq!(approval.tool, "Bash");
+        assert_eq!(approval.input["command"], "touch created-by-probe.txt");
+    }
+
+    /// Without an id the answer cannot be routed back, so the question is
+    /// unanswerable. Emitting it would strand a consumer holding a request it
+    /// can never resolve, blocking the run until timeout.
+    #[test]
+    fn an_unanswerable_approval_request_is_dropped() {
+        for line in [
+            // No request_id at all.
+            r#"{"type":"control_request","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{}}}"#,
+            // An id too large to be usable.
+            &format!(
+                r#"{{"type":"control_request","request_id":"{}","request":{{"subtype":"can_use_tool","tool_name":"Bash","input":{{}}}}}}"#,
+                "x".repeat(MAX_IDENTIFIER_BYTES + 1)
+            ),
+        ] {
+            let (events, _) = run(Agent::Claude, &[line]);
+            assert!(
+                events.is_empty(),
+                "an unanswerable request must not reach a consumer: {events:?}"
+            );
+        }
+    }
+
+    /// Other control requests share the channel and are not approvals.
+    #[test]
+    fn a_control_request_that_is_not_an_approval_is_ignored() {
+        let (events, _) = run(
+            Agent::Claude,
+            &[r#"{"type":"control_request","request_id":"r","request":{"subtype":"initialize"}}"#],
+        );
+        assert!(events.is_empty(), "{events:?}");
     }
 
     #[test]

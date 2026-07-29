@@ -28,6 +28,7 @@ pub struct Request {
     pub(crate) system: Option<String>,
     pub(crate) model: Option<String>,
     pub(crate) effort: Option<String>,
+    pub(crate) approvals: bool,
     pub(crate) permission: Permission,
     pub(crate) format: Option<Format>,
     pub(crate) cont: Continue,
@@ -67,6 +68,7 @@ impl Request {
             system: None,
             model: None,
             effort: None,
+            approvals: false,
             permission: Permission::ReadOnly,
             format: None,
             cont: Continue::New,
@@ -116,6 +118,28 @@ impl Request {
     #[must_use]
     pub fn effort(mut self, effort: impl Into<String>) -> Self {
         self.effort = Some(effort.into());
+        self
+    }
+
+    /// Route gated tool calls to the caller for a decision, instead of letting
+    /// the posture answer them.
+    ///
+    /// Every [`Permission`] resolves the approval question up front, which is
+    /// what lets a headless run finish unattended. This asks instead: a gated
+    /// call arrives as [`crate::Event::ApprovalRequest`] and the run waits,
+    /// mid-turn, until [`crate::Run::respond`] answers it.
+    ///
+    /// Two constraints, both raised before spawning rather than met as a hang:
+    /// this needs [`crate::stream`], since [`crate::run`] yields no events for
+    /// anyone to answer, and it is Claude-only, since neither other agent has a
+    /// headless approval channel.
+    ///
+    /// [`Permission`] still applies to everything the agent does not ask about.
+    /// Claude allows read-only commands without asking, so the absence of a
+    /// question is not proof that nothing ran.
+    #[must_use]
+    pub fn approvals(mut self) -> Self {
+        self.approvals = true;
         self
     }
 
@@ -359,6 +383,7 @@ impl Request {
             system: self.system.clone(),
             model: self.model.clone(),
             effort: self.effort.clone(),
+            approvals: self.approvals,
             permission: self.permission,
             format: self.effective_format(),
             cont: self.cont.clone(),

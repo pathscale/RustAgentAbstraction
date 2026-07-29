@@ -87,6 +87,7 @@
 
 mod account;
 mod agent;
+mod approval;
 mod auth;
 mod error;
 mod event;
@@ -100,6 +101,7 @@ mod session;
 
 pub use account::{AccountUsage, Credits, DailyUsage, Lifetime, UsageWindow};
 pub use agent::{Agent, Caps, EnvPolicy, Format, NETWORK_ENV, Permission, SessionSupport};
+pub use approval::{Approval, Decision};
 pub use auth::{AuthState, AuthStatus};
 pub use error::{Error, Result};
 pub use event::{Event, MAX_CAPTURE, MAX_EVENT_BYTES, MAX_LINE, TRUNCATION_MARK};
