@@ -344,8 +344,8 @@ impl Agent {
     #[must_use]
     pub fn verified_version(self) -> crate::Version {
         let (major, minor, patch) = match self {
-            // `claude --version` -> "2.1.205 (Claude Code)"
-            Agent::Claude => (2, 1, 205),
+            // `claude --version` -> "2.1.212 (Claude Code)"
+            Agent::Claude => (2, 1, 212),
             // `codex --version` -> "codex-cli 0.145.0"
             Agent::Codex => (0, 145, 0),
             // `copilot --version` -> "GitHub Copilot CLI 1.0.75."
@@ -440,7 +440,7 @@ impl Agent {
     #[must_use]
     pub fn caps(self) -> Caps {
         match self {
-            // Verified against claude 2.1.205: `--session-id <uuid>` assigns the
+            // Verified against claude 2.1.212: `--session-id <uuid>` assigns the
             // id, `--fork-session` branches, `--output-format stream-json`
             // streams (and demands `--verbose`), `--append-system-prompt` is a
             // real flag.
@@ -672,7 +672,7 @@ impl Argv {
 }
 
 /// Claude Code's permission-mode token for each posture. Choices verified from
-/// `claude --help` (2.1.205): acceptEdits, auto, bypassPermissions, manual,
+/// `claude --help` (2.1.212): acceptEdits, auto, bypassPermissions, manual,
 /// dontAsk, plan.
 fn claude_mode(p: Permission) -> &'static str {
     match p {
