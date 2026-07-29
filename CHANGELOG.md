@@ -27,6 +27,14 @@ and behaves identically, and a run that sets no effort sends no flag.
 
 ### Fixed
 
+- **A UUID containing `401` is no longer read as an authentication failure.** The status code
+  was matched as a bare substring, so any Copilot failure became `Error::NotAuthenticated`
+  whenever one of the ids it prints happened to contain those three digits, as in
+  `"id":"1b0b1401-cb86-..."`. A run emits several ids, so the misdiagnosis was intermittent
+  and sent the user to re-login over an unrelated failure. It now has to appear as a
+  standalone token, which keeps `HTTP 401` and rejects every hex blob. The auth check also
+  reads stderr and the agent's own prose rather than the raw stream, matching what the quota
+  check already did.
 - **Copilot's `auto` no longer advertises effort levels it refuses.** Applying the documented
   set uniformly was wrong, and a live test caught it: `auto` exits 1 with
   `Model "auto" does not support reasoning effort configuration` rather than ignoring the
