@@ -72,6 +72,10 @@ Nothing was removed or renamed, so this compiles against any 0.1 code. It is a m
 rather than a patch because some changes alter behaviour, and `"0.1"` would have delivered
 them through an ordinary `cargo update`.
 
+*Corrected after release: this entry originally also credited 0.2.0 with streaming by default
+and token-by-token Claude text. Those landed three hours after 0.2.0 was published and ship in
+0.2.1, where they are now listed. The published 0.2.0 does not have them.*
+
 ### Behaviour changes
 
 - **An unauthenticated run is now an error.** Claude exits `0` and puts
