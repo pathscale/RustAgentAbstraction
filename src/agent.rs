@@ -232,6 +232,10 @@ pub struct Plan {
     pub system: Option<String>,
     /// Model id or alias, if pinned.
     pub model: Option<String>,
+    /// Reasoning effort level, if set. Passed through verbatim, for the same
+    /// reason [`Plan::model`] is: the accepted set is the provider's to define
+    /// and it has already grown once.
+    pub effort: Option<String>,
     /// Permission posture.
     pub permission: Permission,
     /// Requested output shape.
@@ -712,6 +716,9 @@ fn argv_claude(plan: &Plan) -> Vec<Arg> {
     }
 
     a.opt("--model", plan.model.as_ref());
+    // Verified against claude 2.1.212: `--effort <level>` (low, medium, high,
+    // xhigh, max), a session-level flag rather than a per-model one.
+    a.opt("--effort", plan.effort.as_ref());
     if let Some(system) = &plan.system {
         a.secret("--append-system-prompt", system, Sensitivity::Prompt);
     }
@@ -798,6 +805,12 @@ fn argv_codex(plan: &Plan) -> Vec<Arg> {
     };
 
     a.opt("--model", plan.model.as_ref());
+    // Verified against codex-cli 0.145.0: `codex exec` has no effort flag, it
+    // is a config override, and `--strict-config` accepts this key. A bad value
+    // is refused by the provider with its own enum rather than by the CLI.
+    if let Some(effort) = plan.effort.as_ref() {
+        a.pair("-c", format!("model_reasoning_effort={effort}"));
+    }
     // Codex reads the schema from a file, which the runner writes before the
     // spawn. `Request::argv` has no file to name, so it shows a placeholder:
     // the preview is for display, and the real path exists only at spawn time.
@@ -857,6 +870,11 @@ fn argv_copilot(plan: &Plan) -> Vec<Arg> {
     };
 
     a.opt("--model", plan.model.as_ref());
+    // Verified against Copilot CLI 1.0.75: `--effort` is the documented spelling
+    // and `--reasoning-effort` its alias (none, minimal, low, medium, high,
+    // xhigh, max). A wider set than Claude's, which is why the level is passed
+    // through rather than mapped to a shared enum.
+    a.opt("--effort", plan.effort.as_ref());
     // One flag serves both directions: it sets the UUID for a new session and
     // resumes an existing one by id.
     match &plan.cont {
@@ -889,6 +907,7 @@ mod tests {
             prompt: "hi".into(),
             system: None,
             model: None,
+            effort: None,
             permission: Permission::ReadOnly,
             format: Format::Json,
             cont: Continue::New,
@@ -923,6 +942,47 @@ mod tests {
             &a[at + 1..at + 5],
             ["Bash", "Edit", "Write", "NotebookEdit"]
         );
+    }
+
+    /// Each agent takes the level a different way, and Codex takes it as a
+    /// config override because it has no flag for it at all.
+    #[test]
+    fn effort_reaches_each_cli_the_way_that_cli_takes_it() {
+        let mut p = plan("x");
+        p.effort = Some("xhigh".into());
+
+        let claude = argv(Agent::Claude, &p);
+        assert_eq!(claude[pos(&claude, "--effort").unwrap() + 1], "xhigh");
+
+        let copilot = argv(Agent::Copilot, &p);
+        assert_eq!(copilot[pos(&copilot, "--effort").unwrap() + 1], "xhigh");
+
+        let codex = argv(Agent::Codex, &p);
+        assert!(
+            pos(&codex, "--effort").is_none(),
+            "codex has no effort flag: {codex:?}"
+        );
+        assert!(
+            codex
+                .windows(2)
+                .any(|w| w[0] == "-c" && w[1] == "model_reasoning_effort=xhigh"),
+            "codex takes it as a config override: {codex:?}"
+        );
+    }
+
+    /// An unset effort must add nothing, so the agent keeps its own default.
+    #[test]
+    fn no_effort_means_no_flag() {
+        let p = plan("x");
+        for agent in [Agent::Claude, Agent::Codex, Agent::Copilot] {
+            let a = argv(agent, &p);
+            assert!(pos(&a, "--effort").is_none(), "{agent}: {a:?}");
+            assert!(
+                !a.iter()
+                    .any(|arg| arg.starts_with("model_reasoning_effort")),
+                "{agent}: {a:?}"
+            );
+        }
     }
 
     #[test]

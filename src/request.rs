@@ -27,6 +27,7 @@ pub struct Request {
     pub(crate) prompt: String,
     pub(crate) system: Option<String>,
     pub(crate) model: Option<String>,
+    pub(crate) effort: Option<String>,
     pub(crate) permission: Permission,
     pub(crate) format: Option<Format>,
     pub(crate) cont: Continue,
@@ -65,6 +66,7 @@ impl Request {
             prompt: prompt.into(),
             system: None,
             model: None,
+            effort: None,
             permission: Permission::ReadOnly,
             format: None,
             cont: Continue::New,
@@ -99,6 +101,21 @@ impl Request {
     #[must_use]
     pub fn model(mut self, model: impl Into<String>) -> Self {
         self.model = Some(model.into());
+        self
+    }
+
+    /// Set the reasoning effort level.
+    ///
+    /// Passed through verbatim, exactly like [`Request::model`] and for the same
+    /// reason: the accepted set belongs to the provider, differs between agents,
+    /// and has already grown once. [`crate::Model::efforts`] lists what each
+    /// model is known to take, and nothing here validates against it.
+    ///
+    /// Delivered as `--effort` on Claude and Copilot, and as
+    /// `-c model_reasoning_effort=<level>` on Codex, which has no flag for it.
+    #[must_use]
+    pub fn effort(mut self, effort: impl Into<String>) -> Self {
+        self.effort = Some(effort.into());
         self
     }
 
@@ -341,6 +358,7 @@ impl Request {
             prompt: self.prompt.clone(),
             system: self.system.clone(),
             model: self.model.clone(),
+            effort: self.effort.clone(),
             permission: self.permission,
             format: self.effective_format(),
             cont: self.cont.clone(),
