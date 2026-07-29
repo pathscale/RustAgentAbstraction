@@ -8,7 +8,10 @@ appear in a patch rather than inflating the version toward 1.0 on a crate still 
 shape. **Where that happens the entry says so at the top**, because a version number that
 under-signals is only acceptable if the changelog over-signals to compensate.
 
-## Unreleased
+## 0.2.2
+
+Additive: nothing changes for existing code. A patch rather than a minor bump because no
+behaviour moved, only new API arrived.
 
 ### Added
 
@@ -31,12 +34,23 @@ under-signals is only acceptable if the changelog over-signals to compensate.
     reported `claude-opus-4-8` while `--model claude-opus-5` reported `claude-opus-5`, even
     though that release's notes call Opus 5 the default Opus model. Both forms are carried
     for that reason.
+- **`Model`, `Kind`, `Source` and `Verified`** are re-exported at the crate root, all
+  `serde`-serializable so a host can hand them straight to a UI layer.
 - **`Agent::discover_models()`** asks the CLI itself, which reflects the installed binary
   rather than the one this crate was written against. Codex answers through
   `codex debug models`, including per-model reasoning levels, and its hidden internal model
   is filtered out. Claude and Copilot return `Error::Unsupported`: both enumerate models only
   in an interactive picker, and a caller asking for discovery is asking for freshness, so
   quietly returning the compiled list would answer a question they did not ask.
+
+### Changed
+
+- **The Claude version these flags are verified against is now 2.1.212**, up from 2.1.205.
+  Only `Probe` output changes: an installed 2.1.205 now reports `VersionStatus::Older`
+  where it previously reported `Verified`. Nothing about how requests are built changed. The
+  bump was made after the full live suite passed against 2.1.212 and the permission-mode
+  choices were re-read from its `--help`, rather than on the assumption that a patch release
+  of the CLI changed nothing.
 
 ## 0.2.1
 
