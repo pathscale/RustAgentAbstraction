@@ -287,12 +287,35 @@ pub(crate) struct Parser {
     /// Bytes currently held in `tools`, kept alongside it because a map has no
     /// cheap way to answer that.
     tool_bytes: usize,
-    /// True once a [`Event::Started`] has been emitted, so it fires only once.
+    /// What the stream has shown so far.
+    seen: Seen,
+}
+
+/// Milestones a stream passes, tracked because later handling depends on them.
+///
+/// Four independent yes/no facts about position in the stream. Clippy flags the
+/// count, but packing them into bitflags would trade four self-describing names
+/// for one opaque integer, and nothing here is hot enough to want that.
+#[derive(Debug, Default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "four independent stream milestones; naming each beats packing them"
+)]
+struct Seen {
+    /// A [`Event::Started`] has been emitted, so it fires only once.
     started: bool,
-    /// Whether any record was recognized as this agent's own shape.
+    /// A record was recognized as this agent's own shape, so the output really
+    /// is what was asked for.
     structured: bool,
-    /// Whether the agent's terminal record was seen.
-    terminal_seen: bool,
+    /// The agent's terminal record arrived, so the turn completed.
+    terminal: bool,
+    /// Token-level deltas arrived.
+    ///
+    /// Claude sends deltas *and* the completed message they build up to, so
+    /// emitting both would show every answer twice. Detected rather than
+    /// configured: the deltas always precede the completed message, so seeing
+    /// one is proof the finished copy is a duplicate.
+    deltas: bool,
 }
 
 impl Parser {
@@ -305,9 +328,7 @@ impl Parser {
             term: Terminal::default(),
             tools: HashMap::new(),
             tool_bytes: 0,
-            started: false,
-            structured: false,
-            terminal_seen: false,
+            seen: Seen::default(),
         }
     }
 
@@ -348,7 +369,7 @@ impl Parser {
         if let Some(ty) = value.get("type").and_then(Value::as_str)
             && self.recognizes(ty)
         {
-            self.structured = true;
+            self.seen.structured = true;
         }
         let mut out = match self.agent {
             Agent::Claude => self.claude(&value),
@@ -361,9 +382,9 @@ impl Parser {
 
         // Fire `Started` exactly once, from whichever record first revealed the
         // id, and put it ahead of that record's own events.
-        if !self.started {
+        if !self.seen.started {
             if let Some(session) = self.term.session.clone() {
-                self.started = true;
+                self.seen.started = true;
                 out.insert(
                     0,
                     Event::Started {
@@ -432,13 +453,13 @@ impl Parser {
     /// A structured run that recognized nothing did not merely fail to answer;
     /// it means the output was not the shape this parser understands.
     pub(crate) fn saw_structured_record(&self) -> bool {
-        self.structured
+        self.seen.structured
     }
 
     /// Whether the stream carried its terminal record, the one that closes a
     /// turn and carries the answer and usage.
     pub(crate) fn saw_terminal_record(&self) -> bool {
-        self.terminal_seen
+        self.seen.terminal
     }
 
     /// Consume the parser for everything only knowable at the end.
@@ -470,11 +491,13 @@ impl Parser {
                 self.term.rate_limit.clone_from(&limit);
                 limit.into_iter().map(Event::RateLimit).collect()
             }
+            // Token-level deltas, present only with `--include-partial-messages`.
+            "stream_event" => self.claude_delta(v),
             // Both roles carry content blocks: `assistant` holds text/thinking/
             // tool_use, `user` carries the tool_result observations back.
             "assistant" | "user" => self.content_blocks(v),
             "result" => {
-                self.terminal_seen = true;
+                self.seen.terminal = true;
                 if let Some(text) = v.get("result").and_then(Value::as_str) {
                     self.term.text = text.to_string();
                 }
@@ -491,6 +514,48 @@ impl Parser {
                 };
                 Vec::new()
             }
+            _ => Vec::new(),
+        }
+    }
+
+    /// One token-level delta from Claude's `stream_event` records.
+    ///
+    /// These wrap the provider's own streaming events. Only the deltas that
+    /// carry visible text are surfaced; the block start/stop and message
+    /// envelopes describe structure this crate already expresses through the
+    /// event vocabulary.
+    fn claude_delta(&mut self, v: &Value) -> Vec<Event> {
+        let Some(event) = v.get("event") else {
+            return Vec::new();
+        };
+        if event.get("type").and_then(Value::as_str) != Some("content_block_delta") {
+            return Vec::new();
+        }
+        let Some(delta) = event.get("delta") else {
+            return Vec::new();
+        };
+        // Seeing any delta means the completed message that follows is a
+        // duplicate of what has already been streamed.
+        self.seen.deltas = true;
+
+        match delta.get("type").and_then(Value::as_str) {
+            Some("text_delta") => delta
+                .get("text")
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+                .map(|text| Event::Text(text.to_string()))
+                .into_iter()
+                .collect(),
+            Some("thinking_delta") => delta
+                .get("thinking")
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+                .map(|text| Event::Thinking(text.to_string()))
+                .into_iter()
+                .collect(),
+            // `input_json_delta` streams a tool call's arguments a fragment at a
+            // time. The completed `tool_use` block carries them whole, which is
+            // what a consumer can actually act on, so the fragments are skipped.
             _ => Vec::new(),
         }
     }
@@ -512,12 +577,16 @@ impl Parser {
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             match ty {
-                "text" => {
+                // Skipped once deltas have streamed the same text, or the
+                // transcript would show every answer twice.
+                // Guarded on `deltas`: once tokens have streamed, the finished
+                // copy falls through to the catch-all and is dropped.
+                "text" if !self.seen.deltas => {
                     if let Some(t) = block.get("text").and_then(Value::as_str) {
                         out.push(Event::Text(t.to_string()));
                     }
                 }
-                "thinking" => {
+                "thinking" if !self.seen.deltas => {
                     if let Some(t) = block.get("thinking").and_then(Value::as_str) {
                         out.push(Event::Thinking(t.to_string()));
                     }
@@ -575,12 +644,12 @@ impl Parser {
         }
         match ty {
             "turn.completed" => {
-                self.terminal_seen = true;
+                self.seen.terminal = true;
                 self.term.usage = codex_usage(v.get("usage"));
                 Vec::new()
             }
             "turn.failed" => {
-                self.terminal_seen = true;
+                self.seen.terminal = true;
                 self.term.stop = Stop::Error;
                 Vec::new()
             }
@@ -717,7 +786,7 @@ impl Parser {
             }],
             // Copilot's terminal record is flat, not nested under `data`.
             "result" => {
-                self.terminal_seen = true;
+                self.seen.terminal = true;
                 if let Some(id) = v.get("sessionId").and_then(Value::as_str)
                     && usable_identifier(id)
                 {
@@ -878,6 +947,84 @@ mod tests {
         assert_eq!(term.usage.cache_read_tokens, Some(18764));
         assert_eq!(term.usage.cache_write_tokens, Some(7322));
         assert_eq!(term.usage.cost_usd, Some(0.017));
+    }
+
+    /// Verbatim from a `--include-partial-messages` run. Claude sends both the
+    /// deltas and the completed message they build up to, so emitting both
+    /// would show every answer twice in a transcript.
+    #[test]
+    fn claude_token_deltas_stream_without_duplicating_the_finished_message() {
+        let (events, _) = run(
+            Agent::Claude,
+            &[
+                r#"{"type":"system","subtype":"init","session_id":"s"}"#,
+                r#"{"type":"stream_event","session_id":"s","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}}"#,
+                r#"{"type":"stream_event","session_id":"s","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"po"}}}"#,
+                r#"{"type":"stream_event","session_id":"s","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ng"}}}"#,
+                r#"{"type":"stream_event","session_id":"s","event":{"type":"content_block_stop","index":0}}"#,
+                // The completed copy of the same text.
+                r#"{"type":"assistant","session_id":"s","message":{"content":[{"type":"text","text":"pong"}]}}"#,
+                r#"{"type":"result","subtype":"success","is_error":false,"result":"pong","session_id":"s"}"#,
+            ],
+        );
+        let texts: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Text(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, ["po", "ng"], "the finished message must not repeat");
+    }
+
+    /// Thinking streams the same way, and must not double either.
+    #[test]
+    fn claude_thinking_deltas_stream_without_duplication() {
+        let (events, _) = run(
+            Agent::Claude,
+            &[
+                r#"{"type":"stream_event","session_id":"s","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"weighing"}}}"#,
+                r#"{"type":"assistant","session_id":"s","message":{"content":[{"type":"thinking","thinking":"weighing"}]}}"#,
+            ],
+        );
+        let thoughts: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Thinking(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(thoughts, ["weighing"]);
+    }
+
+    /// Without partial messages there are no deltas, so the completed message
+    /// is the only source and must still be emitted.
+    #[test]
+    fn a_completed_message_still_streams_when_no_deltas_arrived() {
+        let (events, _) = run(
+            Agent::Claude,
+            &[
+                r#"{"type":"assistant","session_id":"s","message":{"content":[{"type":"text","text":"pong"}]}}"#,
+            ],
+        );
+        assert!(events.contains(&Event::Text("pong".into())), "{events:?}");
+    }
+
+    /// Tool calls are not duplicated by deltas, so they keep coming from the
+    /// completed block even once deltas have been seen.
+    #[test]
+    fn tool_calls_survive_delta_suppression() {
+        let (events, _) = run(
+            Agent::Claude,
+            &[
+                r#"{"type":"stream_event","session_id":"s","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}}"#,
+                r#"{"type":"assistant","session_id":"s","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]}}"#,
+            ],
+        );
+        assert!(
+            events.iter().any(|e| matches!(e, Event::ToolCall { .. })),
+            "suppression must apply to text only: {events:?}"
+        );
     }
 
     #[test]

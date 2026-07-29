@@ -12,6 +12,18 @@ them through an ordinary `cargo update`.
 
 ### Behaviour changes
 
+- **Streaming is now the default**, and a named session no longer disables it. `Format`
+  defaulted to `Json`, under which nothing is observable until the turn ends, so a caller
+  watching a twenty-minute run saw nothing for twenty minutes. Worse, `Request::session`
+  *pinned* that format, meaning the multi-turn path a chat UI always uses could not stream
+  at all. `Stream` carries everything `Json` does, so the default costs only parsing, and
+  `session()` now validates the format instead of overriding it. Pin `Format::Json`
+  explicitly if you only want the answer.
+- **Claude streams token by token.** `--include-partial-messages` is passed under `Stream`,
+  without which Claude emits only completed messages and text arrives a paragraph at a time.
+  Claude sends both the deltas and the finished message; only the deltas are emitted, so a
+  transcript does not show every answer twice.
+
 - **An unauthenticated run is now an error.** Claude exits `0` and puts
   "Not logged in · Please run /login" in its result text, so a missing login previously came
   back as a successful `Outcome` whose answer was a login prompt. Auth is now checked

@@ -189,10 +189,19 @@ pub enum EnvPolicy {
 pub enum Format {
     /// Plain prose on stdout. Carries no session id and no events.
     Text,
-    /// One JSON result document.
-    #[default]
+    /// One JSON result document, delivered when the turn ends.
+    ///
+    /// Nothing is observable until then, so a caller watching a run sees
+    /// nothing for its whole duration. Cheaper to parse, and fine when only the
+    /// answer matters.
     Json,
     /// A JSONL event stream, normalized into [`crate::Event`]s.
+    ///
+    /// The default, because the alternative is silence: under `Json` a run that
+    /// takes twenty minutes reports nothing for twenty minutes. This carries
+    /// everything `Json` does, the session id and any schema-conforming value
+    /// included, so defaulting to it costs only parsing.
+    #[default]
     Stream,
 }
 
@@ -739,6 +748,12 @@ fn argv_claude(plan: &Plan) -> Vec<Arg> {
         // Claude refuses `-p --output-format stream-json` without it:
         // "--print with --output-format=stream-json requires --verbose".
         a.bare("--verbose");
+        // Without this Claude emits only *completed* messages, so text arrives
+        // a paragraph at a time. With it, `stream_event` records carry the
+        // token-level deltas, which is what makes a transcript type rather than
+        // appear. Copilot streams deltas natively, so this is what puts the two
+        // on equal footing.
+        a.bare("--include-partial-messages");
     }
     a.done()
 }

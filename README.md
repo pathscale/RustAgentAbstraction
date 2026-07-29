@@ -93,6 +93,17 @@ while let Some(event) = running.recv().await {
 let outcome = running.finish().await?;
 ```
 
+**Streaming is the default.** `Format::Stream` is what you get without asking, because the
+alternative is silence: under `Format::Json` a run that takes twenty minutes reports nothing
+for twenty minutes, which is indistinguishable from a hang. `Stream` carries everything
+`Json` does, session id and schema-conforming value included, so the default costs only
+parsing.
+
+Text arrives token by token on Claude (via `--include-partial-messages`) and Copilot, and
+message by message on Codex, which has no finer granularity. Claude sends deltas *and* the
+completed message they build up to; only the deltas are emitted, or a transcript would show
+every answer twice.
+
 `Event::Text` is the *incremental display stream*. `Outcome::text` is the agent's own
 *authoritative answer*. They are deliberately separate: concatenating the deltas is not
 guaranteed to equal the final text (Copilot emits both; Claude emits only the latter), so
