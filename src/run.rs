@@ -658,7 +658,11 @@ async fn drive(
     // An unauthenticated Claude run exits 0 and reports the problem in its
     // result text, so checking only the exit code would hand back a successful
     // Outcome whose answer is "Please run /login".
-    let unauthenticated = looks_unauthenticated(&terminal.text);
+    //
+    // Read from stderr and the agent's own prose rather than the raw stream, for
+    // the reason `classify` does the same with quota wording: a phrase hunted
+    // through structured output matches ids and field names, not statements.
+    let unauthenticated = looks_unauthenticated(&terminal.text) || looks_unauthenticated(&stderr);
     // The agent saying its turn failed is as much a failure as a non-zero exit,
     // and Claude reports an unknown model exactly this way: exit 0, `is_error`
     // true, and the explanation where the answer would be.
@@ -768,10 +772,31 @@ fn looks_unauthenticated(text: &str) -> bool {
         "no credentials",
         "credentials not found",
         "please log in",
-        "401",
     ];
     let lower = text.to_ascii_lowercase();
-    PHRASES.iter().any(|needle| lower.contains(needle))
+    PHRASES.iter().any(|needle| lower.contains(needle)) || mentions_status(&lower, "401")
+}
+
+/// Whether `code` appears as a standalone token rather than inside a longer run
+/// of characters.
+///
+/// `401` was previously matched as a bare substring, which made any Copilot
+/// failure an auth failure whenever one of the UUIDs it prints happened to
+/// contain those three digits: `"id":"1b0b1401-cb86-..."` was enough. That is
+/// not rare, since a run emits several ids, so the misdiagnosis was
+/// intermittent and told someone to re-login over an unrelated failure.
+///
+/// A status code is a word. Requiring non-alphanumeric neighbours keeps
+/// `HTTP 401` and `(status 401)` while rejecting every hex blob, and a UUID
+/// cannot produce a standalone `401` at all because its groups are four, eight
+/// or twelve characters long.
+fn mentions_status(haystack: &str, code: &str) -> bool {
+    haystack.match_indices(code).any(|(at, _)| {
+        let before = haystack[..at].chars().next_back();
+        let after = haystack[at + code.len()..].chars().next();
+        let free = |c: Option<char>| c.is_none_or(|c| !c.is_alphanumeric());
+        free(before) && free(after)
+    })
 }
 
 /// Turn a non-zero exit into the most specific error available.
@@ -1018,6 +1043,41 @@ mod tests {
             classify(Agent::Claude, "claude", 1, "boom", "", &terminal),
             Error::Failed { .. }
         ));
+    }
+
+    /// The exact shape that made a Copilot run look unauthenticated: a UUID
+    /// carrying the digits 401. Copilot prints several ids per run, so this
+    /// misfired intermittently and told the user to re-login over a failure
+    /// that had nothing to do with credentials.
+    #[test]
+    fn an_id_containing_401_is_not_an_auth_failure() {
+        let line = r#"{"type":"session.mcp_server_status_changed","id":"1b0b1401-cb86-4276-9874-e84b94c96499"}"#;
+        assert!(
+            !looks_unauthenticated(line),
+            "a hex blob is not a status code"
+        );
+    }
+
+    /// The needle still has to work where it was meant to. A status code is a
+    /// word, and these are the forms an agent actually prints.
+    #[test]
+    fn a_real_401_is_still_recognized() {
+        for text in [
+            "HTTP 401",
+            "request failed (status 401)",
+            "401: unauthorized",
+            "got a 401 from the API",
+        ] {
+            assert!(looks_unauthenticated(text), "should match: {text}");
+        }
+    }
+
+    /// Neighbouring digits mean it is part of some longer number, not a status.
+    #[test]
+    fn digits_around_401_keep_it_from_matching() {
+        for text in ["error 4010", "code 1401", "seq 24019"] {
+            assert!(!looks_unauthenticated(text), "should not match: {text}");
+        }
     }
 
     /// Verbatim from a healthy claude 2.1.205 run. Every `stream-json` run
