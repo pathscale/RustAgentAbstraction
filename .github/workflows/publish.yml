@@ -107,11 +107,26 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
-      # After publishing, so a tag never points at a version that failed to go
-      # out. The tag is what maps a registry version back to a commit.
+      # Deliberately *not* gated on a publish having happened in this run. It
+      # was, and that made the failure below unrepairable: the publish
+      # succeeded, the tag step died, and re-running found the version already
+      # on crates.io and skipped every remaining step including this one. The
+      # tag is what maps a registry version back to a commit, so it has to be
+      # reachable whenever it is missing, not only on the run that published.
+      #
+      # Still ordered after the publish, so a tag never points at a version
+      # that failed to go out.
       - name: Tag the release
-        if: steps.check.outputs.needed == 'true'
         run: |
           tag="v${{ steps.version.outputs.version }}"
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+            echo "::notice::$tag already exists; nothing to do"
+            exit 0
+          fi
+          # An annotated tag records a tagger, and a bare runner has no git
+          # identity: without this the step dies with "unable to auto-detect
+          # email address". This is the identity GitHub uses for its own bot.
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git tag -a "$tag" -m "$tag"
           git push origin "$tag"
