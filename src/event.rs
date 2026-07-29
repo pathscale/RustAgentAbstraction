@@ -258,6 +258,13 @@ fn bound_identifier(text: String) -> String {
 pub struct Terminal {
     /// The native session id.
     pub session: Option<String>,
+    /// The model the run actually used, as the agent named it at start.
+    ///
+    /// For Claude this is the *resolved* form, so asking for `sonnet[1m]`
+    /// records `claude-sonnet-5[1m]`. It is also the key into the terminal
+    /// record's per-model usage, which is what makes the window binding below
+    /// reliable.
+    pub model: Option<String>,
     /// The agent's authoritative final answer.
     pub text: String,
     /// Token and cost accounting.
@@ -417,13 +424,9 @@ impl Parser {
         if !self.seen.started {
             if let Some(session) = self.term.session.clone() {
                 self.seen.started = true;
-                out.insert(
-                    0,
-                    Event::Started {
-                        session,
-                        model: model_of(&value),
-                    },
-                );
+                let model = model_of(&value);
+                self.term.model.clone_from(&model);
+                out.insert(0, Event::Started { session, model });
             }
         }
         out
@@ -538,7 +541,7 @@ impl Parser {
                 if let Some(value) = v.get("structured_output") {
                     self.term.structured = Some(value.clone());
                 }
-                self.term.usage = claude_usage(v);
+                self.term.usage = claude_usage(v, self.term.model.as_deref());
                 // `subtype` says "success" even for a failed turn, so
                 // `is_error` is the field that actually decides.
                 self.term.stop = if v.get("is_error").and_then(Value::as_bool) == Some(true) {
@@ -913,7 +916,7 @@ fn claude_rate_limit(v: Option<&Value>) -> Option<RateLimit> {
 }
 
 /// Claude's terminal `usage` block plus its top-level `total_cost_usd`.
-fn claude_usage(v: &Value) -> Usage {
+fn claude_usage(v: &Value, model: Option<&str>) -> Usage {
     let u = v.get("usage");
     let get = |key: &str| u.and_then(|u| u.get(key)).and_then(Value::as_u64);
     let (input, read, write) = (
@@ -921,13 +924,26 @@ fn claude_usage(v: &Value) -> Usage {
         get("cache_read_input_tokens"),
         get("cache_creation_input_tokens"),
     );
-    // The window and output ceiling are reported per model rather than on the
-    // usage block, and a turn names exactly one model, so the first entry is
-    // that model's.
+    // The window and output ceiling are reported per model, and `modelUsage`
+    // is not single-entry: a run on any non-Haiku model also lists a Haiku
+    // helper, and lists it *first*. Taking the first entry bound a 1M session
+    // to the helper's 200k window, which presented as sessions capped at 200k.
+    // The key is the resolved model name the `init` record announced, verified
+    // against claude 2.1.212: asking for `sonnet[1m]`, init says
+    // `claude-sonnet-5[1m]` and that exact string keys `modelUsage`.
     let per_model = v
         .get("modelUsage")
         .and_then(Value::as_object)
-        .and_then(|models| models.values().next());
+        .and_then(
+            |models| match (model.and_then(|m| models.get(m)), models.len()) {
+                (Some(entry), _) => Some(entry),
+                // One entry and no name to match: it can only be the run's model.
+                (None, 1) => models.values().next(),
+                // Several entries and no match. Guessing here is how the bug
+                // happened, so the window is reported as unknown instead.
+                (None, _) => None,
+            },
+        );
     let of_model = |key: &str| per_model.and_then(|m| m.get(key)).and_then(Value::as_u64);
     Usage {
         input_tokens: input,
@@ -1070,6 +1086,52 @@ mod tests {
     /// Verbatim from a `--include-partial-messages` run. Claude sends both the
     /// deltas and the completed message they build up to, so emitting both
     /// would show every answer twice in a transcript.
+    /// Verbatim shape from claude 2.1.212: a run on any non-Haiku model lists
+    /// a Haiku helper in `modelUsage` too, and lists it *first*. Taking the
+    /// first entry bound a 1M session to the helper's 200k window, which
+    /// presented to a user as "sessions are limited to 200k context".
+    #[test]
+    fn the_window_binds_to_the_runs_model_not_the_haiku_helper() {
+        let (_, term) = run(
+            Agent::Claude,
+            &[
+                r#"{"type":"system","subtype":"init","session_id":"sess-1m","model":"claude-sonnet-5[1m]"}"#,
+                r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","session_id":"sess-1m","total_cost_usd":0.0677,"usage":{"input_tokens":2,"output_tokens":4,"cache_read_input_tokens":27128,"cache_creation_input_tokens":9825},"modelUsage":{"claude-haiku-4-5-20251001":{"inputTokens":521,"outputTokens":12,"cacheReadInputTokens":0,"cacheCreationInputTokens":0,"costUSD":0.000581,"contextWindow":200000,"maxOutputTokens":32000},"claude-sonnet-5[1m]":{"inputTokens":2,"outputTokens":4,"cacheReadInputTokens":27128,"cacheCreationInputTokens":9825,"costUSD":0.0671544,"contextWindow":1000000,"maxOutputTokens":64000}}}"#,
+            ],
+        );
+        assert_eq!(term.model.as_deref(), Some("claude-sonnet-5[1m]"));
+        assert_eq!(
+            term.usage.context_window,
+            Some(1_000_000),
+            "the helper's 200k window must not shadow the real one"
+        );
+        assert_eq!(term.usage.max_output_tokens, Some(64_000));
+        // The top-level usage block already tracks the main model.
+        assert_eq!(term.usage.context_tokens, Some(2 + 27_128 + 9_825));
+    }
+
+    /// With several entries and no model name to match, the window is unknown
+    /// rather than guessed. Guessing the first entry is how the bug happened.
+    #[test]
+    fn an_unmatchable_window_is_absent_not_guessed() {
+        let (_, term) = run(
+            Agent::Claude,
+            &[
+                // No init record, so the run's model was never announced.
+                r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","session_id":"s","usage":{"input_tokens":2,"output_tokens":4},"modelUsage":{"claude-haiku-4-5-20251001":{"contextWindow":200000},"claude-sonnet-5":{"contextWindow":1000000}}}"#,
+            ],
+        );
+        assert_eq!(term.usage.context_window, None);
+        // A single entry needs no name: it can only be the run's model.
+        let (_, single) = run(
+            Agent::Claude,
+            &[
+                r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","session_id":"s","usage":{"input_tokens":2,"output_tokens":4},"modelUsage":{"claude-haiku-4-5-20251001":{"contextWindow":200000}}}"#,
+            ],
+        );
+        assert_eq!(single.usage.context_window, Some(200_000));
+    }
+
     #[test]
     fn claude_token_deltas_stream_without_duplicating_the_finished_message() {
         let (events, _) = run(

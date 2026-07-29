@@ -161,7 +161,7 @@ impl Agent {
             // any entry, since that is the one a reader needs to distrust.
             Agent::Claude => Verified {
                 source: Source::Docs,
-                checked: "2026-07-29",
+                checked: "2026-07-30",
                 against: "claude 2.1.212",
             },
             Agent::Codex => Verified {
@@ -296,6 +296,13 @@ fn claude_aliases() -> Vec<Model> {
             CLAUDE_EFFORTS,
             false,
         ),
+        // The `[1m]` suffix widens the context window without changing the
+        // model. Verified by running each on claude 2.1.212 (2026-07-30): the
+        // terminal record reports `contextWindow: 1000000`, keyed by the
+        // suffixed id (`claude-sonnet-5[1m]`). The suffix also composes with a
+        // pinned id: `claude-opus-5[1m]` ran and reported 1M. `fable[1m]` is
+        // accepted too, resolving to plain `claude-fable-5` at 1M, since Fable
+        // is 1M natively and needs no suffix.
         Model::new(
             "opus[1m]",
             "Opus (1M context)",

@@ -295,6 +295,35 @@ async fn claude_reports_enough_to_track_context() {
 /// The accounting difference this release exists to fix. Codex sends the whole
 /// prompt as `input_tokens`; after normalizing, the parts must add back up to
 /// the total it reported.
+/// The `[1m]` aliases end to end: the run must report the widened window, not
+/// the 200k of the Haiku helper that claude lists first in its per-model
+/// usage. This is the regression test for sessions presenting as capped at
+/// 200k.
+#[tokio::test]
+#[ignore = "spawns a real agent and consumes quota"]
+async fn a_1m_alias_reports_the_widened_window() {
+    if !available(Agent::Claude) {
+        return;
+    }
+    let request = Request::new(Agent::Claude, PING)
+        .model("sonnet[1m]")
+        .permission(Permission::ReadOnly)
+        .timeout(Duration::from_secs(180));
+    let outcome = run(&request).await.expect("sonnet[1m] run failed");
+
+    assert_eq!(
+        outcome.usage.context_window,
+        Some(1_000_000),
+        "the widened window should be reported: {:?}",
+        outcome.usage
+    );
+    let share = outcome.usage.context_used().expect("both halves present");
+    assert!(
+        share < 0.1,
+        "a fresh session should be far from full: {share}"
+    );
+}
+
 #[tokio::test]
 #[ignore = "spawns a real agent and consumes quota"]
 async fn codex_token_parts_reconcile_with_the_total_it_reported() {

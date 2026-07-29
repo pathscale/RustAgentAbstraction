@@ -8,6 +8,28 @@ appear in a patch rather than inflating the version toward 1.0 on a crate still 
 shape. **Where that happens the entry says so at the top**, because a version number that
 under-signals is only acceptable if the changelog over-signals to compensate.
 
+## 0.3.2
+
+### Fixed
+
+- **A 1M-context session no longer reports a 200k window.** On claude, a run on any
+  non-Haiku model lists a Haiku helper in its per-model usage, and lists it first. The
+  window binding took the first entry, so `Usage::context_window` reported the helper's
+  200,000 for every such run, which presented as sessions capped at 200k regardless of the
+  `[1m]` variant in use. The binding now keys on the resolved model name the run announced
+  at start (`claude-sonnet-5[1m]` both names the model and keys the usage map, verified on
+  2.1.212). With several entries and no name to match, the window is now reported as
+  unknown rather than guessed, since guessing is how the bug happened. `Terminal::model`
+  records the resolved name.
+
+### Verified, no code change needed
+
+- The `[1m]` aliases already in the catalogue work headlessly, confirmed by running each on
+  claude 2.1.212: `sonnet[1m]` and `opus[1m]` report `contextWindow: 1000000`, and the
+  suffix composes with pinned ids (`claude-opus-5[1m]` runs). `fable[1m]` is accepted and
+  resolves to plain `claude-fable-5`, which is 1M natively, so no `fable[1m]` entry was
+  added: it would duplicate `fable` under a second name.
+
 ## 0.3.1
 
 **Read the behaviour change below before upgrading.** It is the kind that would normally earn
