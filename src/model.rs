@@ -65,14 +65,20 @@ pub struct Model {
     pub note: Cow<'static, str>,
     /// Whether the id tracks a family or names one model.
     pub kind: Kind,
-    /// Reasoning levels this model accepts, in the vendor's order.
+    /// Reasoning levels this model accepts, in the vendor's order, for
+    /// [`crate::Request::effort`].
     ///
-    /// Empty means "not established here", not "none exist": Claude Code has an
-    /// effort setting of its own, shown in its `/model` picker, but it is not a
-    /// `--model` value and its levels have not been verified. Kept as strings
-    /// for the same reason ids are:
-    /// Codex added `ultra` to some models and not others, and an enum here would
-    /// have to be edited before a new level could even be named.
+    /// Kept as strings for the same reason ids are, and the three agents make
+    /// the case on their own: Claude documents five levels, Copilot seven, and
+    /// Codex varies them per model, offering `ultra` on its two frontier models
+    /// and not on the rest. A shared enum would have to be edited before a new
+    /// level could even be named.
+    ///
+    /// Empty means a picker has nothing to offer for this model. That covers
+    /// two cases, and the catalogue comments say which applies: the model
+    /// genuinely accepts no level, as Copilot's `auto` does, or the levels are
+    /// simply not established here. Neither is a promise that a level would be
+    /// refused, since nothing in this crate validates against it.
     pub efforts: Vec<Cow<'static, str>>,
     /// Whether the agent uses this when the caller names no model.
     pub is_default: bool,
@@ -214,6 +220,14 @@ impl Agent {
 ///
 /// Verified against claude 2.1.212 (`--help`) and the published model list,
 /// 2026-07-29.
+/// Claude's effort levels, verified from `claude --help` on 2.1.212:
+/// `--effort <level>` (low, medium, high, xhigh, max).
+///
+/// Session-level rather than per-model, so every entry carries the same set:
+/// `--help` does not vary the choices by model, and a picker reading
+/// [`Model::efforts`] for the selected model gets the right answer either way.
+const CLAUDE_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+
 fn claude_models() -> Vec<Model> {
     let mut models = claude_aliases();
     models.extend(claude_pinned());
@@ -228,7 +242,7 @@ fn claude_aliases() -> Vec<Model> {
             "Default",
             "Whatever is recommended for this account, or the organization default",
             Kind::Alias,
-            &[],
+            CLAUDE_EFFORTS,
             true,
         ),
         Model::new(
@@ -236,7 +250,7 @@ fn claude_aliases() -> Vec<Model> {
             "Opus",
             "Latest Opus, for complex reasoning",
             Kind::Alias,
-            &[],
+            CLAUDE_EFFORTS,
             false,
         ),
         Model::new(
@@ -244,7 +258,7 @@ fn claude_aliases() -> Vec<Model> {
             "Sonnet",
             "Latest Sonnet, for daily coding",
             Kind::Alias,
-            &[],
+            CLAUDE_EFFORTS,
             false,
         ),
         Model::new(
@@ -252,7 +266,7 @@ fn claude_aliases() -> Vec<Model> {
             "Haiku",
             "Fast and efficient, for simple tasks",
             Kind::Alias,
-            &[],
+            CLAUDE_EFFORTS,
             false,
         ),
         Model::new(
@@ -260,7 +274,7 @@ fn claude_aliases() -> Vec<Model> {
             "Fable",
             "For the hardest and longest-running tasks",
             Kind::Alias,
-            &[],
+            CLAUDE_EFFORTS,
             false,
         ),
         Model::new(
@@ -268,7 +282,7 @@ fn claude_aliases() -> Vec<Model> {
             "Best available",
             "Fable where the organization has it, otherwise the latest Opus",
             Kind::Alias,
-            &[],
+            CLAUDE_EFFORTS,
             false,
         ),
         // Not models. Accepted by `--model` and offered here for that reason,
@@ -279,7 +293,7 @@ fn claude_aliases() -> Vec<Model> {
             "Opus, then Sonnet",
             "Opus while planning, Sonnet to execute (a mode, not a model)",
             Kind::Alias,
-            &[],
+            CLAUDE_EFFORTS,
             false,
         ),
         Model::new(
@@ -287,7 +301,7 @@ fn claude_aliases() -> Vec<Model> {
             "Opus (1M context)",
             "Opus with a 1M token context window (a variant, not a model)",
             Kind::Alias,
-            &[],
+            CLAUDE_EFFORTS,
             false,
         ),
         Model::new(
@@ -295,7 +309,7 @@ fn claude_aliases() -> Vec<Model> {
             "Sonnet (1M context)",
             "Sonnet with a 1M token context window (a variant, not a model)",
             Kind::Alias,
-            &[],
+            CLAUDE_EFFORTS,
             false,
         ),
     ]
@@ -317,7 +331,7 @@ fn claude_pinned() -> Vec<Model> {
             "Claude Opus 5",
             "For complex agentic coding and enterprise work",
             Kind::Pinned,
-            &[],
+            CLAUDE_EFFORTS,
             false,
         ),
         Model::new(
@@ -325,7 +339,7 @@ fn claude_pinned() -> Vec<Model> {
             "Claude Sonnet 5",
             "The best combination of speed and intelligence",
             Kind::Pinned,
-            &[],
+            CLAUDE_EFFORTS,
             false,
         ),
         Model::new(
@@ -333,7 +347,7 @@ fn claude_pinned() -> Vec<Model> {
             "Claude Fable 5",
             "Next-generation intelligence for long-running agents",
             Kind::Pinned,
-            &[],
+            CLAUDE_EFFORTS,
             false,
         ),
         Model::new(
@@ -341,7 +355,7 @@ fn claude_pinned() -> Vec<Model> {
             "Claude Haiku 4.5",
             "The fastest model with near-frontier intelligence",
             Kind::Pinned,
-            &[],
+            CLAUDE_EFFORTS,
             false,
         ),
     ]
@@ -415,6 +429,19 @@ fn codex_models() -> Vec<Model> {
 /// product has, not every model the account may use: the same screen carried
 /// "Your Copilot Free plan currently includes only Auto", and on that plan every
 /// id below except `auto` is refused before a request is made.
+/// Copilot's effort levels, verified from `copilot --help` on 1.0.75:
+/// `--effort, --reasoning-effort <level>` (none, minimal, low, medium, high,
+/// xhigh, max).
+///
+/// Two levels wider than Claude's at the bottom, which is why levels are passed
+/// through rather than mapped onto a shared enum.
+///
+/// Applied to the pinned models only. `auto` rejects the flag outright, so
+/// support is not uniform across an agent even when `--help` lists one set, and
+/// these came from `--help` rather than from running each model: a Free plan
+/// permits only `auto`, so there was no way to confirm the rest.
+const COPILOT_EFFORTS: &[&str] = &["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+
 fn copilot_models() -> Vec<Model> {
     vec![
         Model::new(
@@ -422,6 +449,11 @@ fn copilot_models() -> Vec<Model> {
             "Auto",
             "Copilot picks the best available model for each task",
             Kind::Alias,
+            // Deliberately none. Verified on Copilot CLI 1.0.75 by running it:
+            //   Error: Model "auto" does not support reasoning effort
+            //   configuration (requested: "low").
+            // It exits 1 rather than ignoring the flag, so offering a level for
+            // `auto` in a picker produces a failed run, not a slower one.
             &[],
             true,
         ),
@@ -454,7 +486,7 @@ fn copilot_models() -> Vec<Model> {
 /// A pinned entry with no vendor description, which is every Copilot model: its
 /// picker shows ids and nothing else.
 fn pinned(id: &'static str, name: &'static str) -> Model {
-    Model::new(id, name, "", Kind::Pinned, &[], false)
+    Model::new(id, name, "", Kind::Pinned, COPILOT_EFFORTS, false)
 }
 
 /// Read Codex's own model list.
@@ -645,6 +677,89 @@ mod tests {
                 "{agent} should report that it cannot enumerate models"
             );
         }
+    }
+
+    /// The gap this closes: every Claude and Copilot entry shipped with an
+    /// empty `efforts` while both CLIs document a `--effort` flag, so a picker
+    /// had nothing to offer.
+    #[test]
+    fn every_model_reports_the_levels_its_agent_accepts() {
+        for agent in [Agent::Claude, Agent::Codex, Agent::Copilot] {
+            for model in agent.models() {
+                // `auto` is the documented exception, asserted below.
+                if agent == Agent::Copilot && model.id == "auto" {
+                    continue;
+                }
+                assert!(
+                    !model.efforts.is_empty(),
+                    "{agent} model {} reports no effort levels",
+                    model.id
+                );
+            }
+        }
+    }
+
+    /// Support is not uniform across an agent even where `--help` lists one set.
+    /// Copilot exits 1 for an effort on `auto` rather than ignoring it, so
+    /// offering a level there would produce a failed run.
+    #[test]
+    fn copilot_auto_offers_no_levels_because_it_refuses_them() {
+        let models = Agent::Copilot.models();
+        let auto = models.iter().find(|m| m.id == "auto").expect("auto");
+        assert!(
+            auto.efforts.is_empty(),
+            "auto rejects the effort flag outright"
+        );
+        let pinned = models.iter().find(|m| m.id == "gpt-5.5").expect("gpt-5.5");
+        assert!(
+            !pinned.efforts.is_empty(),
+            "pinned models do document levels"
+        );
+    }
+
+    /// Verified from `claude --help` (2.1.212) and `copilot --help` (1.0.75).
+    /// Copilot's set is two wider at the bottom, which is the whole reason
+    /// levels are strings rather than a shared enum.
+    #[test]
+    fn the_documented_level_sets_are_not_interchangeable() {
+        let claude = &Agent::Claude.models()[0].efforts;
+        let copilot_models = Agent::Copilot.models();
+        let copilot = &copilot_models
+            .iter()
+            .find(|m| m.id == "gpt-5.5")
+            .expect("gpt-5.5")
+            .efforts;
+        assert_eq!(claude, &["low", "medium", "high", "xhigh", "max"]);
+        assert_eq!(
+            copilot,
+            &["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+        );
+        assert_ne!(claude, copilot, "a shared enum would have to cover both");
+    }
+
+    /// Codex is the one agent whose levels differ per model, which is why they
+    /// live on the model rather than on the agent.
+    #[test]
+    fn codex_levels_differ_between_its_own_models() {
+        let models = Agent::Codex.models();
+        let by_id = |id: &str| -> Vec<String> {
+            models
+                .iter()
+                .find(|m| m.id == id)
+                .unwrap_or_else(|| panic!("{id} should be catalogued"))
+                .efforts
+                .iter()
+                .map(ToString::to_string)
+                .collect()
+        };
+        assert!(
+            by_id("gpt-5.6-sol").contains(&"ultra".to_string()),
+            "its frontier model offers ultra"
+        );
+        assert!(
+            !by_id("gpt-5.6-luna").contains(&"ultra".to_string()),
+            "its fast model does not"
+        );
     }
 
     #[test]
