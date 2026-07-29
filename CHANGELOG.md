@@ -8,6 +8,31 @@ appear in a patch rather than inflating the version toward 1.0 on a crate still 
 shape. **Where that happens the entry says so at the top**, because a version number that
 under-signals is only acceptable if the changelog over-signals to compensate.
 
+## 0.3.0
+
+A minor bump because it adds API rather than because anything broke: existing code compiles
+and behaves identically, and a run that sets no effort sends no flag.
+
+### Added
+
+- **`Request::effort`** sets the reasoning effort level. Previously the crate could not send
+  one at all, so a host had no way to act on a level a user picked. Delivered as `--effort`
+  on Claude and Copilot, and as `-c model_reasoning_effort=<level>` on Codex, which has no
+  flag for it. The key was confirmed with `--strict-config` rather than assumed. Passed
+  through verbatim, like the model.
+- **`Model::efforts` is now populated for Claude and Copilot.** Both shipped empty while both
+  CLIs document a `--effort` flag, so a picker had nothing to offer. Claude's five levels come
+  from `claude --help` (2.1.212) and Copilot's seven from `copilot --help` (1.0.75). Codex was
+  never empty: it reports levels per model, and they genuinely differ.
+
+### Fixed
+
+- **Copilot's `auto` no longer advertises effort levels it refuses.** Applying the documented
+  set uniformly was wrong, and a live test caught it: `auto` exits 1 with
+  `Model "auto" does not support reasoning effort configuration` rather than ignoring the
+  flag, so offering a level there would have produced a failed run instead of a slower one.
+  Effort support is not uniform within an agent even where `--help` lists one set.
+
 ## 0.2.2
 
 Additive: nothing changes for existing code. A patch rather than a minor bump because no
