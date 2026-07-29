@@ -170,6 +170,30 @@ do not always agree. On claude 2.1.212, `--model opus` reported `claude-opus-4-8
 `--model claude-opus-5` reported `claude-opus-5`, even though that release's own notes call
 Opus 5 the default Opus model. An alias is whatever the account resolves it to.
 
+### Reasoning effort
+
+`Model::efforts` lists the levels each model takes, and `Request::effort` sends one:
+
+```rust
+let request = Request::new(Agent::Codex, prompt).model("gpt-5.6-sol").effort("ultra");
+```
+
+Passed through verbatim, like the model, because the sets are not interchangeable: Claude
+documents five levels, Copilot seven, and Codex varies them per model, offering `ultra` on
+its two frontier models and not on the rest. Delivered as `--effort` on Claude and Copilot,
+and as `-c model_reasoning_effort=<level>` on Codex, which has no flag for it.
+
+Support is not uniform even within one agent. Copilot's `auto` **exits 1** rather than
+ignoring the flag:
+
+```text
+Error: Model "auto" does not support reasoning effort configuration (requested: "low")
+```
+
+so its catalogue entry carries no levels. An empty `efforts` means a picker has nothing to
+offer for that model, whether because it accepts none or because the levels are not
+established here; the entry says which.
+
 Where a CLI can be asked directly, prefer that:
 
 ```rust
