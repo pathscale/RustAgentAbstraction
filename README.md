@@ -137,6 +137,50 @@ the first one's conversation. Uppercase is encoded too, since macOS and Windows 
 case-insensitive and would otherwise collide `Chat` with `chat`. The record keeps your
 original name, so `list()` hands back what you passed, not a mangled segment.
 
+## Choosing a model
+
+`Agent::models()` returns what each agent offers, so a host can render a picker without
+hard-coding three vendors' worth of ids:
+
+```rust
+for model in Agent::Claude.models() {
+    println!("{:24} {}", model.id, model.name);   // "opus", "Opus"
+}
+```
+
+The list is **advisory and never enforced**. `Request::model` takes any string and nothing
+here checks it, so a model released this morning is not blocked by a list compiled last
+month. A model the account cannot reach comes back as `Error::AgentError` with the
+provider's own status and wording.
+
+That distinction matters more than it sounds, because **a catalogue is not an entitlement**.
+Copilot's picker lists twenty-three models and a Free plan permits exactly one:
+
+```text
+Your Copilot Free plan currently includes only Auto, which automatically selects the
+best available model for each task.
+```
+
+Every other id there is refused before a request is made, including `gpt-5.4`, the example
+in Copilot's own `--help`. Treat the list as choices to try, and let the run report what
+the account actually allows. `Model::is_default` marks the safe pre-selection.
+
+Aliases and pinned ids are both carried, and `Model::kind` tells them apart, because they
+do not always agree. On claude 2.1.212, `--model opus` reported `claude-opus-4-8` while
+`--model claude-opus-5` reported `claude-opus-5`, even though that release's own notes call
+Opus 5 the default Opus model. An alias is whatever the account resolves it to.
+
+Where a CLI can be asked directly, prefer that:
+
+```rust
+let models = Agent::Codex.discover_models().await?;   // reflects the installed binary
+```
+
+`discover_models` returns `Error::Unsupported` on Claude and Copilot rather than silently
+returning the compiled list: both enumerate models only in an interactive picker, and a
+caller asking for discovery is asking for freshness. `Agent::models_verified()` records how
+each compiled list was established and against which release.
+
 ## Structured answers
 
 When the answer is data rather than prose, constrain it with a JSON Schema and read it

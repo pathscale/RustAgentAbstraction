@@ -95,6 +95,7 @@ Pure logic and I/O are kept apart so the mappings are testable without spawning 
 | `src/agent.rs` | The three agents, their capabilities, and argv building. **Pure.** |
 | `src/request.rs` | The fluent request builder and its resolution into a `Plan`. **Pure.** |
 | `src/event.rs` | Normalizing three JSON dialects into one event vocabulary. **Pure.** |
+| `src/model.rs` | The per-agent model catalogue, and discovery where a CLI supports it. |
 | `src/session.rs` | Name → native-id bindings on disk. |
 | `src/run.rs` | Spawning, streaming, timeouts, failure classification. |
 | `src/proc.rs` | Process-group teardown. The crate's only `unsafe`. |
