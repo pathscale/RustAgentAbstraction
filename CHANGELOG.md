@@ -1,8 +1,61 @@
 # Changelog
 
-Notable changes per release. Versions follow [semantic versioning](https://semver.org),
-with the 0.x caveat that a minor bump is the only signal Cargo treats as incompatible, so
-behaviour changes go there rather than into a patch.
+Notable changes per release, following [semantic versioning](https://semver.org).
+
+The 0.x caveat: a minor bump is the only signal Cargo treats as incompatible, so behaviour
+changes belong there once anything depends on this crate. While nothing does, they may
+appear in a patch rather than inflating the version toward 1.0 on a crate still finding its
+shape. **Where that happens the entry says so at the top**, because a version number that
+under-signals is only acceptable if the changelog over-signals to compensate.
+
+## 0.2.1
+
+A patch by version number, but **read the behaviour changes**: they are the kind that would
+normally earn a minor bump, and are here only because nothing depends on this crate yet.
+`agent-abstraction = "0.2"` picks this up on an ordinary `cargo update`, so if you are
+already rendering events, check the first item.
+
+### Behaviour changes
+
+- **Streaming is now the default, and text arrives token by token on Claude.** `Format`
+  defaulted to `Json`, under which nothing is observable until the turn ends: a twenty-minute
+  run reported nothing for twenty minutes. Worse, `Request::session` *pinned* that format, so
+  the multi-turn path a chat UI always uses could not stream at all.
+
+  Three consequences for a caller who does not pin a format:
+  - `stream()` now yields events during a run that previously yielded none.
+  - `Event::Text` is token-level on Claude, not message-level. A transcript that appended one
+    Text event per line now receives `"po"`, `"ng"` where it received `"pong"`.
+  - `run()` parses a JSONL stream rather than one document. The `Outcome` is unchanged.
+
+  Pin `Format::Json` to keep the old behaviour.
+- **An unauthenticated Copilot run is now reported as one.** Its wording shares no phrase with
+  Claude's or Codex's, so it previously fell through to a generic `Error::Failed` with no
+  login hint. Callers matching on `Error` should expect `NotAuthenticated` from Copilot now.
+
+### Added
+
+- **`Request::schema`** constrains an answer to a JSON Schema, with the conforming value on
+  `Outcome::structured` already parsed. For answers that are data rather than prose, such as
+  review findings, this replaces guessing at formatting the model never promised. Claude takes
+  the schema inline, Codex reads it from a file this crate writes and removes, and Copilot
+  1.0.75 has no schema support so asking is `Error::Unsupported`.
+
+  Write schemas strictly: Codex sends yours to a provider that requires
+  `"additionalProperties": false` on every object and rejects the request with a 400 before
+  the model runs otherwise.
+- **`AuthStatus::check(agent)`** answers whether an agent is logged in without spending a
+  request. Claude reports JSON, Codex reports prose, Copilot offers neither and is reported as
+  `AuthState::Unknown` rather than a logout, since telling someone to re-authenticate a
+  working setup is worse than admitting the question cannot be answered.
+
+### Fixed
+
+- **A failure reports its cause rather than a status line.** The first line of stderr was taken
+  as the explanation, but CLIs open with progress chatter: a rejected Codex schema reported
+  "Reading additional input from stdin...", which is not what went wrong. A line that looks
+  like an error now wins, and stdout is consulted when stderr only narrates, since Codex
+  reports errors as JSON events on stdout.
 
 ## 0.2.0
 
