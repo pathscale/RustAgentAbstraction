@@ -280,20 +280,20 @@ impl Request {
             name,
             phase,
         });
-        // A named session needs an id back, so it selects the format that
-        // carries one unless the caller pinned a format explicitly.
-        match self.format {
-            None => self.format = self.agent.session_format(),
-            // An explicit format that cannot carry an id would let the run
-            // succeed and then silently fail to update the binding, so the
-            // combination is refused here rather than discovered later.
-            Some(format) if !self.agent.format_carries_session(format) => {
-                return Err(crate::Error::Unsupported {
-                    agent: self.agent,
-                    what: "a named session under an output format that carries no session id",
-                });
-            }
-            Some(_) => {}
+        // A named session needs an id back. The default format carries one, so
+        // this only has to refuse a format the caller pinned that cannot:
+        // otherwise the run would succeed and then silently fail to bind.
+        //
+        // Deliberately no longer *sets* the format. Doing so overrode the
+        // caller's streaming intent, which is how a named session, the case a
+        // chat UI always uses, ended up unable to stream.
+        if let Some(format) = self.format
+            && !self.agent.format_carries_session(format)
+        {
+            return Err(crate::Error::Unsupported {
+                agent: self.agent,
+                what: "a named session under an output format that carries no session id",
+            });
         }
         Ok(self)
     }
@@ -427,7 +427,11 @@ mod tests {
             EnvPolicy::Minimal,
             "full environment inheritance must be an explicit decision"
         );
-        assert_eq!(request.effective_format(), Format::Json);
+        assert_eq!(
+            request.effective_format(),
+            Format::Stream,
+            "the default must be watchable: Json reports nothing until the turn ends"
+        );
         let argv = request.argv().unwrap();
         assert!(argv.contains(&"--disallowedTools".to_string()));
     }
@@ -495,7 +499,11 @@ mod tests {
         let request = Request::new(Agent::Claude, "hi")
             .session(&store, "/proj", "chat", false)
             .unwrap();
-        assert_eq!(request.effective_format(), Format::Json);
+        assert_eq!(
+            request.effective_format(),
+            Format::Stream,
+            "the default must be watchable: Json reports nothing until the turn ends"
+        );
 
         // An explicit format is respected over the automatic upgrade.
         let pinned = Request::new(Agent::Claude, "hi")

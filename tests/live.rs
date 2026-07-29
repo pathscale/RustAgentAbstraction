@@ -608,3 +608,55 @@ fn schema_files_in_temp() -> usize {
             .count()
     })
 }
+
+/// The point of the whole streaming path: text has to arrive in pieces *while*
+/// the agent is still working, not in one lump at the end. A run under the old
+/// default reported nothing until it finished, which for a long turn is
+/// indistinguishable from a hang.
+#[tokio::test]
+#[ignore = "spawns a real agent and consumes quota"]
+async fn text_arrives_in_pieces_before_the_run_finishes() {
+    if !available(Agent::Claude) {
+        return;
+    }
+    // Long enough to produce several chunks rather than one short answer.
+    let request = Request::new(
+        Agent::Claude,
+        "Count from 1 to 10, one number per line, with a short comment on each.",
+    )
+    .model("haiku")
+    .permission(Permission::ReadOnly)
+    .timeout(Duration::from_secs(180));
+
+    // No .format(): this asserts the *default* streams, which is the fix.
+    let mut running = stream(&request).expect("spawn failed");
+
+    let mut chunks: Vec<String> = Vec::new();
+    while let Some(event) = running.recv().await {
+        if let Event::Text(text) = event {
+            chunks.push(text);
+        }
+    }
+    let outcome = running.finish().await.expect("run failed");
+
+    assert!(
+        chunks.len() > 1,
+        "text arrived as {} chunk(s), so nothing was actually streamed: {chunks:?}",
+        chunks.len()
+    );
+    // Every chunk must be a real piece, not the whole answer repeated.
+    let joined: String = chunks.concat();
+    assert!(
+        joined.len() <= outcome.text.len() + 64,
+        "chunks total {} bytes against a {} byte answer, which means the \
+         finished message was emitted on top of the deltas",
+        joined.len(),
+        outcome.text.len()
+    );
+    assert!(outcome.text.contains('1'), "answer: {:?}", outcome.text);
+    eprintln!(
+        "streamed {} chunks for a {} byte answer",
+        chunks.len(),
+        outcome.text.len()
+    );
+}
