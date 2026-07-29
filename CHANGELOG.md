@@ -8,6 +8,59 @@ appear in a patch rather than inflating the version toward 1.0 on a crate still 
 shape. **Where that happens the entry says so at the top**, because a version number that
 under-signals is only acceptable if the changelog over-signals to compensate.
 
+## 0.3.1
+
+**Read the behaviour change below before upgrading.** It is the kind that would normally earn
+a minor bump and is here only because nothing yet depends on the affected field being wrong.
+`agent-abstraction = "0.3"` picks this up on an ordinary `cargo update`.
+
+### Behaviour changes
+
+- **`Usage::input_tokens` now means the same thing on every agent.** The vendors count
+  oppositely: Claude reports the uncached remainder, Codex reports the whole prompt with the
+  cached part inside it. Both were passed through into one field, so summing or comparing
+  across agents was wrong, and a context tracker built on it was wrong for one of them.
+
+  `input_tokens` is now the uncached remainder everywhere, derived on the Codex side by
+  subtracting the cached count. **Codex figures will drop**, by exactly the cached portion.
+  The number Codex reports is preserved as `context_tokens`.
+
+  Verified across two turns of one Codex thread: input rose 15342 to 30703 while cached rose
+  13056 to 28160. Had cached been separate, the second turn would have meant 30k *new* tokens
+  for a four-word question.
+
+### Added
+
+- **A context tracker that needs no bookkeeping.** `Usage::context_tokens` is every input
+  token a turn was charged for, which is the conversation as the model saw it, and
+  `Usage::context_window` is the limit where the agent reports one. `Usage::context_used()`
+  returns the share as an `f64` from 0.0 to 1.0. Claude reports both halves; Codex reports
+  tokens without a window, so it gives tokens but no share.
+- **`Usage::accumulate`** folds a turn into a session running total. Provided because the
+  obvious loop is wrong: an agent re-sends the whole conversation each turn and reports it,
+  mostly as cache reads, so summing the context figures counts the same conversation once per
+  turn and the error grows with the session. Cost and generated tokens add; context-shaped
+  figures take the latest value.
+- **`Agent::account_usage()`** reports plan-wide quota: windows with a used percentage, their
+  length and reset time, credit balance, per-day token buckets and lifetime totals. Backed by
+  `codex app-server`, an experimental JSON-RPC interface. Claude and Copilot return
+  `Error::Unsupported`, and `Agent::reports_account_usage()` answers that up front so a host
+  can decide whether to build the panel rather than learning it from an error.
+
+  Claude is not scraped for this deliberately. It reports quota only during a run, as
+  `Event::RateLimit`, and the percentages on its `/usage` screen are not on the wire; that
+  screen also states its figures are approximate and cover one machine's local sessions.
+- **Usage fields that were already on the wire and being discarded**: `reasoning_tokens`
+  (Codex separates them), `max_output_tokens`, `duration_ms` and `api_duration_ms`, and
+  `ai_credits_nano`, which is the Copilot billing unit that replaced premium requests. The
+  crate had been capturing only the legacy counter.
+- **`RateLimit::overage_status` and `RateLimit::is_using_overage`**, so a caller can tell a
+  plan limit from an overage one rather than seeing only `allowed` or `rejected`.
+
+Values throughout, never presentation: percentages are numbers, durations are minutes or
+milliseconds, and a credit balance stays the string the provider sent so a decimal is not
+rounded through a float on its way to a display.
+
 ## 0.3.0
 
 A minor bump because it adds API rather than because anything broke: existing code compiles
