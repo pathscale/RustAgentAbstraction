@@ -503,7 +503,7 @@ impl Parser {
 
     /// Claude Code `--output-format json` / `stream-json`.
     ///
-    /// Verified against claude 2.1.205: `system/init` opens with the id,
+    /// Verified against claude 2.1.212: `system/init` opens with the id,
     /// `assistant` records carry Anthropic content blocks, `rate_limit_event`
     /// reports quota, and `result` closes with the answer and usage.
     fn claude(&mut self, v: &Value) -> Vec<Event> {
