@@ -143,6 +143,31 @@ pub enum Error {
         hint: &'static str,
     },
 
+    /// The agent ran, exited cleanly, and reported that the turn itself failed.
+    ///
+    /// Its own variant because the process succeeding says nothing about the
+    /// turn succeeding. An unknown model, a schema the provider rejects or an
+    /// upstream outage all arrive this way: exit code 0, with the failure
+    /// described in the output. Reporting that as `Ok` hands back an
+    /// [`crate::Outcome`] whose `text` is an error message, which a caller
+    /// checking only `Result::is_ok` will render as the answer.
+    ///
+    /// The same reasoning already applied to [`Error::NotAuthenticated`] and
+    /// [`Error::RateLimited`], which are also reported with a zero exit; this
+    /// covers everything else in that family.
+    #[error("{agent} reported a failed turn{}: {message}", status.map(|s| format!(" (status {s})")).unwrap_or_default())]
+    AgentError {
+        /// The agent that failed.
+        agent: Agent,
+        /// The binary that ran.
+        bin: String,
+        /// The provider's status code, where the agent reported one. A 404 is
+        /// typically an unknown model, a 400 a rejected request.
+        status: Option<u16>,
+        /// The agent's own description, unedited.
+        message: String,
+    },
+
     /// The CLI rejected an argument this crate passed it.
     ///
     /// Almost always a version mismatch: the flag was verified against the

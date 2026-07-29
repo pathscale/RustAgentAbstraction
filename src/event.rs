@@ -274,6 +274,36 @@ pub struct Terminal {
     pub first_unparsed: Option<String>,
     /// The schema-conforming answer, where the agent reports one separately.
     pub structured: Option<Value>,
+    /// The provider status code when the agent reported a failed turn, such as
+    /// a 404 for an unknown model.
+    pub error_status: Option<u16>,
+    /// The agent's own description of a failed turn, where it gives one apart
+    /// from the answer text. Claude puts its explanation in `result`, so this
+    /// stays `None` there; Codex reports it under `turn.failed`.
+    pub error_message: Option<String>,
+}
+
+/// Unwrap an error body an agent passed through as a JSON string.
+///
+/// Codex 0.145.0 forwards the upstream response verbatim, so `turn.failed`
+/// carries `{"type":"error","status":400,"error":{"message":"..."}}` encoded as
+/// a *string*. Showing that to a user means showing them JSON, and the status
+/// worth branching on is buried inside it. Anything that is not that shape is
+/// returned as-is.
+fn unwrap_error_body(message: &str) -> (Option<u16>, String) {
+    let Ok(body) = serde_json::from_str::<Value>(message) else {
+        return (None, message.to_string());
+    };
+    let status = body
+        .get("status")
+        .and_then(Value::as_u64)
+        .and_then(|s| u16::try_from(s).ok());
+    let inner = body
+        .get("error")
+        .and_then(|e| e.get("message"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    (status, inner.unwrap_or_else(|| message.to_string()))
 }
 
 /// Incrementally turns one agent's output into [`Event`]s and a [`Terminal`].
@@ -507,7 +537,13 @@ impl Parser {
                     self.term.structured = Some(value.clone());
                 }
                 self.term.usage = claude_usage(v);
+                // `subtype` says "success" even for a failed turn, so
+                // `is_error` is the field that actually decides.
                 self.term.stop = if v.get("is_error").and_then(Value::as_bool) == Some(true) {
+                    self.term.error_status = v
+                        .get("api_error_status")
+                        .and_then(Value::as_u64)
+                        .and_then(|s| u16::try_from(s).ok());
                     Stop::Error
                 } else {
                     stop_from(v.get("stop_reason"))
@@ -651,6 +687,15 @@ impl Parser {
             "turn.failed" => {
                 self.seen.terminal = true;
                 self.term.stop = Stop::Error;
+                if let Some(message) = v
+                    .get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(Value::as_str)
+                {
+                    let (status, message) = unwrap_error_body(message);
+                    self.term.error_status = status;
+                    self.term.error_message = Some(bound_text(message));
+                }
                 Vec::new()
             }
             "item.started" | "item.updated" | "item.completed" => {
@@ -796,8 +841,13 @@ impl Parser {
                     self.term.usage.premium_requests =
                         usage.get("premiumRequests").and_then(Value::as_u64);
                 }
-                if v.get("exitCode").and_then(Value::as_i64).unwrap_or(0) != 0 {
+                if let Some(code) = v.get("exitCode").and_then(Value::as_i64)
+                    && code != 0
+                {
                     self.term.stop = Stop::Error;
+                    // Copilot reports no explanation with the code, so name the
+                    // code rather than leave the failure blank.
+                    self.term.error_message = Some(format!("copilot exited with code {code}"));
                 }
                 Vec::new()
             }
@@ -1148,6 +1198,46 @@ mod tests {
                 ok: Some(true),
                 output: "a.txt".into()
             }
+        );
+    }
+
+    /// Verbatim from codex-cli 0.145.0 with an unknown model. It exits **0**
+    /// and forwards the upstream body as a JSON *string*, so the status worth
+    /// branching on is nested one level inside a field that is itself text.
+    #[test]
+    fn a_codex_failed_turn_yields_the_reason_and_the_status() {
+        let (_, term) = run(
+            Agent::Codex,
+            &[
+                r#"{"type":"thread.started","thread_id":"019fad62"}"#,
+                r#"{"type":"turn.failed","error":{"message":"{\"type\":\"error\",\"status\":400,\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The 'bogus-model-xyz' model is not supported when using Codex with a ChatGPT account.\"}}"}}"#,
+            ],
+        );
+        assert_eq!(term.stop, Stop::Error);
+        assert_eq!(term.error_status, Some(400));
+        assert_eq!(
+            term.error_message.as_deref(),
+            Some(
+                "The 'bogus-model-xyz' model is not supported when using Codex with a ChatGPT account."
+            ),
+            "the caller should get the sentence, not the envelope"
+        );
+    }
+
+    /// An error that is not the double-encoded shape must survive untouched
+    /// rather than be dropped for failing to match it.
+    #[test]
+    fn a_plain_codex_failure_message_passes_through() {
+        let (_, term) = run(
+            Agent::Codex,
+            &[
+                r#"{"type":"turn.failed","error":{"message":"stream disconnected before completion"}}"#,
+            ],
+        );
+        assert_eq!(term.error_status, None);
+        assert_eq!(
+            term.error_message.as_deref(),
+            Some("stream disconnected before completion")
         );
     }
 

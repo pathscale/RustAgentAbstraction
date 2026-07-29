@@ -29,6 +29,15 @@ already rendering events, check the first item.
   - `run()` parses a JSONL stream rather than one document. The `Outcome` is unchanged.
 
   Pin `Format::Json` to keep the old behaviour.
+- **A turn the agent says failed is now an error, not an answer.** All three exit `0` for
+  some failures and put the explanation where the answer belongs: ask Claude for a model
+  that does not exist and it exits cleanly, reports `subtype: "success"`, and returns
+  "There's an issue with the selected model" as its reply. A caller checking `Result::is_ok`
+  rendered that as the model's answer. These are now `Error::AgentError`, carrying the
+  agent's own wording and the provider's status where one was given (typically 404 for an
+  unknown model). `NotAuthenticated` and `RateLimited` keep their own variants, since the
+  remedy differs; this covers the rest of that family. Codex forwards the upstream body as a
+  JSON *string*, so its message is unwrapped to the sentence and the status pulled out of it.
 - **An unauthenticated Copilot run is now reported as one.** Its wording shares no phrase with
   Claude's or Codex's, so it previously fell through to a generic `Error::Failed` with no
   login hint. Callers matching on `Error` should expect `NotAuthenticated` from Copilot now.
@@ -60,22 +69,10 @@ already rendering events, check the first item.
 ## 0.2.0
 
 Nothing was removed or renamed, so this compiles against any 0.1 code. It is a minor bump
-rather than a patch because two changes alter behaviour, and `"0.1"` would have delivered
+rather than a patch because some changes alter behaviour, and `"0.1"` would have delivered
 them through an ordinary `cargo update`.
 
 ### Behaviour changes
-
-- **Streaming is now the default**, and a named session no longer disables it. `Format`
-  defaulted to `Json`, under which nothing is observable until the turn ends, so a caller
-  watching a twenty-minute run saw nothing for twenty minutes. Worse, `Request::session`
-  *pinned* that format, meaning the multi-turn path a chat UI always uses could not stream
-  at all. `Stream` carries everything `Json` does, so the default costs only parsing, and
-  `session()` now validates the format instead of overriding it. Pin `Format::Json`
-  explicitly if you only want the answer.
-- **Claude streams token by token.** `--include-partial-messages` is passed under `Stream`,
-  without which Claude emits only completed messages and text arrives a paragraph at a time.
-  Claude sends both the deltas and the finished message; only the deltas are emitted, so a
-  transcript does not show every answer twice.
 
 - **An unauthenticated run is now an error.** Claude exits `0` and puts
   "Not logged in · Please run /login" in its result text, so a missing login previously came
