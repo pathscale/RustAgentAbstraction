@@ -8,6 +8,36 @@ appear in a patch rather than inflating the version toward 1.0 on a crate still 
 shape. **Where that happens the entry says so at the top**, because a version number that
 under-signals is only acceptable if the changelog over-signals to compensate.
 
+## Unreleased
+
+### Added
+
+- **A model catalogue per agent**, so a host can render a picker without hard-coding three
+  vendors' worth of ids. `Agent::models()` returns them best first, `Model::kind`
+  distinguishes an alias from a pinned id, and `Model::is_default` marks the safe
+  pre-selection. `Agent::models_verified()` records how each list was established and against
+  which release, because the three were gathered three different ways and the weakest is the
+  one worth distrusting.
+
+  The list is **advisory and never enforced**. `Request::model` still takes any string and
+  nothing checks it, so a model released this morning is not blocked by a list compiled last
+  month, and one the account cannot reach fails as `Error::AgentError` with the provider's
+  own status. Two findings from building it are why:
+
+  - **A catalogue is not an entitlement.** Copilot's picker lists twenty-three models and a
+    Free plan permits exactly one, refusing every other id before a request is made,
+    including `gpt-5.4` from Copilot's own `--help`.
+  - **An alias and a pinned id do not always agree.** On claude 2.1.212, `--model opus`
+    reported `claude-opus-4-8` while `--model claude-opus-5` reported `claude-opus-5`, even
+    though that release's notes call Opus 5 the default Opus model. Both forms are carried
+    for that reason.
+- **`Agent::discover_models()`** asks the CLI itself, which reflects the installed binary
+  rather than the one this crate was written against. Codex answers through
+  `codex debug models`, including per-model reasoning levels, and its hidden internal model
+  is filtered out. Claude and Copilot return `Error::Unsupported`: both enumerate models only
+  in an interactive picker, and a caller asking for discovery is asking for freshness, so
+  quietly returning the compiled list would answer a question they did not ask.
+
 ## 0.2.1
 
 A patch by version number, but **read the behaviour changes**: they are the kind that would

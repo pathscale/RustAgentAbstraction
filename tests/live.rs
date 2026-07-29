@@ -123,6 +123,55 @@ async fn codex_reports_an_unknown_model_as_a_sentence_not_json() {
     );
 }
 
+/// The compiled-in catalogue is a snapshot and the CLI is the authority. Where
+/// the CLI can be asked, drift should be visible rather than discovered by a
+/// user picking a model that no longer exists.
+///
+/// Cheap: `codex debug models` spends no tokens.
+#[tokio::test]
+async fn the_codex_catalogue_still_matches_what_codex_reports() {
+    if !available(Agent::Codex) {
+        return;
+    }
+    let discovered = Agent::Codex
+        .discover_models()
+        .await
+        .expect("codex should list its own models");
+    let compiled = Agent::Codex.models();
+
+    let ids = |models: &[agent_abstraction::Model]| -> Vec<String> {
+        models.iter().map(|m| m.id.to_string()).collect()
+    };
+    assert_eq!(
+        ids(&discovered),
+        ids(&compiled),
+        "codex's model list has moved; update `codex_models` in src/model.rs"
+    );
+    assert!(
+        !discovered.iter().any(|m| m.id == "codex-auto-review"),
+        "a model codex marks hidden must not reach a picker"
+    );
+}
+
+/// Both of these have an interactive picker and no headless listing, so asking
+/// must fail rather than quietly hand back the compiled list.
+#[tokio::test]
+async fn agents_without_a_headless_listing_refuse_to_guess() {
+    for agent in [Agent::Claude, Agent::Copilot] {
+        if !available(agent) {
+            continue;
+        }
+        let err = agent
+            .discover_models()
+            .await
+            .expect_err("should not invent a model list");
+        assert!(
+            matches!(err, agent_abstraction::Error::Unsupported { .. }),
+            "{agent} should report it cannot enumerate models, got {err:?}"
+        );
+    }
+}
+
 #[tokio::test]
 #[ignore = "spawns a real agent and consumes quota"]
 async fn codex_answers_and_reports_usage() {
