@@ -68,6 +68,24 @@ skips itself when its binary is absent. **Run it after touching any argv mapping
 parser**. The unit tests prove the code does what it says, only the live suite proves the
 CLI agrees.
 
+## Releasing
+
+Publishing is automatic: merging a version bump in `Cargo.toml` to `master` publishes that
+version to crates.io and tags the commit. Nothing else triggers it, and a version already on
+the registry is a no-op, so a rerun or a revert cannot double-publish.
+
+Two consequences worth holding on to:
+
+- **A version bump is a release.** There is no staging step between merging one and it being
+  permanent on crates.io, where a version number can never be reused. Bump the version in the
+  commit you intend to ship, not ahead of it.
+- **The publish job re-runs the full check suite itself** rather than trusting the CI
+  workflow. Both fire on the same push and nothing orders them, and a publish is the one
+  action that cannot be taken back.
+
+Requires the `CARGO_REGISTRY_TOKEN` repository secret. Without it the job fails with that
+name in the message rather than an opaque auth error from cargo.
+
 ## Architecture
 
 Pure logic and I/O are kept apart so the mappings are testable without spawning anything.
