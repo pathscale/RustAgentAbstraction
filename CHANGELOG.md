@@ -8,6 +8,21 @@ appear in a patch rather than inflating the version toward 1.0 on a crate still 
 shape. **Where that happens the entry says so at the top**, because a version number that
 under-signals is only acceptable if the changelog over-signals to compensate.
 
+## 0.3.5
+
+### Fixed
+
+- **A wrong claim about Claude's `/usage` screen, in three places.** The docs said its figures
+  are approximate and cover only one machine's local sessions. That disclaimer belongs to the
+  *attribution* breakdown further down that screen (the per-MCP-server and per-skill shares),
+  not to the three top-line percentages, which carry no such caveat.
+
+  Replaced with what is actually verifiable: the run stream carries no utilization figure at
+  all. Against claude 2.1.212 the entire `rate_limit_info` vocabulary is `status`, `resetsAt`,
+  `rateLimitType`, `overageStatus`, `overageDisabledReason` and `isUsingOverage`, checked with
+  an account at 32% of its session window. There is no percentage field to be missing, so
+  waiting for a different event cannot produce one.
+
 ## 0.3.4
 
 ### Added
@@ -107,8 +122,9 @@ a minor bump and is here only because nothing yet depends on the affected field 
   can decide whether to build the panel rather than learning it from an error.
 
   Claude is not scraped for this deliberately. It reports quota only during a run, as
-  `Event::RateLimit`, and the percentages on its `/usage` screen are not on the wire; that
-  screen also states its figures are approximate and cover one machine's local sessions.
+  `Event::RateLimit`, and the percentages on its `/usage` screen are not on the wire: the
+  whole `rate_limit_info` vocabulary is `status`, `resetsAt`, `rateLimitType` and the overage
+  fields, with no utilization figure anywhere in it.
 - **Usage fields that were already on the wire and being discarded**: `reasoning_tokens`
   (Codex separates them), `max_output_tokens`, `duration_ms` and `api_duration_ms`, and
   `ai_credits_nano`, which is the Copilot billing unit that replaced premium requests. The

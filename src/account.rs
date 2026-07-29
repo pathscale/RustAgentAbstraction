@@ -12,11 +12,13 @@
 //!   over stdio. Percentages, window lengths, reset times, per-day buckets and
 //!   lifetime totals.
 //! - **Claude** reports quota only *during* a run, as
-//!   [`crate::Event::RateLimit`], and only the window, its reset time and
-//!   whether the request was allowed. The percentages its `/usage` screen shows
-//!   are not on the wire. That screen also says its figures are approximate and
-//!   cover only local sessions on one machine, so scraping them would produce a
-//!   number that looks authoritative and is not.
+//!   [`crate::Event::RateLimit`], and the wire carries no utilization figure at
+//!   all. Verified against claude 2.1.212: the whole `rate_limit_info` vocabulary
+//!   is `status`, `resetsAt`, `rateLimitType`, `overageStatus`,
+//!   `overageDisabledReason` and `isUsingOverage`. There is no percentage field
+//!   to be absent, so no amount of waiting for the right event produces one.
+//!   The percentages on its `/usage` screen are fetched separately by that
+//!   screen, and only rendered there.
 //! - **Copilot** reports session spend as [`crate::Usage::ai_credits_nano`] and
 //!   nothing account-wide. Remaining budget lives in its status footer.
 //!

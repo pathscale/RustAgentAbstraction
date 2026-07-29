@@ -543,11 +543,13 @@ Only Codex can answer, through its `codex app-server` JSON-RPC interface: quota 
 percentages and reset times, credit balance, per-day token buckets and lifetime totals.
 
 Claude and Copilot return `Error::Unsupported`. Claude reports quota only *during* a run, as
-`Event::RateLimit`, and only the window, its reset time and whether the request was allowed;
-the percentages on its `/usage` screen are not on the wire, and that screen itself says its
-figures are approximate and cover one machine's local sessions. Copilot reports session
-spend and nothing account-wide. Ask `reports_account_usage()` first rather than discovering
-this from an error.
+`Event::RateLimit`, and **the wire carries no utilization figure at all**: verified against
+2.1.212, the entire `rate_limit_info` vocabulary is `status`, `resetsAt`, `rateLimitType`,
+`overageStatus`, `overageDisabledReason` and `isUsingOverage`. There is no percentage field
+to be missing, so waiting for a different event will not produce one. The percentages on its
+`/usage` screen are fetched separately by that screen. Copilot reports session spend and
+nothing account-wide. Ask `reports_account_usage()` first rather than discovering this from
+an error.
 
 ## No shell, ever
 
