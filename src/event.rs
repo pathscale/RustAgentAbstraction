@@ -345,6 +345,12 @@ pub(crate) struct Parser {
     tool_bytes: usize,
     /// What the stream has shown so far.
     seen: Seen,
+    /// The prompt size of the newest API request in this turn, from the last
+    /// Claude `assistant` record's `message.usage` — the honest basis for
+    /// `Usage::context_tokens`. The terminal `result` sums usage across every
+    /// request the turn made, so a tool-heavy turn re-counts the conversation
+    /// once per round trip and the "context" can exceed the window itself.
+    latest_context: Option<u64>,
 }
 
 /// Milestones a stream passes, tracked because later handling depends on them.
@@ -385,6 +391,7 @@ impl Parser {
             tools: HashMap::new(),
             tool_bytes: 0,
             seen: Seen::default(),
+            latest_context: None,
         }
     }
 
@@ -588,7 +595,33 @@ impl Parser {
                     input: request.get("input").cloned().unwrap_or(Value::Null),
                 })]
             }
-            "assistant" | "user" => self.content_blocks(v),
+            "assistant" | "user" => {
+                /*
+                 * Each `assistant` record carries the usage of the one API
+                 * request that produced it, and its prompt side — input plus
+                 * both cache figures — is the conversation as the model saw
+                 * it *right now*. Kept latest-wins as the turn's context
+                 * figure, because the terminal record's usage sums every
+                 * request in the turn: a tool-heavy turn re-reads the
+                 * conversation once per round trip, and the summed "context"
+                 * grows past the window itself (observed at 195%).
+                 */
+                if ty == "assistant"
+                    && let Some(usage) = v.get("message").and_then(|m| m.get("usage"))
+                {
+                    let part = |key: &str| usage.get(key).and_then(Value::as_u64);
+                    let (input, read, write) = (
+                        part("input_tokens"),
+                        part("cache_read_input_tokens"),
+                        part("cache_creation_input_tokens"),
+                    );
+                    if input.is_some() || read.is_some() || write.is_some() {
+                        self.latest_context =
+                            Some(input.unwrap_or(0) + read.unwrap_or(0) + write.unwrap_or(0));
+                    }
+                }
+                self.content_blocks(v)
+            }
             "result" => {
                 self.seen.terminal = true;
                 if let Some(text) = v.get("result").and_then(Value::as_str) {
@@ -600,6 +633,12 @@ impl Parser {
                     self.term.structured = Some(value.clone());
                 }
                 self.term.usage = claude_usage(v, self.term.model.as_deref());
+                // The per-request figure outranks the terminal sum; the sum
+                // stays only as the fallback for a turn whose assistant
+                // records carried no usage (older CLIs).
+                if self.latest_context.is_some() {
+                    self.term.usage.context_tokens = self.latest_context;
+                }
                 // `subtype` says "success" even for a failed turn, so
                 // `is_error` is the field that actually decides.
                 self.term.stop = if v.get("is_error").and_then(Value::as_bool) == Some(true) {
@@ -1166,6 +1205,47 @@ mod tests {
         assert_eq!(term.usage.max_output_tokens, Some(64_000));
         // The top-level usage block already tracks the main model.
         assert_eq!(term.usage.context_tokens, Some(2 + 27_128 + 9_825));
+    }
+
+    /// The terminal record's usage sums every API request in the turn, so a
+    /// tool-heavy turn re-counts the conversation once per round trip — a host
+    /// displayed 195% of a 1M window from exactly this. Each `assistant`
+    /// record carries the usage of its own request; the last one's prompt side
+    /// is the conversation as the model actually saw it, and it wins.
+    #[test]
+    fn context_is_the_last_requests_prompt_not_the_turns_sum() {
+        let (_, term) = run(
+            Agent::Claude,
+            &[
+                r#"{"type":"system","subtype":"init","session_id":"s","model":"claude-sonnet-5"}"#,
+                r#"{"type":"assistant","session_id":"s","message":{"usage":{"input_tokens":4,"output_tokens":20,"cache_read_input_tokens":100000,"cache_creation_input_tokens":2000},"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]}}"#,
+                r#"{"type":"user","session_id":"s","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}"#,
+                r#"{"type":"assistant","session_id":"s","message":{"usage":{"input_tokens":6,"output_tokens":40,"cache_read_input_tokens":102000,"cache_creation_input_tokens":500},"content":[{"type":"text","text":"done"}]}}"#,
+                r#"{"type":"result","subtype":"success","is_error":false,"result":"done","session_id":"s","usage":{"input_tokens":10,"output_tokens":60,"cache_read_input_tokens":202000,"cache_creation_input_tokens":2500}}"#,
+            ],
+        );
+        assert_eq!(
+            term.usage.context_tokens,
+            Some(6 + 102_000 + 500),
+            "the last request's prompt is the context; the turn sum (204,510) is not"
+        );
+        // The summed figures keep their own meaning: total charged work.
+        assert_eq!(term.usage.cache_read_tokens, Some(202_000));
+    }
+
+    /// A turn whose assistant records carry no usage (older CLIs) still gets
+    /// the terminal figure rather than nothing.
+    #[test]
+    fn the_terminal_sum_remains_the_fallback_context() {
+        let (_, term) = run(
+            Agent::Claude,
+            &[
+                r#"{"type":"system","subtype":"init","session_id":"s","model":"claude-sonnet-5"}"#,
+                r#"{"type":"assistant","session_id":"s","message":{"content":[{"type":"text","text":"ok"}]}}"#,
+                r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","session_id":"s","usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":1000,"cache_creation_input_tokens":0}}"#,
+            ],
+        );
+        assert_eq!(term.usage.context_tokens, Some(10 + 1000));
     }
 
     /// With several entries and no model name to match, the window is unknown
