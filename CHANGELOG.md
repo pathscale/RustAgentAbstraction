@@ -8,6 +8,36 @@ appear in a patch rather than inflating the version toward 1.0 on a crate still 
 shape. **Where that happens the entry says so at the top**, because a version number that
 under-signals is only acceptable if the changelog over-signals to compensate.
 
+## 0.3.8
+
+### Added
+
+- **`Event::Usage`, a token counter while the turn is still running**, for a status line
+  like `7m 8s · 8.5k tokens`. One event per model call, foldable into a running total with
+  `Usage::accumulate`, whose per-field rules were written for this.
+
+  Deduplicated on `message.id`: Claude sends one `assistant` record per content block and
+  each repeats the same usage, so a four-call turn arrives as eight records and reporting
+  every one would count each call twice. Verified against claude 2.1.212 that the per-call
+  figures accumulate to exactly the terminal record's totals, and a live test asserts it
+  end to end so a counter cannot drift from the number that replaces it.
+
+  **`output_tokens` is withheld on these events.** Mid-turn the agent reports the count as
+  it stood when the message began, which understates the finished figure badly: one run
+  whose per-call reports summed to 9 had generated 497 by the end. Reporting it would let a
+  host build a counter that is simply wrong. The context and cache figures are exact.
+
+  Claude reports throughout a turn. Copilot reports once, near the end, carrying its AI
+  credit spend. Codex reports nothing until the turn completes and never emits this.
+
+### Changed
+
+- **The per-request context figure has one source now.** 0.3.7 computed it inline while
+  parsing assistant records; the live counter needed the same arithmetic, and two copies of
+  it are how a live figure and a final one drift apart. Folded into one place, with the
+  event deduplicated on `message.id` and the context figure deliberately not, so a record
+  carrying no id still keeps the context correct as it did before.
+
 ## 0.3.7
 
 ### Fixed
