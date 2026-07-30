@@ -8,6 +8,30 @@ appear in a patch rather than inflating the version toward 1.0 on a crate still 
 shape. **Where that happens the entry says so at the top**, because a version number that
 under-signals is only acceptable if the changelog over-signals to compensate.
 
+## 0.3.6
+
+### Added
+
+- **`Request::interactive` and `Run::send`**, so a user who types a correction mid-turn does
+  not have to wait for the turn to end. The message is delivered into a run already under
+  way and the agent takes it at its next step boundary, verified against claude 2.1.212: a
+  three-command task told to stop after the first ran only that one, with the later two
+  never executing.
+
+  **Rendering rule for a host: append the message to the transcript below the user's previous
+  one, immediately.** That is the whole contract. Claude can echo messages back with
+  `--replay-user-messages`, and this crate deliberately does not pass it, because the caller
+  already knows what it sent and waiting for an echo would delay the very thing this makes
+  immediate.
+
+  `send` returns `Error::Cancelled` once the turn has settled, so a message typed a moment
+  too late is reported rather than dropped; it belongs in a new run resuming the session.
+
+  Claude only: neither other agent reads a structured message stream on stdin, so both are
+  `Error::Unsupported` before spawning. `approvals` now implies `interactive`, since both
+  ride the same open stdin, and that implication is enforced where the command line is built
+  rather than only in the builder, so a hand-made `Plan` cannot be inconsistent.
+
 ## 0.3.5
 
 ### Fixed
