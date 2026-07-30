@@ -29,6 +29,12 @@ Copilot CLIs headlessly behind one API. Consumed as a direct dependency by the
   turn. `Usage::accumulate` holds the per-field rule; extend it rather than hand-rolling a
   total. The vendors also disagree on what "input" counts, so a new field must say which
   convention it follows and normalize to one.
+- **A follow-up message is rendered on send, never on echo.** `Run::send` delivers a message
+  into a running turn and the host appends it to its transcript immediately, below the user's
+  previous one. Claude can echo messages back with `--replay-user-messages` for a host that
+  wants the agent to sequence its transcript; this crate deliberately does not pass it,
+  because the caller already knows what it sent and waiting for an echo would delay the one
+  thing the feature exists to make immediate. Do not add echo-based ordering.
 - **This crate is a library. It has no binary and no CLI.** If something seems to need a
   command-line entry point, it belongs in the consumer, not here.
 - **No shell.** Arguments are built as a `Vec<String>` and handed to `exec`. Never

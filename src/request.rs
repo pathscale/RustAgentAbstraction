@@ -28,6 +28,7 @@ pub struct Request {
     pub(crate) system: Option<String>,
     pub(crate) model: Option<String>,
     pub(crate) effort: Option<String>,
+    pub(crate) duplex: bool,
     pub(crate) approvals: bool,
     pub(crate) permission: Permission,
     pub(crate) format: Option<Format>,
@@ -68,6 +69,7 @@ impl Request {
             system: None,
             model: None,
             effort: None,
+            duplex: false,
             approvals: false,
             permission: Permission::ReadOnly,
             format: None,
@@ -118,6 +120,25 @@ impl Request {
     #[must_use]
     pub fn effort(mut self, effort: impl Into<String>) -> Self {
         self.effort = Some(effort.into());
+        self
+    }
+
+    /// Keep the input channel open for the turn, so the caller can send more.
+    ///
+    /// Without this a run takes one prompt and that is the whole conversation.
+    /// With it, [`crate::Run::send`] delivers another message while the agent is
+    /// still working, which is what lets a chat UI accept a correction the
+    /// moment a user types it rather than making them wait for the turn to end.
+    ///
+    /// The agent takes the message at its next step boundary, not mid-token.
+    /// Verified against claude 2.1.212: a three-command task told to stop after
+    /// the first command ran only that one.
+    ///
+    /// Claude only. Neither other agent reads a structured message stream on
+    /// stdin, so both are [`crate::Error::Unsupported`].
+    #[must_use]
+    pub fn interactive(mut self) -> Self {
+        self.duplex = true;
         self
     }
 
@@ -383,6 +404,7 @@ impl Request {
             system: self.system.clone(),
             model: self.model.clone(),
             effort: self.effort.clone(),
+            duplex: self.duplex || self.approvals,
             approvals: self.approvals,
             permission: self.permission,
             format: self.effective_format(),

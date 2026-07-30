@@ -421,6 +421,87 @@ async fn a_denied_approval_stops_the_tool_from_running() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The point of `interactive`: a correction typed mid-turn actually redirects
+/// the agent. Three sleeps are requested and the run is told to stop after the
+/// first, so the assertion is that the later two never ran.
+///
+/// The timing is generous: the message only has to arrive before the third
+/// command, and each is an eight second sleep.
+#[tokio::test]
+#[ignore = "spawns a real agent and consumes quota"]
+async fn a_message_sent_mid_turn_redirects_the_agent() {
+    if !available(Agent::Claude) {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("agent-abstraction-duplex-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    for name in ["step-b.txt", "step-c.txt"] {
+        let _ = std::fs::remove_file(dir.join(name));
+    }
+
+    let request = Request::new(
+        Agent::Claude,
+        "Using the Bash tool, run these three commands ONE AT A TIME, in order: \
+         `sleep 8`, then `touch step-b.txt`, then `touch step-c.txt`.",
+    )
+    .model("haiku")
+    .cwd(&dir)
+    .permission(Permission::Bypass)
+    .interactive()
+    .timeout(Duration::from_secs(180));
+
+    let mut run = stream(&request).expect("stream should start");
+    let mut sent = false;
+    while let Some(event) = run.recv().await {
+        // Send once the agent is demonstrably working, so the message lands
+        // mid-turn rather than before the turn begins.
+        if !sent && matches!(event, Event::ToolCall { .. }) {
+            sent = true;
+            run.send("STOP. Do not run any more commands. Reply with only: ABORTED")
+                .await
+                .expect("the message should reach claude");
+        }
+    }
+    let outcome = run
+        .finish()
+        .await
+        .expect("an interrupted turn still completes");
+
+    assert!(
+        sent,
+        "the agent never called a tool, so nothing was interrupted"
+    );
+    assert!(
+        !dir.join("step-c.txt").exists(),
+        "the third command ran, so the message did not redirect the agent: {outcome:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Sending is refused where it cannot work, rather than silently doing nothing.
+#[tokio::test]
+async fn a_follow_up_is_refused_where_it_cannot_be_delivered() {
+    for agent in [Agent::Codex, Agent::Copilot] {
+        assert!(
+            matches!(
+                Request::new(agent, PING).interactive().argv(),
+                Err(agent_abstraction::Error::Unsupported { .. })
+            ),
+            "{agent} cannot take a follow-up mid-turn"
+        );
+    }
+    // A run that never opened the channel has nowhere to put a message.
+    let plain = stream(&Request::new(Agent::Claude, PING)).expect("stream");
+    assert!(
+        matches!(
+            plain.send("late").await,
+            Err(agent_abstraction::Error::Unsupported { .. })
+        ),
+        "a non-interactive run should refuse a follow-up"
+    );
+    let _ = plain.cancel().await;
+}
+
 /// Both refusals, checked without spawning: neither other agent can ask, and
 /// `run` cannot carry the question to anyone.
 #[tokio::test]

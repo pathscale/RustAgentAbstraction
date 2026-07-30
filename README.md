@@ -259,6 +259,52 @@ down the whole group. Killing only the CLI would orphan the commands *it* starte
 keep holding files and credentials afterwards. Windows has no equivalent here yet: only the
 direct child is killed, since containing a tree there needs a Job Object.
 
+## Sending while the agent is working
+
+A user who types a correction mid-turn should not have to wait for the turn to end.
+`Request::interactive` keeps the input channel open and `Run::send` delivers a message into
+a run already under way:
+
+```rust
+let request = Request::new(Agent::Claude, prompt).interactive();
+let mut run = stream(&request)?;
+
+// ... from the UI thread, the moment the user hits enter:
+run.send("actually, skip the tests and just fix the parser").await?;
+```
+
+The agent takes it at its **next step boundary**, not mid-token. Verified against claude
+2.1.212: a three-command task told to stop after the first ran only that one.
+
+### How a host should render this
+
+Append the message to the transcript below the user's previous one, immediately, and carry
+on. That is the whole rule.
+
+There is deliberately no acknowledgement to wait for. The CLI can echo messages back with
+`--replay-user-messages` for a host that wants the agent to sequence its transcript, and
+this crate does not use it: the caller already knows what it sent, so an echo would only
+report something it knew, and waiting for one would delay the exact thing this exists to
+make immediate. Render on send, not on echo.
+
+### One boundary worth handling
+
+`send` returns `Error::Cancelled` once the turn has settled. A message typed a moment too
+late is not silently dropped, it is reported, and it belongs in a **new run resuming the
+session** rather than in the finished one:
+
+```rust
+if let Err(e) = run.send(&text).await {
+    if e.is_cancelled() {
+        // the turn ended first: start a new run with .session(...) and send it there
+    }
+}
+```
+
+`interactive` is Claude only. Neither other agent reads a structured message stream on
+stdin, so both return `Error::Unsupported` before spawning. `approvals` implies
+`interactive`, since both ride the same open channel.
+
 ## Human in the loop
 
 Every `Permission` answers the approval question up front, which is what lets a headless run

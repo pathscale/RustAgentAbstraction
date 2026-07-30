@@ -244,6 +244,10 @@ pub struct Plan {
     pub cont: Continue,
     /// True when the prompt is piped on stdin instead of riding the argv.
     pub stdin_prompt: bool,
+    /// True when stdin stays open for the turn so the caller can send more.
+    ///
+    /// Implied by [`Plan::approvals`], which needs the same open channel.
+    pub duplex: bool,
     /// True when gated tool calls are routed to the caller for a decision
     /// rather than resolved by the posture.
     pub approvals: bool,
@@ -578,6 +582,15 @@ impl Agent {
                 what: "routing tool approvals to the caller",
             });
         }
+        // Verified against codex-cli 0.145.0 and Copilot CLI 1.0.75: neither
+        // takes a structured message stream on stdin, so neither can be sent a
+        // second message once a turn is under way.
+        if (plan.duplex || plan.approvals) && self != Agent::Claude {
+            return Err(Error::Unsupported {
+                agent: self,
+                what: "sending a follow-up message while a turn is running",
+            });
+        }
         // `ReadOnly` keeps its guarantee by removing the mutating tools
         // outright, so under it there is nothing left to be asked about: a
         // caller would opt into approvals and then never be asked, and read the
@@ -724,7 +737,7 @@ fn claude_mode(p: Permission) -> &'static str {
 fn argv_claude(plan: &Plan) -> Vec<Arg> {
     let mut a = Argv::new(&plan.bin);
     a.bare("-p");
-    if plan.approvals {
+    if plan.duplex || plan.approvals {
         // Under `--input-format stream-json` the prompt is a JSON message on
         // stdin, so it must not also ride the argv.
     } else if plan.stdin_prompt {
@@ -735,6 +748,15 @@ fn argv_claude(plan: &Plan) -> Vec<Arg> {
         a.arg_sensitive(Agent::Claude.effective_prompt(plan), Sensitivity::Prompt);
     }
 
+    // Approvals ride the same open channel, so they imply it.
+    if plan.duplex || plan.approvals {
+        // Messages travel as JSON on stdin, which is what lets a caller send
+        // another one mid-turn. Verified against claude 2.1.212: a message
+        // written while a turn is running is taken up at the next step
+        // boundary, so a three-command task interrupted after the first runs
+        // only that one.
+        a.pair("--input-format", "stream-json");
+    }
     if plan.approvals {
         // The control channel that carries a `can_use_tool` question out and a
         // decision back. Verified against claude 2.1.212: `manual` is the mode
@@ -749,7 +771,6 @@ fn argv_claude(plan: &Plan) -> Vec<Arg> {
         // which is Claude's decision to make and not this crate's to override.
         a.pair("--permission-mode", "manual");
         a.pair("--permission-prompt-tool", "stdio");
-        a.pair("--input-format", "stream-json");
     } else {
         a.pair("--permission-mode", claude_mode(plan.permission));
     }
@@ -961,6 +982,7 @@ mod tests {
             format: Format::Json,
             cont: Continue::New,
             stdin_prompt: false,
+            duplex: false,
             approvals: false,
             schema: None,
             schema_file: None,
@@ -1057,6 +1079,53 @@ mod tests {
             assert!(
                 Agent::Claude.typed_argv(&p).is_ok(),
                 "{permission:?} should allow approvals"
+            );
+        }
+    }
+
+    /// Interactive alone opens the message channel without switching the
+    /// permission posture: a caller who wants to send follow-ups is not
+    /// thereby asking to be prompted about every tool.
+    #[test]
+    fn interactive_opens_the_channel_without_changing_the_posture() {
+        let mut p = plan("claude");
+        p.duplex = true;
+        p.permission = Permission::Edit;
+        let a = argv(Agent::Claude, &p);
+
+        assert_eq!(a[pos(&a, "--input-format").unwrap() + 1], "stream-json");
+        assert_eq!(a[pos(&a, "--permission-mode").unwrap() + 1], "acceptEdits");
+        assert!(
+            pos(&a, "--permission-prompt-tool").is_none(),
+            "no approval channel was asked for: {a:?}"
+        );
+        assert!(
+            !a.iter().any(|arg| arg == "hi"),
+            "the prompt travels as a stdin message: {a:?}"
+        );
+    }
+
+    /// Approvals need the same open channel, so they imply it. Checked on a
+    /// hand-built `Plan` because the builder is not the only way to make one.
+    #[test]
+    fn approvals_imply_the_open_channel_even_without_the_builder() {
+        let mut p = plan("claude");
+        p.approvals = true;
+        p.duplex = false;
+        p.permission = Permission::Edit;
+        let a = argv(Agent::Claude, &p);
+        assert_eq!(a[pos(&a, "--input-format").unwrap() + 1], "stream-json");
+    }
+
+    /// Neither other agent reads a structured message stream on stdin.
+    #[test]
+    fn agents_that_cannot_take_a_follow_up_refuse_before_spawning() {
+        let mut p = plan("x");
+        p.duplex = true;
+        for agent in [Agent::Codex, Agent::Copilot] {
+            assert!(
+                matches!(agent.typed_argv(&p), Err(Error::Unsupported { .. })),
+                "{agent} cannot be sent a second message mid-turn"
             );
         }
     }

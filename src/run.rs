@@ -117,10 +117,11 @@ pub struct Run {
     /// Set by the driver once the child has been reaped, so `Drop` never
     /// signals a pid the OS may since have handed to someone else.
     reaped: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Decisions on the way back to the agent. `None` unless the request asked
-    /// for approvals, which is what makes [`Run::respond`] refuse rather than
-    /// silently do nothing on an ordinary run.
-    decisions: Option<mpsc::Sender<String>>,
+    /// Lines on the way back to the agent: follow-up messages and approval
+    /// decisions share one channel because they share one stdin. `None` unless
+    /// the request opened it, which is what lets [`Run::send`] and
+    /// [`Run::respond`] refuse rather than silently do nothing.
+    to_agent: Option<mpsc::Sender<String>>,
     /// Dropping or firing this asks the driver to tear down in order. Held as
     /// an `Option` so `detach` can discard it without signalling.
     cancel: Option<tokio::sync::oneshot::Sender<()>>,
@@ -135,6 +136,45 @@ impl Run {
     /// The next event, or `None` once the agent has finished producing them.
     pub async fn recv(&mut self) -> Option<Event> {
         self.events.recv().await
+    }
+
+    /// Send another message while the agent is still working.
+    ///
+    /// The whole point of [`crate::Request::interactive`]: a user who types a
+    /// correction mid-turn should not have to wait for the turn to finish.
+    ///
+    /// The agent takes it at its **next step boundary**, not mid-token, so an
+    /// answer already being written finishes first and a long tool-using task
+    /// changes course at its next step. Verified against claude 2.1.212.
+    ///
+    /// # Ordering, and why there is no acknowledgement
+    ///
+    /// The caller already knows what it sent, so the intended pattern is to
+    /// append the message to the transcript immediately, below the user's
+    /// previous one, and carry on. This deliberately does not ask the agent to
+    /// echo the message back for sequencing: an echo would only tell a UI
+    /// something it already knew, and waiting for one would delay the very
+    /// thing this exists to make immediate.
+    ///
+    /// # Errors
+    /// [`Error::Unsupported`] on a run that did not open the channel with
+    /// [`crate::Request::interactive`]. [`Error::Cancelled`] once the channel
+    /// has closed, which happens when the turn settles or the run is torn down:
+    /// **a message sent after the turn ends is too late** and belongs in a new
+    /// run resuming the session, so this reports it rather than dropping it.
+    pub async fn send(&self, message: &str) -> Result<()> {
+        let Some(channel) = &self.to_agent else {
+            return Err(Error::Unsupported {
+                agent: self.agent,
+                what: "sending a follow-up on a run that is not interactive",
+            });
+        };
+        channel
+            .send(crate::approval::user_message(message))
+            .await
+            .map_err(|_| Error::Cancelled {
+                bin: self.argv.first().cloned().unwrap_or_default(),
+            })
     }
 
     /// Answer an [`Event::ApprovalRequest`].
@@ -153,7 +193,7 @@ impl Run {
     /// already finished or been torn down, which is the same reason a decision
     /// can no longer be delivered.
     pub async fn respond(&self, id: &str, decision: &crate::Decision) -> Result<()> {
-        let Some(channel) = &self.decisions else {
+        let Some(channel) = &self.to_agent else {
             return Err(Error::Unsupported {
                 agent: self.agent,
                 what: "answering an approval on a run that did not request them",
@@ -371,10 +411,10 @@ pub fn stream(request: &Request) -> Result<Run> {
     let mut command = Command::new(&argv[0]);
     command
         .args(&argv[1..])
-        .stdin(if plan.stdin_prompt || plan.approvals {
-            // An approvals run needs stdin for the whole turn, not just to
-            // deliver a prompt: it is the channel every decision travels back
-            // on.
+        .stdin(if plan.stdin_prompt || plan.duplex || plan.approvals {
+            // An interactive run needs stdin for the whole turn, not just to
+            // deliver a prompt: it is the channel follow-up messages and
+            // approval decisions travel back on.
             Stdio::piped()
         } else {
             // Close stdin so an agent that would otherwise wait on it exits
@@ -445,7 +485,7 @@ pub fn stream(request: &Request) -> Result<Run> {
     let (tx, rx) = mpsc::channel(EVENT_BUFFER);
     // Only created for an approvals run, so `respond` can tell "no channel" from
     // "channel closed" and refuse the first rather than hanging on it.
-    let (decisions_tx, decisions_rx) = if plan.approvals {
+    let (decisions_tx, decisions_rx) = if plan.duplex || plan.approvals {
         let (tx, rx) = mpsc::channel::<String>(APPROVAL_BUFFER);
         (Some(tx), Some(rx))
     } else {
@@ -467,7 +507,7 @@ pub fn stream(request: &Request) -> Result<Run> {
         pid,
         reaped,
         cancel: Some(cancel_tx),
-        decisions: decisions_tx,
+        to_agent: decisions_tx,
         task: Some(task),
         argv,
     })
@@ -571,11 +611,11 @@ async fn drive(
     // take the answer channel with it.
     let mut decision_task = None;
     let mut close_stdin = None;
-    if plan.approvals {
+    if plan.duplex || plan.approvals {
         let Some(mut stdin) = child.child.stdin.take() else {
             return Err(Error::Spawn {
                 bin: bin.clone(),
-                source: std::io::Error::other("stdin was not piped for an approvals run"),
+                source: std::io::Error::other("stdin was not piped for an interactive run"),
             });
         };
         let opening = format!(
