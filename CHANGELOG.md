@@ -8,6 +8,18 @@ appear in a patch rather than inflating the version toward 1.0 on a crate still 
 shape. **Where that happens the entry says so at the top**, because a version number that
 under-signals is only acceptable if the changelog over-signals to compensate.
 
+## 0.3.7
+
+### Fixed
+
+- **`Usage::context_tokens` could exceed the context window.** The figure was derived from
+  the terminal record's usage, which Claude sums across every API request in the turn — a
+  tool-heavy turn re-counts the conversation once per round trip, and a host displayed
+  195% of a 1M window. Each `assistant` record carries its own request's usage; the last
+  one's prompt side (input plus both cache figures) is the conversation as the model
+  actually saw it, and is now the figure reported, with the terminal sum kept only as the
+  fallback for streams whose assistant records carry no usage.
+
 ## 0.3.6
 
 ### Added
