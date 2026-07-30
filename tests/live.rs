@@ -478,6 +478,54 @@ async fn a_message_sent_mid_turn_redirects_the_agent() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A live counter has to agree with the number that replaces it when the run
+/// ends, or a UI would show a total that jumps at the last moment. Drives a
+/// multi-step task so several model calls report, then checks the accumulated
+/// figures against the terminal record.
+#[tokio::test]
+#[ignore = "spawns a real agent and consumes quota"]
+async fn live_usage_events_agree_with_the_final_outcome() {
+    if !available(Agent::Claude) {
+        return;
+    }
+    let request = Request::new(
+        Agent::Claude,
+        "Using the Bash tool, run these one at a time: `echo one`, `echo two`, \
+         `echo three`. Then say done.",
+    )
+    .model("haiku")
+    .permission(Permission::Bypass)
+    .timeout(Duration::from_secs(180));
+
+    let mut run = stream(&request).expect("stream should start");
+    let mut live = agent_abstraction::Usage::default();
+    let mut snapshots = 0;
+    while let Some(event) = run.recv().await {
+        if let Event::Usage(usage) = event {
+            snapshots += 1;
+            assert_eq!(
+                usage.output_tokens, None,
+                "a mid-turn output count is understated and must be withheld"
+            );
+            live.accumulate(&usage);
+        }
+    }
+    let outcome = run.finish().await.expect("run failed");
+
+    assert!(
+        snapshots > 1,
+        "a multi-step turn should report more than one model call, got {snapshots}"
+    );
+    assert_eq!(
+        live.input_tokens, outcome.usage.input_tokens,
+        "accumulated input should match the terminal record"
+    );
+    assert_eq!(
+        live.context_tokens, outcome.usage.context_tokens,
+        "the last snapshot's context should be the final context"
+    );
+}
+
 /// Sending is refused where it cannot work, rather than silently doing nothing.
 #[tokio::test]
 async fn a_follow_up_is_refused_where_it_cannot_be_delivered() {

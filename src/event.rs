@@ -62,6 +62,24 @@ pub enum Event {
         /// The observation the model saw.
         output: String,
     },
+    /// Token usage so far, reported while the turn is still running.
+    ///
+    /// For a live counter in a UI. Emitted once per model call, so a host can
+    /// fold each into a running total with [`crate::Usage::accumulate`], whose
+    /// per-field rules were written for exactly this.
+    ///
+    /// **`output_tokens` is deliberately absent here.** Mid-turn the agent
+    /// reports the count as it stood when the message began, which understates
+    /// the finished figure badly: a run whose per-call reports summed to 9 had
+    /// generated 497 by the end. The context figures are exact, so a counter
+    /// built on [`crate::Usage::context_tokens`] is honest and one built on
+    /// output would not be. The true output count arrives with the
+    /// [`crate::Outcome`].
+    ///
+    /// Claude reports this throughout a turn. Copilot reports once, near the
+    /// end. Codex reports nothing until the turn completes, so it never emits
+    /// this.
+    Usage(crate::outcome::Usage),
     /// The agent is waiting for permission to make a tool call.
     ///
     /// Only emitted when the request asked for it via
@@ -233,6 +251,8 @@ fn enforce_bounds(event: Event) -> Event {
             session,
             model: model.map(bound_identifier),
         },
+        // Numbers only, with nothing a bound could apply to.
+        Event::Usage(usage) => Event::Usage(usage),
         Event::ApprovalRequest(approval) => {
             Event::ApprovalRequest(crate::approval::Approval {
                 // The id has to survive intact or the answer cannot be matched
@@ -371,6 +391,13 @@ struct Seen {
     structured: bool,
     /// The agent's terminal record arrived, so the turn completed.
     terminal: bool,
+    /// The `message.id` whose usage was last reported.
+    ///
+    /// One model call arrives as several `assistant` records, one per content
+    /// block, each repeating the same usage. Reporting all of them would make a
+    /// host accumulating the events count one call several times: a four-call
+    /// turn arrived as eight records.
+    usage_of: Option<String>,
     /// Token-level deltas arrived.
     ///
     /// Claude sends deltas *and* the completed message they build up to, so
@@ -454,6 +481,68 @@ impl Parser {
             }
         }
         out
+    }
+
+    /// A usage snapshot for a model call not yet reported.
+    ///
+    /// Deduplicated on `message.id`: one call arrives as several records, one
+    /// per content block, each carrying the same usage, so reporting every one
+    /// would triple-count a call in a host that accumulates them.
+    ///
+    /// Verified against claude 2.1.212: across a four-call turn the per-call
+    /// inputs summed to exactly the terminal record's totals, for input and for
+    /// both cache figures.
+    fn live_usage(&mut self, v: &Value) -> Vec<Event> {
+        let Some(message) = v.get("message") else {
+            return Vec::new();
+        };
+        let Some(usage) = message.get("usage") else {
+            return Vec::new();
+        };
+        let get = |key: &str| usage.get(key).and_then(Value::as_u64);
+        let (input, read, write) = (
+            get("input_tokens"),
+            get("cache_read_input_tokens"),
+            get("cache_creation_input_tokens"),
+        );
+        if input.is_none() && read.is_none() && write.is_none() {
+            return Vec::new();
+        }
+        let prompt = input.unwrap_or(0) + read.unwrap_or(0) + write.unwrap_or(0);
+        /*
+         * Each `assistant` record carries the usage of the one API request that
+         * produced it, and its prompt side is the conversation as the model saw
+         * it *right now*. Kept latest-wins as the turn's context figure,
+         * because the terminal record's usage sums every request in the turn: a
+         * tool-heavy turn re-reads the conversation once per round trip, and
+         * the summed "context" grows past the window itself (observed at 195%).
+         *
+         * Set before the id check on purpose. The event has to be deduplicated
+         * or a host's running total counts one call several times, but the
+         * context figure is latest-wins and harmless to set twice, so a record
+         * carrying no `message.id` still keeps it correct.
+         */
+        self.latest_context = Some(prompt);
+
+        // Without an id there is no way to tell a repeat from a new call, and
+        // over-reporting corrupts a running total, so silence is the safer miss.
+        let Some(id) = message.get("id").and_then(Value::as_str) else {
+            return Vec::new();
+        };
+        if self.seen.usage_of.as_deref() == Some(id) {
+            return Vec::new();
+        }
+        self.seen.usage_of = Some(id.to_string());
+        vec![Event::Usage(Usage {
+            input_tokens: input,
+            cache_read_tokens: read,
+            cache_write_tokens: write,
+            context_tokens: Some(prompt),
+            // Understated mid-turn: this is the count as the message began. See
+            // `Event::Usage`.
+            output_tokens: None,
+            ..Usage::default()
+        })]
     }
 
     /// Whether the agent's terminal record has arrived, so the turn is over.
@@ -595,33 +684,7 @@ impl Parser {
                     input: request.get("input").cloned().unwrap_or(Value::Null),
                 })]
             }
-            "assistant" | "user" => {
-                /*
-                 * Each `assistant` record carries the usage of the one API
-                 * request that produced it, and its prompt side — input plus
-                 * both cache figures — is the conversation as the model saw
-                 * it *right now*. Kept latest-wins as the turn's context
-                 * figure, because the terminal record's usage sums every
-                 * request in the turn: a tool-heavy turn re-reads the
-                 * conversation once per round trip, and the summed "context"
-                 * grows past the window itself (observed at 195%).
-                 */
-                if ty == "assistant"
-                    && let Some(usage) = v.get("message").and_then(|m| m.get("usage"))
-                {
-                    let part = |key: &str| usage.get(key).and_then(Value::as_u64);
-                    let (input, read, write) = (
-                        part("input_tokens"),
-                        part("cache_read_input_tokens"),
-                        part("cache_creation_input_tokens"),
-                    );
-                    if input.is_some() || read.is_some() || write.is_some() {
-                        self.latest_context =
-                            Some(input.unwrap_or(0) + read.unwrap_or(0) + write.unwrap_or(0));
-                    }
-                }
-                self.content_blocks(v)
-            }
+            "assistant" | "user" => self.content_blocks(v),
             "result" => {
                 self.seen.terminal = true;
                 if let Some(text) = v.get("result").and_then(Value::as_str) {
@@ -701,14 +764,14 @@ impl Parser {
     /// Anthropic content blocks, shared by Claude's `assistant` and `user`
     /// records.
     fn content_blocks(&mut self, v: &Value) -> Vec<Event> {
+        let mut out = self.live_usage(v);
         let blocks = v
             .get("message")
             .and_then(|m| m.get("content"))
             .and_then(Value::as_array);
         let Some(blocks) = blocks else {
-            return Vec::new();
+            return out;
         };
-        let mut out = Vec::new();
         for block in blocks {
             let ty = block
                 .get("type")
@@ -1361,6 +1424,105 @@ mod tests {
                 .filter(|e| matches!(e, Event::Started { .. }))
                 .count(),
             1
+        );
+    }
+
+    /// Verbatim shape from claude 2.1.212: one model call arrives as several
+    /// `assistant` records, one per content block, each repeating the same
+    /// usage. Reporting every one would make a host's running total count the
+    /// call three times.
+    #[test]
+    fn a_model_call_reports_its_usage_once_however_many_blocks_it_has() {
+        let (events, _) = run(
+            Agent::Claude,
+            &[
+                r#"{"type":"assistant","session_id":"s","message":{"id":"msg_a","content":[{"type":"thinking","thinking":"..."}],"usage":{"input_tokens":10,"cache_read_input_tokens":20180,"cache_creation_input_tokens":7574,"output_tokens":4}}}"#,
+                r#"{"type":"assistant","session_id":"s","message":{"id":"msg_a","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{}}],"usage":{"input_tokens":10,"cache_read_input_tokens":20180,"cache_creation_input_tokens":7574,"output_tokens":4}}}"#,
+                r#"{"type":"assistant","session_id":"s","message":{"id":"msg_b","content":[{"type":"text","text":"done"}],"usage":{"input_tokens":8,"cache_read_input_tokens":30427,"cache_creation_input_tokens":0,"output_tokens":3}}}"#,
+            ],
+        );
+        let usage: Vec<&Usage> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Usage(u) => Some(u),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(usage.len(), 2, "two model calls, three records: {events:?}");
+        assert_eq!(usage[0].input_tokens, Some(10));
+        assert_eq!(usage[0].context_tokens, Some(10 + 20180 + 7574));
+        assert_eq!(usage[1].context_tokens, Some(8 + 30427));
+    }
+
+    /// The context figure must survive a record with no `message.id`, which is
+    /// what an older CLI emits. The event is deduplicated on that id and so
+    /// cannot fire, but the terminal context is latest-wins and must still be
+    /// right, so the two are deliberately gated differently.
+    #[test]
+    fn context_is_still_tracked_when_a_record_carries_no_id() {
+        let (events, term) = run(
+            Agent::Claude,
+            &[
+                r#"{"type":"assistant","session_id":"s","message":{"content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":8,"cache_read_input_tokens":30427,"cache_creation_input_tokens":0}}}"#,
+                r#"{"type":"result","subtype":"success","is_error":false,"result":"hi","session_id":"s","usage":{"input_tokens":99,"cache_read_input_tokens":99}}"#,
+            ],
+        );
+        assert!(
+            !events.iter().any(|e| matches!(e, Event::Usage(_))),
+            "no id means no way to deduplicate, so nothing is reported"
+        );
+        assert_eq!(
+            term.usage.context_tokens,
+            Some(8 + 30427),
+            "the per-request figure must still outrank the terminal sum"
+        );
+    }
+
+    /// Mid-turn the agent reports output as it stood when the message began,
+    /// which understates the finished figure badly. Reporting it would let a
+    /// host build a counter that is simply wrong, so it is withheld.
+    #[test]
+    fn a_live_snapshot_withholds_the_output_count() {
+        let (events, _) = run(
+            Agent::Claude,
+            &[
+                r#"{"type":"assistant","session_id":"s","message":{"id":"m","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":8,"output_tokens":1}}}"#,
+            ],
+        );
+        let Some(Event::Usage(usage)) = events.iter().find(|e| matches!(e, Event::Usage(_))) else {
+            panic!("expected a usage event: {events:?}")
+        };
+        assert_eq!(usage.output_tokens, None, "a partial count is not reported");
+        assert_eq!(usage.input_tokens, Some(8), "the exact figures still are");
+    }
+
+    /// Accumulating the live events must land on the same totals the terminal
+    /// record reports, or a counter would drift from the final number it is
+    /// about to be replaced by. Figures from one real four-call turn.
+    #[test]
+    fn live_snapshots_accumulate_to_the_terminal_totals() {
+        let calls = [
+            (10u64, 20180u64, 7574u64),
+            (8, 0, 30427),
+            (8, 30427, 1859),
+            (8, 32286, 115),
+        ];
+        let mut session = Usage::default();
+        for (input, read, write) in calls {
+            session.accumulate(&Usage {
+                input_tokens: Some(input),
+                cache_read_tokens: Some(read),
+                cache_write_tokens: Some(write),
+                context_tokens: Some(input + read + write),
+                ..Usage::default()
+            });
+        }
+        // The terminal record for that run.
+        assert_eq!(session.input_tokens, Some(34));
+        assert_eq!(
+            session.context_tokens,
+            Some(8 + 32286 + 115),
+            "context takes the latest, being cumulative already"
         );
     }
 

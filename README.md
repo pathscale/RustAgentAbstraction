@@ -574,6 +574,34 @@ to the first meaning on both, and `context_tokens` carries the whole prompt.
 
 `context_used()` needs both the tokens and the window, so today it answers only on Claude.
 
+### A live counter while the agent works
+
+`Event::Usage` reports token usage as the turn runs, for a status line like
+`7m 8s · 8.5k tokens`:
+
+```rust
+let mut live = Usage::default();
+while let Some(event) = run.recv().await {
+    if let Event::Usage(usage) = event {
+        live.accumulate(&usage);
+        ui.set_counter(live.context_tokens, live.context_used());
+    }
+}
+```
+
+One event per model call, deduplicated: Claude sends several records per call, one per
+content block, each repeating the same usage, and reporting all of them would count a call
+three times.
+
+**`output_tokens` is absent on these events, deliberately.** Mid-turn the agent reports the
+count as it stood when the message began, which understates the finished figure badly: one
+run whose per-call reports summed to 9 had generated 497 by the end. The context and cache
+figures are exact, so a counter built on `context_tokens` is honest and one built on output
+would not be. The real output count arrives with the `Outcome`.
+
+Claude reports throughout a turn. Copilot reports once, near the end. Codex reports nothing
+until the turn completes, so it never emits this.
+
 ### Account-wide
 
 ```rust
