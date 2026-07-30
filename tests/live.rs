@@ -490,7 +490,12 @@ async fn a_follow_up_is_refused_where_it_cannot_be_delivered() {
             "{agent} cannot take a follow-up mid-turn"
         );
     }
-    // A run that never opened the channel has nowhere to put a message.
+    // A run that never opened the channel has nowhere to put a message. This
+    // half needs the binary, since it has to actually spawn; the argv checks
+    // above do not.
+    if !available(Agent::Claude) {
+        return;
+    }
     let plain = stream(&Request::new(Agent::Claude, PING)).expect("stream");
     assert!(
         matches!(
