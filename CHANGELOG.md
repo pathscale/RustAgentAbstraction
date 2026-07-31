@@ -8,6 +8,30 @@ appear in a patch rather than inflating the version toward 1.0 on a crate still 
 shape. **Where that happens the entry says so at the top**, because a version number that
 under-signals is only acceptable if the changelog over-signals to compensate.
 
+## 0.4.0
+
+### Changed
+
+- **`Usage::accumulate` sums the cache figures instead of taking the latest.** A behaviour
+  change to a public method, and a minor bump for the reason at the top of this file:
+  something depends on this crate now.
+
+  `cache_read_tokens` and `cache_write_tokens` were filed with the context figures, on the
+  reasoning that an agent re-sends the whole conversation each turn and reports it mostly as
+  cache reads, so summing would count one conversation many times. That reasoning is right
+  about `context_tokens`, which still takes the latest, and wrong about these. A turn's cache
+  figure is not the conversation's size: the terminal record already sums the cache traffic
+  of every call in the turn, which this crate's own parser test shows with calls of 100000
+  and 102000 arriving as 202000. Every one of those reads is billed.
+
+  The visible cost was a host whose token total could not explain its own cost figure:
+  54.6k tokens beside $9.409, with six figures of billed cache reads missing from the count
+  on a long conversation.
+
+  **If you fold usage with `accumulate`, your session cache totals will rise.** They were
+  the last turn's traffic and are now the session's. Per-turn `Outcome::usage` is untouched;
+  only the folding rule moved.
+
 ## 0.3.8
 
 ### Added

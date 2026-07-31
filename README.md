@@ -548,14 +548,20 @@ let used = outcome.usage.context_used();   // Option<f64>, 0.0 to 1.0
 ```
 
 **Do not sum usage across turns in a loop.** An agent re-sends the whole conversation each
-turn and reports it, mostly as cache reads, so adding the context figures counts the same
-conversation once per turn and the error grows with the session. `Usage::accumulate` applies
-the right rule per field:
+turn and reports its size, so adding `context_tokens` counts the same conversation once per
+turn and the error grows with the session. `Usage::accumulate` applies the right rule per
+field:
 
 ```rust
 let mut session = Usage::default();
-session.accumulate(&outcome.usage);   // cost and output add; context takes the latest
+session.accumulate(&outcome.usage);   // tokens and cost add; context takes the latest
 ```
+
+The cache figures add, and that is worth saying out loud because they look like context and
+are not. A turn's `cache_read_tokens` is what that turn's calls actually read, already summed
+across them by the agent's terminal record, and every read is billed. Taking the latest
+instead reports one turn's cache traffic as the whole session's, which is how a host ends up
+with a token total that cannot explain its own cost figure.
 
 The vendors also disagree on what "input" counts: Claude reports the uncached remainder,
 Codex reports the whole prompt with the cached part inside it. `input_tokens` is normalized
