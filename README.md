@@ -305,6 +305,56 @@ if let Err(e) = run.send(&text).await {
 stdin, so both return `Error::Unsupported` before spawning. `approvals` implies
 `interactive`, since both ride the same open channel.
 
+## Slash commands
+
+A conversation that outgrows its context window makes the model measurably worse at the thing
+it was doing. `/compact` is the CLI's answer: it summarises the conversation and continues from
+the summary. `Request::command` runs it as a value rather than a string:
+
+```rust
+use agent_abstraction::{Agent, Command, Compaction, Event, Request, stream};
+
+let request = Request::command(Agent::Claude, &Command::Compact { instructions: None })
+    .resume(&session_id);
+
+let mut run = stream(&request)?;
+while let Some(event) = run.recv().await {
+    if let Event::Compaction(Compaction::Finished { ok, error }) = event {
+        // `ok: false` with a reason is an answer, not an error.
+    }
+}
+```
+
+**Do not build the literal yourself, and do not send it with `Run::send`.** Two reasons, both
+found by running it:
+
+- On Codex and Copilot there is no command vocabulary, so `/compact` arrives as prose and the
+  model answers a question *about* compaction. That is indistinguishable from success for a
+  caller checking `is_ok`, which is why both refuse before spawning.
+- Injected into a live turn, the compaction emits its own `result` record **after** the turn's,
+  overwriting the outcome: the answer's text becomes the compaction's empty string and the
+  turn's usage becomes its zeroes. A command is its own turn, resuming the session.
+
+A compaction writes no answer, so the outcome's text is empty and `num_turns` is zero. Neither
+is a failure, and a conversation too short to summarise is refused with a reason on a run that
+completed. `Event::Compaction` is what says whether it worked.
+
+The catalogue is the agent's own. Claude reports it at init and `Event::Commands` carries it,
+split the way a user sees it: skills are capabilities someone installed, utilities are part of
+the tool.
+
+```rust
+Event::Commands(commands) => {
+    commands.has("compact");   // offer the button only if it exists
+    commands.utilities();      // the built-in half
+    commands.skills;           // the installed half
+}
+```
+
+Read rather than compiled in, because plugins, skills and user commands make the set
+per-install: a hardcoded list would describe the developer's machine instead of the user's.
+`Caps::commands` says whether an agent has one at all.
+
 ## Human in the loop
 
 Every `Permission` answers the approval question up front, which is what lets a headless run

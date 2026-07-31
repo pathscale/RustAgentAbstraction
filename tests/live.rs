@@ -1195,3 +1195,113 @@ async fn text_arrives_in_pieces_before_the_run_finishes() {
         outcome.text.len()
     );
 }
+
+/// `/compact` is a command the CLI runs, not text the model reads.
+///
+/// The distinction is the whole feature and it is invisible from the outside:
+/// an agent that treated the slash as prose would answer a question *about*
+/// compaction and look, to a caller checking only `is_ok`, exactly like a
+/// compaction that worked. So the assertion is on the lifecycle records, which
+/// only a real compaction produces.
+///
+/// Two turns first, because a conversation shorter than that is refused. That
+/// refusal is itself the other half of the contract: it arrives as a completed
+/// run carrying the reason, never as an error.
+#[tokio::test]
+#[ignore = "spawns a real agent and consumes quota"]
+async fn claude_runs_compact_as_a_command_and_reports_its_phases() {
+    if !available(Agent::Claude) {
+        return;
+    }
+    let dir = std::env::temp_dir().join("agent-abstraction-compact-live");
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+
+    // A session with enough behind it to be worth summarising.
+    let mut session = None;
+    for prompt in [
+        "Remember the number 41. Reply with just: ok",
+        "Remember the colour teal. Reply with just: ok",
+    ] {
+        let mut request = Request::new(Agent::Claude, prompt)
+            .model("haiku")
+            .cwd(&dir)
+            .timeout(Duration::from_secs(180));
+        if let Some(id) = &session {
+            request = request.resume(id);
+        }
+        let outcome = run(&request).await.expect("seeding turn failed");
+        session = outcome.session.clone();
+    }
+    let session = session.expect("claude must report a session id");
+
+    let request = Request::command(
+        Agent::Claude,
+        &agent_abstraction::Command::Compact { instructions: None },
+    )
+    .model("haiku")
+    .cwd(&dir)
+    .resume(&session)
+    .timeout(Duration::from_secs(300));
+
+    let mut stream = stream(&request).expect("compact run failed to start");
+    let mut phases = Vec::new();
+    let mut catalogue = None;
+    while let Some(event) = stream.recv().await {
+        match event {
+            Event::Compaction(phase) => phases.push(phase),
+            Event::Commands(commands) => catalogue = Some(commands),
+            _ => {}
+        }
+    }
+    let outcome = stream.finish().await.expect("compact run failed");
+
+    assert!(outcome.is_ok(), "unexpected stop: {outcome:?}");
+    assert!(
+        phases
+            .iter()
+            .any(|phase| matches!(phase, agent_abstraction::Compaction::Started)),
+        "no compaction began, so the slash was read as prose: {phases:?}"
+    );
+    let finished = phases
+        .iter()
+        .find_map(|phase| match phase {
+            agent_abstraction::Compaction::Finished { ok, error } => Some((*ok, error.clone())),
+            _ => None,
+        })
+        .expect("a compaction that starts must settle");
+    assert!(finished.0, "compaction refused: {:?}", finished.1);
+
+    // The catalogue rides the same run, and is the agent's own rather than ours.
+    let catalogue = catalogue.expect("claude publishes its commands at init");
+    assert!(
+        catalogue.has("compact"),
+        "an agent that just compacted must list the command: {catalogue:?}"
+    );
+    assert!(
+        !catalogue.utilities().is_empty(),
+        "utilities are the commands that are not skills: {catalogue:?}"
+    );
+    eprintln!(
+        "compacted; {} commands, {} of them skills",
+        catalogue.all.len(),
+        catalogue.skills.len()
+    );
+}
+
+/// The other agents have no command vocabulary, and the refusal is raised
+/// before anything spawns, so this costs nothing.
+#[tokio::test]
+#[ignore = "spawns a real agent and consumes quota"]
+async fn only_claude_takes_a_slash_command() {
+    for agent in [Agent::Codex, Agent::Copilot] {
+        let request = Request::command(
+            agent,
+            &agent_abstraction::Command::Compact { instructions: None },
+        );
+        let error = run(&request).await.expect_err("must refuse");
+        assert!(
+            matches!(error, agent_abstraction::Error::Unsupported { .. }),
+            "{agent} refused with the wrong error: {error:?}"
+        );
+    }
+}

@@ -89,6 +89,18 @@ pub enum Event {
     ApprovalRequest(crate::approval::Approval),
     /// A quota signal. Reported, never acted on.
     RateLimit(RateLimit),
+    /// A `/compact` started or settled.
+    ///
+    /// Only on a run carrying [`crate::Command::Compact`]. A refusal arrives
+    /// here as [`crate::Compaction::Finished`] with a reason rather than as an
+    /// error, because the command ran and answered. Claude only.
+    Compaction(crate::command::Compaction),
+    /// What the agent reports it can do, emitted once as the run starts.
+    ///
+    /// The catalogue is the agent's own, not this crate's: skills, plugins and
+    /// user commands differ per install. Claude only; nothing else publishes
+    /// one.
+    Commands(crate::command::Commands),
 }
 
 /// The ceiling on any single captured buffer.
@@ -270,6 +282,21 @@ fn enforce_bounds(event: Event) -> Event {
             overage_status: limit.overage_status.map(bound_identifier),
             is_using_overage: limit.is_using_overage,
         }),
+        // The agent's own refusal sentence, bounded like any other prose it
+        // hands back.
+        Event::Compaction(crate::command::Compaction::Finished { ok, error }) => {
+            Event::Compaction(crate::command::Compaction::Finished {
+                ok,
+                error: error.map(bound_text),
+            })
+        }
+        Event::Compaction(phase) => Event::Compaction(phase),
+        // Command names, each short by nature and descriptive rather than
+        // correlating, so a long one shortens rather than being dropped.
+        Event::Commands(commands) => Event::Commands(crate::command::Commands {
+            all: commands.all.into_iter().map(bound_identifier).collect(),
+            skills: commands.skills.into_iter().map(bound_identifier).collect(),
+        }),
     }
 }
 
@@ -381,7 +408,7 @@ pub(crate) struct Parser {
 #[derive(Debug, Default)]
 #[expect(
     clippy::struct_excessive_bools,
-    reason = "four independent stream milestones; naming each beats packing them"
+    reason = "five independent stream milestones; naming each beats packing them"
 )]
 struct Seen {
     /// A [`Event::Started`] has been emitted, so it fires only once.
@@ -391,6 +418,11 @@ struct Seen {
     structured: bool,
     /// The agent's terminal record arrived, so the turn completed.
     terminal: bool,
+    /// The command catalogue has been reported, so it fires only once.
+    ///
+    /// A compaction re-initialises the session, so a run carrying `/compact`
+    /// sees a second `init` with the same lists.
+    catalogue: bool,
     /// The `message.id` whose usage was last reported.
     ///
     /// One model call arrives as several `assistant` records, one per content
@@ -685,6 +717,7 @@ impl Parser {
                 })]
             }
             "assistant" | "user" => self.content_blocks(v),
+            "system" => self.claude_system(v),
             "result" => {
                 self.seen.terminal = true;
                 if let Some(text) = v.get("result").and_then(Value::as_str) {
@@ -714,6 +747,68 @@ impl Parser {
                     stop_from(v.get("stop_reason"))
                 };
                 Vec::new()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Claude's `system` records: the catalogue at init, and compaction status.
+    ///
+    /// Verified against claude 2.1.212. A `/compact` reports as
+    /// `{"subtype":"status","status":"compacting"}` and then
+    /// `{"subtype":"status","status":null,"compact_result":"success"}`, with
+    /// `compact_error` carrying the reason on a refusal.
+    ///
+    /// `compact_boundary` marks where the summary begins and is deliberately
+    /// not surfaced: it describes the transcript's shape, which this crate does
+    /// not model, and the `status` pair already says what happened.
+    fn claude_system(&mut self, v: &Value) -> Vec<Event> {
+        match v.get("subtype").and_then(Value::as_str) {
+            Some("init") => {
+                // The second `init` of a run is the session re-initialising
+                // after a compaction, carrying the same catalogue. Emitting it
+                // again would have a host redraw a palette that did not change.
+                if self.seen.catalogue {
+                    return Vec::new();
+                }
+                let names = |key: &str| -> Vec<String> {
+                    v.get(key)
+                        .and_then(Value::as_array)
+                        .map(|entries| {
+                            entries
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .map(str::to_string)
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                };
+                let commands = crate::command::Commands {
+                    all: names("slash_commands"),
+                    skills: names("skills"),
+                };
+                // An init that listed nothing is an older CLI, not an agent
+                // with no commands, and saying "none" would be a claim.
+                if commands.all.is_empty() {
+                    return Vec::new();
+                }
+                self.seen.catalogue = true;
+                vec![Event::Commands(commands)]
+            }
+            Some("status") => {
+                if v.get("status").and_then(Value::as_str) == Some("compacting") {
+                    return vec![Event::Compaction(crate::command::Compaction::Started)];
+                }
+                let Some(result) = v.get("compact_result").and_then(Value::as_str) else {
+                    return Vec::new();
+                };
+                vec![Event::Compaction(crate::command::Compaction::Finished {
+                    ok: result == "success",
+                    error: v
+                        .get("compact_error")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                })]
             }
             _ => Vec::new(),
         }
@@ -1213,6 +1308,83 @@ mod tests {
     }
 
     // Lines below are trimmed copies of transcripts captured from the live CLIs.
+
+    /// The compaction lifecycle, from a real `/compact` run.
+    ///
+    /// Records copied from claude 2.1.212 resuming a session: the status pair,
+    /// the second `init` the session re-initialises with, the boundary marker,
+    /// and a terminal carrying no text because a compaction writes no answer.
+    #[test]
+    fn a_compaction_reports_its_phases_and_settles_cleanly() {
+        let (events, _) = run(
+            Agent::Claude,
+            &[
+                r#"{"type":"system","subtype":"init","session_id":"s","model":"claude-opus-5","slash_commands":["compact","context","code-review"],"skills":["code-review"]}"#,
+                r#"{"type":"system","subtype":"status","status":"compacting","session_id":"s"}"#,
+                r#"{"type":"system","subtype":"status","status":null,"compact_result":"success","session_id":"s"}"#,
+                r#"{"type":"system","subtype":"init","session_id":"s","slash_commands":["compact","context","code-review"],"skills":["code-review"]}"#,
+                r#"{"type":"system","subtype":"compact_boundary","session_id":"s"}"#,
+                r#"{"type":"result","subtype":"success","is_error":false,"result":"","session_id":"s","usage":{"input_tokens":0,"output_tokens":0}}"#,
+            ],
+        );
+
+        let catalogue: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Commands(commands) => Some(commands),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            catalogue.len(),
+            1,
+            "the re-init after compacting must not redraw the palette"
+        );
+        assert_eq!(catalogue[0].utilities(), vec!["compact", "context"]);
+
+        let phases: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Compaction(phase) => Some(phase.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            phases,
+            vec![
+                crate::command::Compaction::Started,
+                crate::command::Compaction::Finished {
+                    ok: true,
+                    error: None
+                },
+            ]
+        );
+    }
+
+    /// A refusal is an answer. The run completes and says why.
+    #[test]
+    fn a_refused_compaction_is_reported_not_raised() {
+        let (events, _) = run(
+            Agent::Claude,
+            &[
+                r#"{"type":"system","subtype":"init","session_id":"s","model":"claude-opus-5"}"#,
+                r#"{"type":"system","subtype":"status","status":null,"compact_result":"failed","compact_error":"Not enough messages to compact.","session_id":"s"}"#,
+                r#"{"type":"result","subtype":"success","is_error":false,"result":"","session_id":"s"}"#,
+            ],
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Event::Compaction(crate::command::Compaction::Finished { ok: false, error: Some(why) })
+                if why == "Not enough messages to compact."
+        )));
+        // An init that listed nothing is an older CLI, not an agent with no
+        // commands, so nothing is claimed about the catalogue.
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::Commands(_)))
+        );
+    }
 
     #[test]
     fn claude_stream_yields_start_thinking_text_and_terminal_facts() {

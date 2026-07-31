@@ -41,6 +41,10 @@ pub enum SessionSupport {
 /// rather than silently doing something weaker than asked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "one flag per capability; a bitfield would read worse at every call site"
+)]
 pub struct Caps {
     /// How a native session id is obtained, if at all.
     pub session: SessionSupport,
@@ -53,6 +57,12 @@ pub struct Caps {
     pub native_system: bool,
     /// How the agent accepts a JSON Schema for its answer, if at all.
     pub schema: SchemaSupport,
+    /// Whether the agent answers slash commands such as `/compact`.
+    ///
+    /// Claude publishes a catalogue and acts on them; the others read the same
+    /// text as prose and would discuss the command rather than run it, which is
+    /// worse than refusing.
+    pub commands: bool,
 }
 
 /// How an agent accepts a JSON Schema constraining its answer.
@@ -223,6 +233,10 @@ pub enum Continue {
 /// A fully resolved run request, ready to become an argv. Built by
 /// [`crate::Request::plan`]; consumed by [`Agent::argv`].
 #[derive(Debug, Clone)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each names a distinct thing the argv builder branches on"
+)]
 pub struct Plan {
     /// The binary to invoke.
     pub bin: String,
@@ -260,6 +274,12 @@ pub struct Plan {
     /// Path to the schema on disk, materialized by the runner for agents that
     /// take a file rather than an inline value.
     pub schema_file: Option<String>,
+    /// True when the prompt is a slash command rather than something to answer.
+    ///
+    /// Changes nothing about the argv — a command travels as the prompt — and
+    /// exists so [`Agent::check`] can refuse an agent that would read it as
+    /// prose.
+    pub is_command: bool,
 }
 
 /// Prompts at or above this many bytes are piped on stdin rather than placed on
@@ -463,6 +483,9 @@ impl Agent {
                 // Verified: `--json-schema <inline>` puts the conforming value
                 // in the result document's `structured_output`.
                 schema: SchemaSupport::Inline,
+                // Verified: `/compact` reports `compact_result` and the init
+                // record lists the whole catalogue.
+                commands: true,
             },
             // `codex exec --json` emits `thread_id`; continuation is the
             // `resume` subcommand and is linear (`codex fork` is TUI-only).
@@ -474,6 +497,7 @@ impl Agent {
                 // Verified: `--output-schema <FILE>` makes the final
                 // `agent_message` the conforming JSON, with no separate field.
                 schema: SchemaSupport::File,
+                commands: false,
             },
             // Verified against Copilot CLI 1.0.75: `--session-id <uuid>` both
             // mints a new session and resumes an existing one (one flag, both
@@ -486,6 +510,7 @@ impl Agent {
                 native_system: false,
                 // Copilot 1.0.75 exposes no schema flag at all.
                 schema: SchemaSupport::None,
+                commands: false,
             },
         }
     }
@@ -544,6 +569,15 @@ impl Agent {
             return Err(Error::Unsupported {
                 agent: self,
                 what: "a structured event stream",
+            });
+        }
+        // Refused rather than passed through: an agent with no command
+        // vocabulary reads `/compact` as prose and answers a question about
+        // it, which looks like the command running and silently is not.
+        if plan.is_command && !caps.commands {
+            return Err(Error::Unsupported {
+                agent: self,
+                what: "slash commands such as /compact",
             });
         }
         Ok(())
@@ -986,6 +1020,7 @@ mod tests {
             approvals: false,
             schema: None,
             schema_file: None,
+            is_command: false,
         }
     }
 
@@ -1529,6 +1564,28 @@ mod tests {
             Agent::Codex.argv(&p),
             Err(Error::Unsupported { .. })
         ));
+    }
+
+    /// The failure mode this refusal exists to prevent is a silent one: an
+    /// agent with no command vocabulary reads `/compact` as prose and answers a
+    /// question *about* compaction, which looks from the outside exactly like
+    /// the command having run.
+    #[test]
+    fn a_slash_command_is_refused_by_agents_that_only_read_prose() {
+        for agent in [Agent::Codex, Agent::Copilot] {
+            let mut p = plan(agent.bin());
+            p.is_command = true;
+            assert!(
+                matches!(agent.argv(&p), Err(Error::Unsupported { .. })),
+                "{agent} must refuse a slash command rather than send it as text"
+            );
+        }
+        let mut p = plan("claude");
+        p.is_command = true;
+        assert!(
+            Agent::Claude.argv(&p).is_ok(),
+            "Claude publishes a catalogue and acts on them"
+        );
     }
 
     /// All three expose an id, so all three can back a named session, but only

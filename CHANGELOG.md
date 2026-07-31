@@ -8,6 +8,45 @@ appear in a patch rather than inflating the version toward 1.0 on a crate still 
 shape. **Where that happens the entry says so at the top**, because a version number that
 under-signals is only acceptable if the changelog over-signals to compensate.
 
+## 0.4.1
+
+### Added
+
+- **Slash commands as values, not strings.** `Request::command(Agent::Claude, &Command::Compact
+  { instructions: None })` runs the CLI's own `/compact`, the answer to a conversation that has
+  grown too long for the model to think in. `Command::Clear` discards one, and `Command::Other`
+  reaches anything else this install offers.
+
+  A host should not build `"/compact"` by hand. The literal is indistinguishable from a user who
+  meant to type the word, and on an agent with no command vocabulary it is worse than useless: the
+  model reads it as prose and answers a question *about* compaction, which looks from the outside
+  exactly like the command having run. Codex and Copilot therefore refuse before spawning.
+
+  **A command is its own turn, not an interruption**, and this is a constructor rather than
+  something `Run::send` can deliver mid-turn for a reason found by running it. Injected into a
+  live turn, the compaction emits its own `result` record *after* the turn's own, overwriting the
+  outcome: the answer's text becomes the compaction's empty string and the turn's usage becomes
+  the compaction's zeroes. As its own run resuming the session, it produces one clean terminal.
+
+- **`Event::Compaction`**, reporting a compaction starting and settling. A conversation too short
+  to summarise is refused with `Not enough messages to compact.`, which arrives here as
+  `Finished { ok: false, error: Some(..) }` on a completed run rather than as an error: the
+  command ran and answered. The outcome's text is empty and its `num_turns` is zero, because a
+  compaction generates no answer, and neither is a failure.
+
+- **`Event::Commands`**, the agent's own command catalogue, emitted once as a run starts. Claude
+  publishes two lists at init and the split is the one a user sees: skills are capabilities
+  someone installed, utilities are part of the tool, and `Commands::utilities()` is the other half
+  of `Commands::skills`. Read from the agent rather than compiled in, because plugins, skills and
+  user commands make the set per-install: a hardcoded list would describe the developer's machine
+  instead of the user's.
+
+- **`Caps::commands`**, so a host can ask before offering the button.
+
+Verified against claude 2.1.212, including a live test that drives a real compaction end to end.
+The assertion is on the lifecycle records rather than on the run succeeding, since an agent that
+read the slash as prose would also succeed.
+
 ## 0.4.0
 
 ### Changed

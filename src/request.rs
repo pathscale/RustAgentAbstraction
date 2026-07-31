@@ -44,6 +44,9 @@ pub struct Request {
     /// Set when [`Request::session`] resolved a named session, so the runner
     /// knows to write the binding back.
     pub(crate) binding: Option<Binding>,
+    /// Set by [`Request::command`]: the prompt is a slash command, so the
+    /// capability check refuses agents that have no command vocabulary.
+    pub(crate) is_command: bool,
 }
 
 /// A named session this run is attached to.
@@ -82,7 +85,43 @@ impl Request {
             schema_file: None,
             timeout: None,
             binding: None,
+            is_command: false,
         }
+    }
+
+    /// A run that carries a slash command instead of a prompt.
+    ///
+    /// The agent's own verbs, addressed as values: `/compact` summarises a
+    /// conversation that has grown too long to think in, `/clear` discards it.
+    /// See [`crate::Command`].
+    ///
+    /// Pair it with [`Request::session`] or [`Request::resume`]. A command with
+    /// no conversation behind it has nothing to act on: `/compact` on a fresh
+    /// session is refused, and says so.
+    ///
+    /// # A command is a turn, not an interruption
+    ///
+    /// Deliberately a constructor rather than something [`crate::Run::send`]
+    /// delivers mid-turn. Verified against claude 2.1.212: a command injected
+    /// into a running turn emits its own `result` record *after* the turn's,
+    /// which overwrites the outcome — the answer's text becomes the
+    /// compaction's empty string and the turn's usage becomes the compaction's
+    /// zeroes. As its own run the same command produces one clean terminal.
+    ///
+    /// # Reading the result
+    ///
+    /// The outcome's text is empty and `num_turns` is zero, because a
+    /// compaction generates no answer. Neither is a failure, and neither is a
+    /// refusal: [`crate::Event::Compaction`] carries whether it worked, so this
+    /// wants [`crate::stream`] rather than [`crate::run`].
+    ///
+    /// Claude only. No other agent has a command vocabulary, so both refuse
+    /// before spawning.
+    #[must_use]
+    pub fn command(agent: Agent, command: &crate::Command) -> Self {
+        let mut request = Self::new(agent, command.wire());
+        request.is_command = true;
+        request
     }
 
     /// Override the binary. Defaults to the agent's own name on `PATH`.
@@ -416,6 +455,7 @@ impl Request {
             stdin_prompt: self.argv_weight() >= STDIN_THRESHOLD,
             schema: self.schema.clone(),
             schema_file: self.schema_file.clone(),
+            is_command: self.is_command,
         }
     }
 
