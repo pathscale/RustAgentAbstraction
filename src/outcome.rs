@@ -71,24 +71,32 @@ impl Usage {
 
     /// Fold one turn's usage into a session running total.
     ///
-    /// Provided because the obvious loop is wrong. Cost and generated tokens
-    /// accumulate, but the context-shaped figures are already cumulative: an
-    /// agent re-sends the whole conversation each turn and reports it, mostly
-    /// as cache reads. Summing those across turns counts the same conversation
-    /// once per turn, and the error grows with the session.
+    /// Provided because the obvious loop is wrong. Cost and tokens accumulate,
+    /// but `context_tokens` is already cumulative: an agent re-sends the whole
+    /// conversation each turn and reports its size. Summing that across turns
+    /// counts the same conversation once per turn, and the error grows with the
+    /// session.
     ///
     /// So additive fields add, and context-shaped fields take the newer value:
     ///
     /// | field | behaviour |
     /// |---|---|
     /// | `output_tokens`, `reasoning_tokens`, `input_tokens` | summed |
+    /// | `cache_read_tokens`, `cache_write_tokens` | summed |
     /// | `cost_usd`, `premium_requests`, `duration_ms`, `api_duration_ms` | summed |
-    /// | `context_tokens`, `cache_read_tokens`, `cache_write_tokens` | latest |
-    /// | `context_window`, `max_output_tokens` | latest |
+    /// | `context_tokens`, `context_window`, `max_output_tokens` | latest |
     /// | `ai_credits_nano` | latest, being a session total already |
     ///
     /// `input_tokens` sums because it is the uncached remainder, which is new
     /// work each turn.
+    ///
+    /// The cache figures sum for the same reason, which this once got wrong by
+    /// filing them with the context. They are not the conversation's size: a
+    /// turn's terminal record already sums the cache reads of every call in
+    /// that turn, so 100000 and 102000 arrive as 202000, and every one of those
+    /// reads is billed. Taking the latest reported one turn's cache traffic as
+    /// the whole session's, which understates a long session badly and leaves a
+    /// host's token total unable to explain its own cost figure.
     pub fn accumulate(&mut self, turn: &Usage) {
         fn add(total: &mut Option<u64>, turn: Option<u64>) {
             if let Some(value) = turn {
@@ -103,6 +111,8 @@ impl Usage {
 
         add(&mut self.input_tokens, turn.input_tokens);
         add(&mut self.output_tokens, turn.output_tokens);
+        add(&mut self.cache_read_tokens, turn.cache_read_tokens);
+        add(&mut self.cache_write_tokens, turn.cache_write_tokens);
         add(&mut self.reasoning_tokens, turn.reasoning_tokens);
         add(&mut self.premium_requests, turn.premium_requests);
         add(&mut self.duration_ms, turn.duration_ms);
@@ -112,8 +122,6 @@ impl Usage {
         }
 
         latest(&mut self.context_tokens, turn.context_tokens);
-        latest(&mut self.cache_read_tokens, turn.cache_read_tokens);
-        latest(&mut self.cache_write_tokens, turn.cache_write_tokens);
         latest(&mut self.context_window, turn.context_window);
         latest(&mut self.max_output_tokens, turn.max_output_tokens);
         latest(&mut self.ai_credits_nano, turn.ai_credits_nano);
@@ -242,9 +250,11 @@ impl Outcome {
 mod tests {
     use super::*;
 
-    /// The trap `accumulate` exists to avoid. An agent re-sends the whole
-    /// conversation each turn and reports it, mostly as cache reads, so summing
-    /// the context figures counts the same conversation once per turn.
+    /// The trap `accumulate` exists to avoid, and the one it once fell into
+    /// next door. `context_tokens` is the conversation's size as the agent last
+    /// saw it, so summing it counts the same conversation once per turn. The
+    /// cache figures look alike and are not: each turn's is what that turn's
+    /// calls actually read, and every read is billed.
     ///
     /// Numbers from two real Codex turns on one thread.
     #[test]
@@ -277,7 +287,15 @@ mod tests {
             Some(30_703),
             "context is already cumulative and must not be summed"
         );
-        assert_eq!(session.cache_read_tokens, Some(28_160));
+        // Billed traffic, not a size: the session read 41,216 tokens out of
+        // cache across the two turns and was charged for all of them. Taking
+        // the latest would report the second turn's 28,160 as the whole
+        // session's, and no token total built on it could explain its cost.
+        assert_eq!(
+            session.cache_read_tokens,
+            Some(41_216),
+            "cache reads are billed per call and accumulate"
+        );
     }
 
     #[test]
