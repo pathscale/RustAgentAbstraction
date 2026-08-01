@@ -63,6 +63,10 @@ pub struct Caps {
     /// text as prose and would discuss the command rather than run it, which is
     /// worse than refusing.
     pub commands: bool,
+    /// Whether another user message can be delivered while a turn is running.
+    pub live_follow_up: bool,
+    /// Whether gated tool calls can be routed to the caller for a decision.
+    pub approvals: bool,
 }
 
 /// How an agent accepts a JSON Schema constraining its answer.
@@ -486,6 +490,8 @@ impl Agent {
                 // Verified: `/compact` reports `compact_result` and the init
                 // record lists the whole catalogue.
                 commands: true,
+                live_follow_up: true,
+                approvals: true,
             },
             // `codex exec --json` emits `thread_id`; continuation is the
             // `resume` subcommand and is linear (`codex fork` is TUI-only).
@@ -498,6 +504,8 @@ impl Agent {
                 // `agent_message` the conforming JSON, with no separate field.
                 schema: SchemaSupport::File,
                 commands: false,
+                live_follow_up: false,
+                approvals: false,
             },
             // Verified against Copilot CLI 1.0.75: `--session-id <uuid>` both
             // mints a new session and resumes an existing one (one flag, both
@@ -511,6 +519,8 @@ impl Agent {
                 // Copilot 1.0.75 exposes no schema flag at all.
                 schema: SchemaSupport::None,
                 commands: false,
+                live_follow_up: false,
+                approvals: false,
             },
         }
     }
@@ -610,7 +620,8 @@ impl Agent {
         // to run headlessly at all and gates only through `--deny-tool`. A run
         // that quietly never asked would be the worst outcome here, since a
         // caller would read silence as "nothing needed approval".
-        if plan.approvals && self != Agent::Claude {
+        let caps = self.caps();
+        if plan.approvals && !caps.approvals {
             return Err(Error::Unsupported {
                 agent: self,
                 what: "routing tool approvals to the caller",
@@ -619,7 +630,7 @@ impl Agent {
         // Verified against codex-cli 0.145.0 and Copilot CLI 1.0.75: neither
         // takes a structured message stream on stdin, so neither can be sent a
         // second message once a turn is under way.
-        if (plan.duplex || plan.approvals) && self != Agent::Claude {
+        if plan.duplex && !caps.live_follow_up {
             return Err(Error::Unsupported {
                 agent: self,
                 what: "sending a follow-up message while a turn is running",
@@ -1026,6 +1037,19 @@ mod tests {
 
     fn argv(agent: Agent, plan: &Plan) -> Vec<String> {
         agent.argv(plan).expect("plan is supported")
+    }
+
+    #[test]
+    fn interactive_capabilities_match_the_supported_request_paths() {
+        let claude = Agent::Claude.caps();
+        assert!(claude.live_follow_up);
+        assert!(claude.approvals);
+
+        for agent in [Agent::Codex, Agent::Copilot] {
+            let caps = agent.caps();
+            assert!(!caps.live_follow_up, "{agent} cannot take live follow-ups");
+            assert!(!caps.approvals, "{agent} has no headless approval channel");
+        }
     }
 
     fn pos(a: &[String], needle: &str) -> Option<usize> {
