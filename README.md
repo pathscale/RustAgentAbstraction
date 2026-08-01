@@ -301,9 +301,11 @@ if let Err(e) = run.send(&text).await {
 }
 ```
 
-`interactive` is Claude only. Neither other agent reads a structured message stream on
-stdin, so both return `Error::Unsupported` before spawning. `approvals` implies
-`interactive`, since both ride the same open channel.
+`Caps::live_follow_up` and `Caps::approvals` let a host decide whether to offer these
+controls before building a request. Both are Claude only today. Neither other agent reads
+a structured message stream on stdin, so requesting either capability returns
+`Error::Unsupported` before spawning. `approvals` implies `interactive`, since both ride
+the same open channel.
 
 ## Slash commands
 
