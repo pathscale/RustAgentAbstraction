@@ -43,6 +43,13 @@ pub enum Event {
     Thinking(String),
     /// Assistant text as it arrives.
     Text(String),
+    /// One assistant message ended inside a turn that may produce another.
+    ///
+    /// This carries no text. It lets a streaming host preserve authored
+    /// message boundaries without inventing whitespace between token deltas.
+    /// Codex app-server exposes this boundary explicitly; the other transports
+    /// do not currently report an equivalent event.
+    MessageBoundary,
     /// The agent invoked a tool.
     ToolCall {
         /// Correlates with the matching [`Event::ToolResult`], when the agent
@@ -242,6 +249,7 @@ fn bound_value(value: Value) -> Value {
 fn enforce_bounds(event: Event) -> Event {
     match event {
         Event::Text(text) => Event::Text(bound_text(text)),
+        Event::MessageBoundary => Event::MessageBoundary,
         Event::Thinking(text) => Event::Thinking(bound_text(text)),
         // An unusable id is dropped rather than shortened, so the event still
         // reports what the agent did while making the loss of correlation

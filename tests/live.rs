@@ -574,6 +574,43 @@ async fn codex_app_server_accepts_a_live_steer() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A single declared cwd is the common project shape in `AgencyZero`. It must be
+/// writable without adding the same directory a second time as an extra root.
+#[tokio::test]
+#[ignore = "spawns a real agent and consumes quota"]
+async fn codex_app_server_can_write_inside_its_cwd() {
+    if !available(Agent::Codex) {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!(
+        "agent-abstraction-codex-writable-cwd-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let target = dir.join("written-inside-cwd.txt");
+    let _ = std::fs::remove_file(&target);
+
+    let request = Request::new(
+        Agent::Codex,
+        "Create the file written-inside-cwd.txt in the current working directory. \
+         Its exact contents must be: writable",
+    )
+    .cwd(&dir)
+    .permission(Permission::Auto)
+    .interactive()
+    .timeout(Duration::from_secs(180));
+
+    let outcome = run(&request)
+        .await
+        .expect("Codex should write inside its declared cwd");
+    assert!(outcome.is_ok(), "the turn did not complete: {outcome:?}");
+    assert_eq!(
+        std::fs::read_to_string(&target).expect("Codex did not create the file"),
+        "writable"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A Codex sandbox escape is a server request the host can deny mid-turn.
 #[tokio::test]
 #[ignore = "spawns a real agent and consumes quota"]

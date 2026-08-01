@@ -117,7 +117,12 @@ impl Protocol {
     fn start_turn(&self, thread_id: &str) -> String {
         let plan = self.request.plan();
         let roots = roots(&self.request);
-        let writable: Vec<String> = roots.iter().skip(1).cloned().collect();
+        // app-server does not implicitly add `cwd` to a turn's writable roots.
+        // Verified against codex-cli 0.145.0 on 2026-08-02: omitting the first
+        // root leaves a one-directory request able to read its cwd but unable
+        // to write there. Every declared root therefore belongs in both the
+        // runtime scope and the workspace-write sandbox policy.
+        let writable = roots.clone();
         let sandbox = match plan.permission {
             Permission::ReadOnly | Permission::Plan => {
                 json!({"type": "readOnly", "networkAccess": false})
@@ -230,6 +235,7 @@ impl Protocol {
                         {
                             self.terminal.text = text.to_string();
                         }
+                        step.events.push(Event::MessageBoundary);
                     } else if let Some(event) = tool_result(item) {
                         step.events.push(event);
                     }
@@ -536,7 +542,7 @@ mod tests {
         assert_eq!(turn["params"]["sandboxPolicy"]["type"], "workspaceWrite");
         assert_eq!(
             turn["params"]["sandboxPolicy"]["writableRoots"],
-            json!(["/repo"])
+            json!(["/workspace", "/repo"])
         );
     }
 
@@ -570,6 +576,21 @@ mod tests {
         assert_eq!(usage.input_tokens, Some(40));
         assert_eq!(usage.context_tokens, Some(100));
         assert_eq!(usage.context_window, Some(258_400));
+    }
+
+    #[test]
+    fn completed_agent_messages_preserve_their_boundary() {
+        let mut protocol = Protocol::new(request());
+        let step = protocol.push(&json!({
+            "method": "item/completed",
+            "params": {"item": {
+                "type": "agentMessage",
+                "phase": "commentary",
+                "text": "I checked it."
+            }}
+        }));
+
+        assert_eq!(step.events, vec![Event::MessageBoundary]);
     }
 
     #[test]

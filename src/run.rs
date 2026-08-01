@@ -1043,6 +1043,20 @@ async fn drive_codex_app_server(
     while !protocol.finished {
         tokio::select! {
             biased;
+            // User steering and approval answers outrank the agent's output.
+            // app-server can keep stdout continuously ready with reasoning and
+            // text deltas; reading it first in a biased select could starve a
+            // correction precisely while Codex was busiest.
+            control = controls.recv() => {
+                let Some(control) = control else {
+                    continue;
+                };
+                pending.push_back(control);
+                flush_codex_controls(&mut protocol, &mut pending, &mut stdin, &bin).await?;
+                stdin.flush().await.map_err(|source| Error::Spawn {
+                    bin: bin.clone(), source
+                })?;
+            }
             record = read_bounded_line(&mut reader, &mut line) => {
                 if record.map_err(|source| Error::Spawn { bin: bin.clone(), source })?.is_some() {
                     append_capped(&mut raw, &line);
@@ -1079,16 +1093,6 @@ async fn drive_codex_app_server(
                     });
                     protocol.finished = true;
                 }
-            }
-            control = controls.recv() => {
-                let Some(control) = control else {
-                    continue;
-                };
-                pending.push_back(control);
-                flush_codex_controls(&mut protocol, &mut pending, &mut stdin, &bin).await?;
-                stdin.flush().await.map_err(|source| Error::Spawn {
-                    bin: bin.clone(), source
-                })?;
             }
             () = &mut deadline => {
                 let partial = protocol.terminal.text.clone();
