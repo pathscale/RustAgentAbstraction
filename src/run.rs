@@ -923,17 +923,54 @@ fn classify_run(
     // Checked before quota and before a plain failure: a login problem is the
     // most specific reading of the output, and the only one a user can act on
     // directly.
-    for source in [terminal.text.as_str(), stderr, stdout] {
-        if looks_unauthenticated(source) {
-            return Error::NotAuthenticated {
-                agent,
-                bin: bin.to_string(),
-                message: first_meaningful_line(source).unwrap_or_default(),
-                hint: agent.login_hint(),
-            };
+    let named = |source: &str| Error::NotAuthenticated {
+        agent,
+        bin: bin.to_string(),
+        message: first_meaningful_line(source).unwrap_or_default(),
+        hint: agent.login_hint(),
+    };
+
+    // The CLI's own channel, read whole: Copilot's notice runs to five lines.
+    if looks_unauthenticated(stderr) {
+        return named(stderr);
+    }
+
+    /*
+     * The agent's own answer, read only at the top.
+     *
+     * An agent with no credentials has nothing to say but the notice, so the
+     * phrase is in its opening lines and the whole answer is those lines.
+     * An agent that *writes about* logging in buries the same words in
+     * paragraphs, and reading the whole answer counted that as a login
+     * failure: a reply explaining why a publish had been refused mentioned
+     * not being authenticated, so the run was reported as an auth error, the
+     * hint told the user to run `/login`, and the answer itself was replaced
+     * by the report. An agent's prose is not a diagnosis of the agent.
+     */
+    for source in [terminal.text.as_str(), stdout] {
+        let opening = opening_lines(source, OPENING_LINES);
+        if looks_unauthenticated(&opening) {
+            return named(&opening);
         }
     }
     classify(agent, bin, code, stderr, stdout, terminal)
+}
+
+/// How far into an agent's own output a diagnosis may be read from.
+///
+/// Three rather than one, because a CLI is entitled to a banner line before it
+/// says what is wrong, and three rather than more, because past that an agent
+/// is answering the question it was asked.
+const OPENING_LINES: usize = 3;
+
+/// The first `count` non-blank lines, trimmed and rejoined.
+fn opening_lines(text: &str, count: usize) -> String {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .take(count)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Whether text is an agent saying it has no usable credentials.
@@ -1448,6 +1485,53 @@ mod tests {
                 panic!("{agent}: expected NotAuthenticated, got {err:?}")
             };
             assert!(hint.contains(expected), "{agent}: {hint}");
+        }
+    }
+
+    /// Reported from the field: a run was stopped, the user was told `claude`
+    /// was not authenticated, and the answer was replaced by a login hint. The
+    /// agent had been explaining why a `cargo publish` was refused, and its own
+    /// prose contained the phrases this classifier looks for. An answer is not
+    /// a diagnosis of the thing that produced it.
+    #[test]
+    fn an_agent_writing_about_authentication_is_not_an_auth_failure() {
+        let answer = "The publish was refused before it ran.\n\n\
+                      What denied it was the auto mode classifier, not a missing \
+                      credential.\n\
+                      In auto mode there is no human to receive the prompt, so an \
+                      ask collapses into a refusal.\n\
+                      The message said the CLI was not authenticated, which is \
+                      unrelated: an unauthorized upload is exactly what the rule \
+                      is there to stop.";
+        let terminal = Terminal {
+            text: answer.into(),
+            ..Terminal::default()
+        };
+        let err = classify_run(Agent::Claude, "claude", 1, "", answer, &terminal);
+        assert!(
+            !err.is_auth_failure(),
+            "an answer that discusses auth was read as an auth failure: {err:?}"
+        );
+    }
+
+    /// The other half of the same rule: the notice itself still has to be
+    /// caught, and it arrives as the agent's entire answer.
+    #[test]
+    fn the_notice_is_still_caught_when_it_is_the_whole_answer() {
+        for text in [
+            "Not logged in · Please run /login",
+            // A banner first, which is why the opening is three lines deep.
+            "claude 2.1.212\n\nNot logged in · Please run /login",
+        ] {
+            let terminal = Terminal {
+                text: text.into(),
+                ..Terminal::default()
+            };
+            let err = classify_run(Agent::Claude, "claude", 0, "", "", &terminal);
+            assert!(
+                err.is_auth_failure(),
+                "{text:?} was not read as auth: {err:?}"
+            );
         }
     }
 
