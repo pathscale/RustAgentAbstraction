@@ -241,6 +241,44 @@ async fn a_bogus_effort_is_reported_not_ignored() {
     );
 }
 
+/// The false-termination regression, which only the real CLI can prove.
+///
+/// An agent asked about rate limits and logging in answers in exactly the
+/// vocabulary that describes being rate limited and logged out, and the run
+/// used to classify itself from its own answer: the turn finished, the answer
+/// was discarded, and the caller was handed a banner quoting one of the
+/// answer's own sentences back as though a provider had written it.
+///
+/// The prompt asks for the trigger phrases deliberately. A pass is an ordinary
+/// successful outcome whose text contains them.
+#[tokio::test]
+#[ignore = "spawns a real agent"]
+async fn an_answer_about_limits_and_login_is_not_a_failed_run() {
+    if !available(Agent::Claude) {
+        return;
+    }
+    let prompt = "In three sentences of plain prose, explain the difference between \
+                  a provider rate limit and an authentication failure. Use the exact \
+                  phrases \"rate limit\", \"usage limit\", \"not authenticated\" and \
+                  \"please run /login\" somewhere in your answer. Do not use a list.";
+    let request = Request::new(Agent::Claude, prompt)
+        .permission(Permission::ReadOnly)
+        .timeout(Duration::from_secs(180));
+    let outcome = run(&request)
+        .await
+        .expect("an answer about limits and login must not fail the run");
+    let text = outcome.text.to_lowercase();
+    assert!(
+        text.contains("rate limit") || text.contains("usage limit"),
+        "the model did not use the trigger wording, so this proved nothing: {}",
+        outcome.text
+    );
+    assert!(
+        !outcome.text.trim().is_empty(),
+        "the answer survived classification but arrived empty"
+    );
+}
+
 /// Cheap and free of tokens: `codex app-server` answers from the account, not
 /// the model. Pins the shape a quota panel depends on.
 #[tokio::test]

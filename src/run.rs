@@ -847,20 +847,43 @@ async fn drive(
     // Read from stderr and the agent's own prose rather than the raw stream, for
     // the reason `classify` does the same with quota wording: a phrase hunted
     // through structured output matches ids and field names, not statements.
-    let unauthenticated = looks_unauthenticated(&terminal.text) || looks_unauthenticated(&stderr);
+    //
+    // The answer is read at its opening only, by the same rule and the same
+    // helper `classify_run` uses. This gate used to read `terminal.text` whole
+    // while the classifier it guards read three lines, so the two could
+    // disagree: a healthy answer that merely discussed logging in opened the
+    // error path, no classifier would name it, and the turn fell out the far
+    // end as `Error::Failed` with exit code 0 and nothing to report. One rule,
+    // one helper, so that disagreement cannot exist.
+    let unauthenticated =
+        answer_reports_no_credentials(&terminal.text) || looks_unauthenticated(&stderr);
     // The agent saying its turn failed is as much a failure as a non-zero exit,
     // and Claude reports an unknown model exactly this way: exit 0, `is_error`
     // true, and the explanation where the answer would be.
     let turn_failed = terminal.stop == Stop::Error;
     if exit_code != 0 || quota_blocked || unauthenticated || turn_failed {
-        return Err(classify_run(
-            request.agent,
-            &bin,
-            exit_code,
-            &stderr,
-            &raw,
-            &terminal,
-        ));
+        let error = classify_run(request.agent, &bin, exit_code, &stderr, &raw, &terminal);
+        /*
+         * The backstop, and the reason a false positive can no longer cost an
+         * answer.
+         *
+         * Everything above is a heuristic reading of text the agent wrote, and
+         * a heuristic will be wrong eventually: these phrases are ordinary
+         * English, and an agent asked about rate limits or logging in answers
+         * in exactly the vocabulary that describes being rate limited or
+         * logged out. What must never follow from being wrong is discarding a
+         * finished answer.
+         *
+         * So a run whose process exited cleanly, whose terminal record says
+         * the turn completed, and which carries no parsed quota block is only
+         * ever failed by a classifier that can *name* the failure. A generic
+         * `Failed` on that run is the classifiers disagreeing with the gate,
+         * not evidence, and the answer stands.
+         */
+        let exited_clean = exit_code == 0 && !quota_blocked && !turn_failed;
+        if !exited_clean || names_a_failure(&error) {
+            return Err(error);
+        }
     }
 
     // A fork lands on a *new* id the agent only reveals at the end, so the name
@@ -948,9 +971,8 @@ fn classify_run(
      * by the report. An agent's prose is not a diagnosis of the agent.
      */
     for source in [terminal.text.as_str(), stdout] {
-        let opening = opening_lines(source, OPENING_LINES);
-        if looks_unauthenticated(&opening) {
-            return named(&opening);
+        if answer_reports_no_credentials(source) {
+            return named(&opening_lines(source, OPENING_LINES));
         }
     }
     classify(agent, bin, code, stderr, stdout, terminal)
@@ -978,6 +1000,38 @@ fn opening_lines(text: &str, count: usize) -> String {
         .take(count)
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Whether an agent's own answer is a credentials notice rather than an answer
+/// that happens to discuss credentials.
+///
+/// The single rule for reading an answer as a diagnosis of the run, shared by
+/// the gate in `run` and by `classify_run`. They read the same text for the
+/// same phrases and used to apply different rules to it: whole text at the
+/// gate, opening lines in the classifier. A healthy answer about logging in
+/// satisfied one and not the other, which opened the error path for a run no
+/// classifier would then name.
+///
+/// Short *and* at the top, which is the same rule the quota branch applies,
+/// and it takes both halves. Lines alone were not enough: asked to explain the
+/// difference between a rate limit and an auth failure, a live Claude answered
+/// in one 900-character paragraph, so "the first three lines" was the entire
+/// essay and the phrase inside it convicted the run. Prose wraps at the
+/// window, not at a newline, so length is what distinguishes a notice from an
+/// answer. A real notice is a sentence: `Not logged in, please run /login`.
+fn answer_reports_no_credentials(text: &str) -> bool {
+    let opening = opening_lines(text, OPENING_LINES);
+    opening.len() <= NOTICE_MAX && looks_unauthenticated(&opening)
+}
+
+/// Whether a classifier named the failure rather than falling through to the
+/// generic one.
+///
+/// `Error::Failed` is what `classify` returns when nothing more specific fits.
+/// On a run that exited cleanly that is not a diagnosis, it is the absence of
+/// one, and an answer must not be discarded for it.
+fn names_a_failure(error: &Error) -> bool {
+    !matches!(error, Error::Failed { .. })
 }
 
 /// Whether text is an agent saying it has no usable credentials.
@@ -1569,6 +1623,68 @@ mod tests {
                 "{text:?} was not read as auth: {err:?}"
             );
         }
+    }
+
+    /// The gate into the error path and the classifier behind it must read an
+    /// answer by the same rule.
+    ///
+    /// Shaped after the report from the field: a healthy, finished turn about
+    /// a stalled crate release, which mentions an auth error in a later
+    /// paragraph because that was the subject. Read whole, as the gate used
+    /// to, the phrase convicts the run; read at its opening, as everything
+    /// now does, the answer is an answer. An agent with no credentials leads
+    /// with the notice, which is what makes the opening the honest place to
+    /// look.
+    #[test]
+    fn an_answer_mentioning_auth_late_does_not_open_the_error_path() {
+        let answer = "So the duplicate pastes cost nothing.\n\
+                      The publish chain is done: 0.4.1 and 0.4.2 are both on the \
+                      registry and tagged.\n\
+                      Everything downstream already consumes them.\n\
+                      The only thing still open anywhere is the crate PR, \
+                      `pathscale/RustAgentAbstraction#18`, which is the auth error \
+                      that ate your reply: the run was reported as `not \
+                      authenticated` and the hint sent you to /login, while the \
+                      credentials were fine the whole time.";
+        assert!(
+            !answer_reports_no_credentials(answer),
+            "an answer discussing auth opened the error path"
+        );
+        // And the notice itself, which is what the rule exists to catch.
+        assert!(answer_reports_no_credentials(
+            "Not logged in \u{b7} Please run /login"
+        ));
+    }
+
+    /// The backstop, which is what makes a false positive survivable at all.
+    ///
+    /// Every phrase check here is a heuristic over ordinary English and will
+    /// be wrong eventually. When it is, the run reaches a classifier that
+    /// cannot name any failure and returns the generic one. On a process that
+    /// exited cleanly with a completed turn, that verdict is the absence of
+    /// evidence rather than evidence, and the finished answer must stand.
+    #[test]
+    fn a_generic_failure_does_not_name_a_failure() {
+        let unnamed = Error::Failed {
+            bin: "claude".into(),
+            code: 0,
+            stderr: String::new(),
+        };
+        assert!(
+            !names_a_failure(&unnamed),
+            "a generic failure was treated as a diagnosis, which discards the answer"
+        );
+        // Everything a classifier can actually name still stands on its own.
+        assert!(names_a_failure(&Error::RateLimited {
+            bin: "claude".into(),
+            message: "usage limit reached".into(),
+        }));
+        assert!(names_a_failure(&Error::NotAuthenticated {
+            agent: Agent::Claude,
+            bin: "claude".into(),
+            message: "Not logged in".into(),
+            hint: Agent::Claude.login_hint(),
+        }));
     }
 
     /// Reported from the field: a finished, successful turn that happened to be
