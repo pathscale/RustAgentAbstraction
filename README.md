@@ -302,10 +302,10 @@ if let Err(e) = run.send(&text).await {
 ```
 
 `Caps::live_follow_up` and `Caps::approvals` let a host decide whether to offer these
-controls before building a request. Both are Claude only today. Neither other agent reads
-a structured message stream on stdin, so requesting either capability returns
-`Error::Unsupported` before spawning. `approvals` implies `interactive`, since both ride
-the same open channel.
+controls before building a request. Claude and Codex support both; interactive Codex runs
+use app-server while ordinary Codex runs keep using `exec`. Copilot returns
+`Error::Unsupported` before spawning. `approvals` implies `interactive`, since both need
+the same open control channel.
 
 ## Slash commands
 
@@ -390,7 +390,7 @@ Four things are refused up front rather than met as a hang or a silence:
 
 | combination | why |
 |---|---|
-| Codex or Copilot | neither has a headless approval channel. Codex's sandbox mode is decided before the run; Copilot needs `--allow-all-tools` to run headlessly at all |
+| Copilot | it has no headless approval channel and needs `--allow-all-tools` to run headlessly at all |
 | `run()` instead of `stream()` | `run` discards events, so nobody could answer |
 | `Permission::ReadOnly` | it removes the mutating tools outright, so there is nothing left to be asked about, and a caller would never be asked |
 | `respond` on a run that did not opt in | there is no channel to answer on |
@@ -419,6 +419,18 @@ settings in place.
 | `Bypass` | `bypassPermissions` | `--dangerously-bypass-approvals-and-sandbox` | `--allow-all-paths` |
 
 The default is `ReadOnly`. Widen it explicitly.
+
+Use `Request::cwd` for the primary workspace and repeat `Request::add_dir` for repositories
+or folders the agent also needs to edit. The mapping stays provider-neutral: Claude and
+ordinary Codex runs receive `--add-dir`, while interactive Codex runs receive the same paths
+as app-server runtime and workspace-write roots.
+
+```rust
+let request = Request::new(agent, prompt)
+    .cwd("/work/task")
+    .add_dir("/work/repository")
+    .permission(Permission::Auto);
+```
 
 **What this does not cover.** These postures constrain each CLI's *built-in* tools: its
 shell, its file writes, its sandbox. They do **not** constrain MCP servers, plugins or

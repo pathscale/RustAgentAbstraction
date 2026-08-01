@@ -9,6 +9,7 @@
 //! the moment the other filled its pipe buffer, which for a chatty agent is a
 //! matter of seconds.
 
+use std::collections::VecDeque;
 use std::process::Stdio;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
@@ -86,6 +87,19 @@ const APPROVAL_BUFFER: usize = 8;
 /// that a consumer which stops reading does not grow without bound.
 const EVENT_BUFFER: usize = 256;
 
+/// A host action travelling back to an interactive agent.
+///
+/// Claude and Codex encode these differently, so the public handle preserves
+/// the intent and lets the selected transport serialize it at the boundary.
+#[derive(Debug)]
+enum Control {
+    Message(String),
+    Approval {
+        id: String,
+        decision: crate::Decision,
+    },
+}
+
 /// A run in progress.
 ///
 /// Yields events through [`Run::recv`] and settles into an [`Outcome`] through
@@ -121,7 +135,7 @@ pub struct Run {
     /// decisions share one channel because they share one stdin. `None` unless
     /// the request opened it, which is what lets [`Run::send`] and
     /// [`Run::respond`] refuse rather than silently do nothing.
-    to_agent: Option<mpsc::Sender<String>>,
+    to_agent: Option<mpsc::Sender<Control>>,
     /// Dropping or firing this asks the driver to tear down in order. Held as
     /// an `Option` so `detach` can discard it without signalling.
     cancel: Option<tokio::sync::oneshot::Sender<()>>,
@@ -145,7 +159,8 @@ impl Run {
     ///
     /// The agent takes it at its **next step boundary**, not mid-token, so an
     /// answer already being written finishes first and a long tool-using task
-    /// changes course at its next step. Verified against claude 2.1.212.
+    /// changes course at its next step. Verified against claude 2.1.212 and
+    /// codex-cli 0.145.0.
     ///
     /// # Ordering, and why there is no acknowledgement
     ///
@@ -170,7 +185,7 @@ impl Run {
             });
         };
         channel
-            .send(crate::approval::user_message(message))
+            .send(Control::Message(message.to_string()))
             .await
             .map_err(|_| Error::Cancelled {
                 bin: self.argv.first().cloned().unwrap_or_default(),
@@ -200,7 +215,10 @@ impl Run {
             });
         };
         channel
-            .send(decision.wire(id))
+            .send(Control::Approval {
+                id: id.to_string(),
+                decision: decision.clone(),
+            })
             .await
             .map_err(|_| Error::Cancelled {
                 bin: self.argv.first().cloned().unwrap_or_default(),
@@ -383,13 +401,23 @@ pub async fn run(request: &Request) -> Result<Outcome> {
 /// # Errors
 /// [`Error::NotInstalled`] if the binary is missing, [`Error::Unsupported`] if
 /// the agent cannot honour the request, or [`Error::Spawn`] on an OS failure.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one spawn boundary keeps command posture, pipes, process group, and driver selection together"
+)]
 pub fn stream(request: &Request) -> Result<Run> {
     // `tokio::spawn` panics outside a runtime. A fallible signature must not
     // hide that, so the context is checked and reported as an ordinary error.
     let runtime = tokio::runtime::Handle::try_current().map_err(|_| Error::NoRuntime)?;
 
-    // Written before the argv is built, because the argv has to name it.
+    let initial_plan = request.plan();
+    let codex_app_server =
+        request.agent == crate::Agent::Codex && (initial_plan.duplex || initial_plan.approvals);
+
+    // Written before the argv is built, because the argv has to name it. The
+    // app-server protocol accepts the schema inline instead.
     let schema_file = match (&request.schema, request.agent.caps().schema) {
+        (Some(_), _) if codex_app_server => None,
         (Some(schema), crate::agent::SchemaSupport::File) => {
             Some(SchemaFile::write(schema).map_err(|source| Error::Spawn {
                 bin: request.agent.bin().to_string(),
@@ -486,7 +514,7 @@ pub fn stream(request: &Request) -> Result<Run> {
     // Only created for an approvals run, so `respond` can tell "no channel" from
     // "channel closed" and refuse the first rather than hanging on it.
     let (decisions_tx, decisions_rx) = if plan.duplex || plan.approvals {
-        let (tx, rx) = mpsc::channel::<String>(APPROVAL_BUFFER);
+        let (tx, rx) = mpsc::channel::<Control>(APPROVAL_BUFFER);
         (Some(tx), Some(rx))
     } else {
         (None, None)
@@ -498,7 +526,12 @@ pub fn stream(request: &Request) -> Result<Run> {
     let task = runtime.spawn(async move {
         // Moved in so the file outlives the run and is removed with it.
         let _schema_file = schema_file;
-        drive(child, request, tx, cancel_rx, reaped_for_task, decisions_rx).await
+        if codex_app_server {
+            drive_codex_app_server(child, request, tx, cancel_rx, reaped_for_task, decisions_rx)
+                .await
+        } else {
+            drive(child, request, tx, cancel_rx, reaped_for_task, decisions_rx).await
+        }
     });
     Ok(Run {
         events: rx,
@@ -597,7 +630,7 @@ async fn drive(
     events: mpsc::Sender<Event>,
     cancel: tokio::sync::oneshot::Receiver<()>,
     reaped: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    decisions: Option<mpsc::Receiver<String>>,
+    decisions: Option<mpsc::Receiver<Control>>,
 ) -> Result<Outcome> {
     // From here on the child is owned by a guard, so every exit path from this
     // task, including an abort, takes the process group with it.
@@ -641,7 +674,13 @@ async fn drive(
                 loop {
                     tokio::select! {
                         reply = rx.recv() => {
-                            let Some(reply) = reply else { break };
+                            let Some(control) = reply else { break };
+                            let reply = match control {
+                                Control::Message(message) => {
+                                    crate::approval::user_message(&message)
+                                }
+                                Control::Approval { id, decision } => decision.wire(&id),
+                            };
                             if stdin.write_all(reply.as_bytes()).await.is_err() {
                                 break;
                             }
@@ -917,6 +956,242 @@ async fn drive(
         // Prose is never reinterpreted as data.
         structured,
     })
+}
+
+/// Drive one interactive Codex turn over app-server's JSON-RPC transport.
+///
+/// Unlike `codex exec`, app-server remains alive after a turn completes. This
+/// driver therefore treats `turn/completed` as the terminal record, closes the
+/// protocol pipe, and reaps the service process itself.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one select loop owns the protocol, control channel, deadline, and child lifecycle"
+)]
+async fn drive_codex_app_server(
+    child: Child,
+    request: Request,
+    events: mpsc::Sender<Event>,
+    cancel: tokio::sync::oneshot::Receiver<()>,
+    reaped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    controls: Option<mpsc::Receiver<Control>>,
+) -> Result<Outcome> {
+    let mut child = ChildGuard { child, armed: true };
+    let plan = request.plan();
+    let bin = plan.bin.clone();
+    let Some(mut stdin) = child.child.stdin.take() else {
+        return Err(Error::Spawn {
+            bin,
+            source: std::io::Error::other("stdin was not piped for Codex app-server"),
+        });
+    };
+    let Some(stdout) = child.child.stdout.take() else {
+        return Err(Error::Spawn {
+            bin,
+            source: std::io::Error::other("stdout was not piped for Codex app-server"),
+        });
+    };
+    let Some(mut controls) = controls else {
+        return Err(Error::Spawn {
+            bin,
+            source: std::io::Error::other("Codex app-server has no host control channel"),
+        });
+    };
+
+    let stderr = child.child.stderr.take();
+    let stderr_task = tokio::spawn(async move {
+        let mut buf = String::new();
+        if let Some(handle) = stderr {
+            let mut reader = BufReader::new(handle);
+            let mut line = String::new();
+            while let Ok(Some(_)) = read_bounded_line(&mut reader, &mut line).await {
+                append_capped(&mut buf, &line);
+            }
+        }
+        buf
+    });
+
+    let mut protocol = crate::codex_app_server::Protocol::new(request.clone());
+    for opening in protocol.opening() {
+        stdin
+            .write_all(opening.as_bytes())
+            .await
+            .map_err(|source| Error::Spawn {
+                bin: bin.clone(),
+                source,
+            })?;
+    }
+    stdin.flush().await.map_err(|source| Error::Spawn {
+        bin: bin.clone(),
+        source,
+    })?;
+
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+    let mut raw = String::new();
+    let mut pending = VecDeque::new();
+    let mut bound = false;
+    let mut persist_result: Result<()> = Ok(());
+    let deadline = async {
+        match request.timeout {
+            Some(limit) => tokio::time::sleep(limit).await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(deadline);
+    tokio::pin!(cancel);
+
+    while !protocol.finished {
+        tokio::select! {
+            biased;
+            record = read_bounded_line(&mut reader, &mut line) => {
+                if record.map_err(|source| Error::Spawn { bin: bin.clone(), source })?.is_some() {
+                    append_capped(&mut raw, &line);
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
+                        let step = protocol.push(&value);
+                        for event in step.events {
+                            if let Event::Started { session, .. } = &event
+                                && !bound
+                            {
+                                bound = true;
+                                persist_result = persist_session(&request, session);
+                            }
+                            let _ = events.send(event).await;
+                        }
+                        for write in step.writes {
+                            stdin.write_all(write.as_bytes()).await.map_err(|source| {
+                                Error::Spawn { bin: bin.clone(), source }
+                            })?;
+                        }
+                        flush_codex_controls(&mut protocol, &mut pending, &mut stdin, &bin)
+                            .await?;
+                        stdin.flush().await.map_err(|source| Error::Spawn {
+                            bin: bin.clone(), source
+                        })?;
+                    } else {
+                        protocol.terminal.unparsed += 1;
+                        if protocol.terminal.first_unparsed.is_none() {
+                            protocol.terminal.first_unparsed = Some(line.clone());
+                        }
+                    }
+                } else {
+                    protocol.failure.get_or_insert_with(|| {
+                        "app-server closed stdout before turn/completed".to_string()
+                    });
+                    protocol.finished = true;
+                }
+            }
+            control = controls.recv() => {
+                let Some(control) = control else {
+                    continue;
+                };
+                pending.push_back(control);
+                flush_codex_controls(&mut protocol, &mut pending, &mut stdin, &bin).await?;
+                stdin.flush().await.map_err(|source| Error::Spawn {
+                    bin: bin.clone(), source
+                })?;
+            }
+            () = &mut deadline => {
+                let partial = protocol.terminal.text.clone();
+                shut_down(&mut child, stderr_task).await;
+                reaped.store(true, std::sync::atomic::Ordering::SeqCst);
+                return Err(Error::Timeout {
+                    bin,
+                    timeout: request.timeout.unwrap_or_default(),
+                    partial,
+                });
+            }
+            _ = &mut cancel => {
+                shut_down(&mut child, stderr_task).await;
+                reaped.store(true, std::sync::atomic::Ordering::SeqCst);
+                return Err(Error::Cancelled { bin });
+            }
+        }
+    }
+
+    // app-server is a service rather than a one-shot process. EOF asks it to
+    // stop cleanly; the short fallback prevents a completed turn from hanging
+    // because a future CLI release keeps serving after its input closes.
+    drop(stdin);
+    if tokio::time::timeout(std::time::Duration::from_secs(2), child.child.wait())
+        .await
+        .is_err()
+    {
+        kill_process_group(&child.child);
+        let _ = child.child.kill().await;
+    }
+    child.armed = false;
+    reaped.store(true, std::sync::atomic::Ordering::SeqCst);
+    drop(events);
+    let stderr = stderr_task.await.unwrap_or_default();
+
+    persist_result?;
+    if let Some(detail) = protocol.failure {
+        return Err(Error::Parse {
+            agent: request.agent,
+            detail,
+        });
+    }
+
+    let terminal = protocol.terminal;
+    if terminal.stop == Stop::Error {
+        return Err(classify_run(
+            request.agent,
+            &bin,
+            0,
+            &stderr,
+            &raw,
+            &terminal,
+        ));
+    }
+    let structured = terminal.structured.clone().or_else(|| {
+        request
+            .schema
+            .as_ref()
+            .and_then(|_| serde_json::from_str(&terminal.text).ok())
+    });
+    Ok(Outcome {
+        agent: request.agent,
+        session: terminal.session,
+        text: terminal.text,
+        usage: terminal.usage,
+        stop: terminal.stop,
+        rate_limit: terminal.rate_limit,
+        exit_code: 0,
+        stderr,
+        unparsed: terminal.unparsed,
+        first_unparsed: terminal.first_unparsed,
+        structured,
+    })
+}
+
+/// Write every control whose protocol ids are available, preserving earlier
+/// messages until thread and turn startup have both completed.
+async fn flush_codex_controls(
+    protocol: &mut crate::codex_app_server::Protocol,
+    pending: &mut VecDeque<Control>,
+    stdin: &mut tokio::process::ChildStdin,
+    bin: &str,
+) -> Result<()> {
+    let mut waiting = VecDeque::new();
+    while let Some(control) = pending.pop_front() {
+        let encoded = match &control {
+            Control::Message(message) => protocol.steer(message),
+            Control::Approval { id, decision } => protocol.respond(id, decision),
+        };
+        if let Some(encoded) = encoded {
+            stdin
+                .write_all(encoded.as_bytes())
+                .await
+                .map_err(|source| Error::Spawn {
+                    bin: bin.to_string(),
+                    source,
+                })?;
+        } else {
+            waiting.push_back(control);
+        }
+    }
+    pending.append(&mut waiting);
+    Ok(())
 }
 
 /// Kill the process group, reap the child, and join the stderr reader.

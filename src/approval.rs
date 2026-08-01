@@ -10,13 +10,12 @@
 //! [`crate::Run::respond`] answers. Deciding stays entirely with the caller;
 //! this crate carries the question out and the answer back.
 //!
-//! # Claude only
+//! # Supported agents
 //!
-//! Verified against claude 2.1.212. Codex `exec` has no approval callback: its
-//! sandbox mode *is* the answer, decided before the run starts. Copilot needs
-//! `--allow-all-tools` to run headlessly at all, and gates only through
-//! `--deny-tool`. Asking either for approvals is
-//! [`crate::Error::Unsupported`] rather than a run that quietly never asks.
+//! Verified against claude 2.1.212 and codex-cli 0.145.0. Codex interactive
+//! runs use app-server because `codex exec` has no approval callback. Copilot
+//! needs `--allow-all-tools` to run headlessly at all and gates only through
+//! `--deny-tool`, so asking it for approvals is [`crate::Error::Unsupported`].
 //!
 //! # A run that asks must be streamed
 //!

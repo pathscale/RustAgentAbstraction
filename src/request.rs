@@ -34,6 +34,8 @@ pub struct Request {
     pub(crate) format: Option<Format>,
     pub(crate) cont: Continue,
     pub(crate) cwd: Option<PathBuf>,
+    /// Additional working roots the agent may write beside `cwd`.
+    pub(crate) extra_dirs: Vec<PathBuf>,
     pub(crate) env: Vec<(String, String)>,
     pub(crate) extra_args: Vec<String>,
     pub(crate) env_policy: EnvPolicy,
@@ -78,6 +80,7 @@ impl Request {
             format: None,
             cont: Continue::New,
             cwd: None,
+            extra_dirs: Vec::new(),
             env: Vec::new(),
             extra_args: Vec::new(),
             env_policy: EnvPolicy::Minimal,
@@ -170,11 +173,10 @@ impl Request {
     /// moment a user types it rather than making them wait for the turn to end.
     ///
     /// The agent takes the message at its next step boundary, not mid-token.
-    /// Verified against claude 2.1.212: a three-command task told to stop after
-    /// the first command ran only that one.
+    /// Verified against claude 2.1.212 and codex-cli 0.145.0.
     ///
-    /// Claude only. Neither other agent reads a structured message stream on
-    /// stdin, so both are [`crate::Error::Unsupported`].
+    /// Claude and Codex support this. Codex switches from `exec` to app-server
+    /// for the interactive turn. Copilot is [`crate::Error::Unsupported`].
     #[must_use]
     pub fn interactive(mut self) -> Self {
         self.duplex = true;
@@ -191,11 +193,11 @@ impl Request {
     ///
     /// Two constraints, both raised before spawning rather than met as a hang:
     /// this needs [`crate::stream`], since [`crate::run`] yields no events for
-    /// anyone to answer, and it is Claude-only, since neither other agent has a
-    /// headless approval channel.
+    /// anyone to answer. Claude and Codex expose approval callbacks; Copilot
+    /// does not and is [`crate::Error::Unsupported`].
     ///
     /// [`Permission`] still applies to everything the agent does not ask about.
-    /// Claude allows read-only commands without asking, so the absence of a
+    /// Agents may allow read-only commands without asking, so the absence of a
     /// question is not proof that nothing ran.
     #[must_use]
     pub fn approvals(mut self) -> Self {
@@ -222,6 +224,18 @@ impl Request {
     #[must_use]
     pub fn cwd(mut self, cwd: impl Into<PathBuf>) -> Self {
         self.cwd = Some(cwd.into());
+        self
+    }
+
+    /// Add another working root beside [`Request::cwd`].
+    ///
+    /// Claude and `codex exec` receive `--add-dir`. Interactive Codex runs use
+    /// the same path as an app-server runtime root and workspace-write root, so
+    /// the access described here survives transport changes without a caller
+    /// assembling provider-specific arguments.
+    #[must_use]
+    pub fn add_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.extra_dirs.push(dir.into());
         self
     }
 
@@ -448,6 +462,11 @@ impl Request {
             permission: self.permission,
             format: self.effective_format(),
             cont: self.cont.clone(),
+            extra_dirs: self
+                .extra_dirs
+                .iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect(),
             // Measure the whole command line, not just the prompt: for Codex
             // and Copilot the system text is prepended to it, and for Claude the
             // system prompt rides its own argument. A small prompt with a large

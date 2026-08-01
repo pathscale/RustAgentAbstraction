@@ -516,6 +516,114 @@ async fn a_message_sent_mid_turn_redirects_the_agent() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Codex uses app-server for an interactive turn. This proves the full live
+/// path rather than only its JSON shapes: a running tool call is steered, text
+/// arrives as deltas, and the app-server usage record carries the context
+/// window `AgencyZero` needs for its meter.
+#[tokio::test]
+#[ignore = "spawns a real agent and consumes quota"]
+async fn codex_app_server_accepts_a_live_steer() {
+    if !available(Agent::Codex) {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!(
+        "agent-abstraction-codex-duplex-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let target = dir.join("must-not-exist.txt");
+    let _ = std::fs::remove_file(&target);
+
+    let request = Request::new(
+        Agent::Codex,
+        "Run `sleep 5` as one shell command. Wait for it to finish. Then, as a separate \
+         command, run `touch must-not-exist.txt`. Do not combine the commands.",
+    )
+    .cwd(&dir)
+    .permission(Permission::Bypass)
+    .interactive()
+    .timeout(Duration::from_secs(180));
+
+    let mut run = stream(&request).expect("app-server should start");
+    assert_eq!(run.argv(), ["codex", "app-server", "--stdio"]);
+    let mut sent = false;
+    let mut text_events = 0;
+    while let Some(event) = run.recv().await {
+        if matches!(event, Event::Text(_)) {
+            text_events += 1;
+        }
+        if !sent && matches!(event, Event::ToolCall { .. }) {
+            sent = true;
+            run.send("STOP. Do not run another command. Reply with only: ABORTED")
+                .await
+                .expect("turn/steer should accept the message");
+        }
+    }
+    let outcome = run.finish().await.expect("steered turn should complete");
+    assert!(sent, "Codex never called the first tool");
+    assert!(text_events > 0, "assistant deltas were not streamed");
+    assert!(
+        outcome.usage.context_window.is_some(),
+        "app-server did not report its context window: {:?}",
+        outcome.usage
+    );
+    assert!(
+        !target.exists(),
+        "the second command ran, so the steer did not redirect Codex"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A Codex sandbox escape is a server request the host can deny mid-turn.
+#[tokio::test]
+#[ignore = "spawns a real agent and consumes quota"]
+async fn codex_app_server_routes_approvals() {
+    if !available(Agent::Codex) {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!(
+        "agent-abstraction-codex-approval-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let outside = std::env::temp_dir().join(format!(
+        "agent-abstraction-codex-outside-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&outside);
+
+    let request = Request::new(
+        Agent::Codex,
+        format!(
+            "Use a shell command to create exactly this file: {}",
+            outside.display()
+        ),
+    )
+    .cwd(&dir)
+    .permission(Permission::Auto)
+    .approvals()
+    .timeout(Duration::from_secs(180));
+
+    let mut run = stream(&request).expect("app-server should start");
+    let mut asked = false;
+    while let Some(event) = run.recv().await {
+        if let Event::ApprovalRequest(approval) = event {
+            asked = true;
+            run.respond(&approval.id, &agent_abstraction::Decision::deny())
+                .await
+                .expect("the denial should reach app-server");
+        }
+    }
+    let outcome = run
+        .finish()
+        .await
+        .expect("a denial should not fail the turn");
+    assert!(asked, "Codex did not ask for the out-of-root write");
+    assert!(!outside.exists(), "the denied write still created the file");
+    assert!(outcome.is_ok(), "the turn did not recover: {outcome:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A live counter has to agree with the number that replaces it when the run
 /// ends, or a UI would show a total that jumps at the last moment. Drives a
 /// multi-step task so several model calls report, then checks the accumulated
@@ -567,15 +675,16 @@ async fn live_usage_events_agree_with_the_final_outcome() {
 /// Sending is refused where it cannot work, rather than silently doing nothing.
 #[tokio::test]
 async fn a_follow_up_is_refused_where_it_cannot_be_delivered() {
-    for agent in [Agent::Codex, Agent::Copilot] {
-        assert!(
-            matches!(
-                Request::new(agent, PING).interactive().argv(),
-                Err(agent_abstraction::Error::Unsupported { .. })
-            ),
-            "{agent} cannot take a follow-up mid-turn"
-        );
-    }
+    assert!(matches!(
+        Request::new(Agent::Copilot, PING).interactive().argv(),
+        Err(agent_abstraction::Error::Unsupported { .. })
+    ));
+    assert!(
+        Request::new(Agent::Codex, PING)
+            .interactive()
+            .argv()
+            .is_ok()
+    );
     // A run that never opened the channel has nowhere to put a message. This
     // half needs the binary, since it has to actually spawn; the argv checks
     // above do not.
@@ -593,23 +702,25 @@ async fn a_follow_up_is_refused_where_it_cannot_be_delivered() {
     let _ = plain.cancel().await;
 }
 
-/// Both refusals, checked without spawning: neither other agent can ask, and
-/// `run` cannot carry the question to anyone.
+/// Both refusals, checked without spawning: Copilot cannot ask, and `run`
+/// cannot carry the question to anyone.
 #[tokio::test]
 async fn approvals_are_refused_where_they_cannot_work() {
-    for agent in [Agent::Codex, Agent::Copilot] {
-        let request = Request::new(agent, PING)
+    let unsupported = Request::new(Agent::Copilot, PING)
+        .permission(Permission::Edit)
+        .approvals();
+    assert!(matches!(
+        unsupported.argv(),
+        Err(agent_abstraction::Error::Unsupported { .. })
+    ));
+    assert!(
+        Request::new(Agent::Codex, PING)
             .permission(Permission::Edit)
-            .approvals();
-        assert!(
-            matches!(
-                request.argv(),
-                Err(agent_abstraction::Error::Unsupported { .. })
-            ),
-            "{agent} has no approval channel and should say so"
-        );
-    }
-    let discarded = Request::new(Agent::Claude, PING)
+            .approvals()
+            .argv()
+            .is_ok()
+    );
+    let discarded = Request::new(Agent::Codex, PING)
         .permission(Permission::Edit)
         .approvals();
 
