@@ -956,6 +956,13 @@ fn classify_run(
     classify(agent, bin, code, stderr, stdout, terminal)
 }
 
+/// The longest an agent's answer may be and still be read as a notice.
+///
+/// A CLI that has been stopped says so briefly: Claude's is one sentence and a
+/// reset time. An answer that *discusses* limits runs to paragraphs and uses
+/// exactly the same words, so length is the only thing separating them.
+const NOTICE_MAX: usize = 240;
+
 /// How far into an agent's own output a diagnosis may be read from.
 ///
 /// Three rather than one, because a CLI is entitled to a banner line before it
@@ -1040,10 +1047,34 @@ fn classify(
     // `rate_limit` is present in perfectly healthy output. Where the stream
     // parsed, the parsed signal and the agent's own prose decide; the raw scan
     // is only the fallback for output that produced neither.
-    let prose = match (&terminal.error_message, terminal.text.as_str()) {
-        (Some(message), text) => format!("{message}\n{text}"),
-        (None, text) if !text.is_empty() => text.to_string(),
-        _ => stdout.to_string(),
+    /*
+     * The agent's own answer is evidence about the *topic*, not about the run.
+     *
+     * `terminal.text` is what the agent said. A turn that discusses quotas at
+     * any length contains the vocabulary this function searches for, so a
+     * finished, successful answer on that subject classified its own run as
+     * blocked and replaced itself with a banner quoting one of its own
+     * sentences. The same shape as the auth misclassification fixed in 0.4.2,
+     * one branch further down the same function.
+     *
+     * So the run's own channels stay authoritative. `error_message` is the
+     * CLI's own field rather than the model's words, and is read whole. The
+     * answer is read only when it is short enough to *be* a notice: a run that
+     * was really stopped has the notice and nothing else to say, in a couple
+     * of lines, while an answer that discusses the subject runs to paragraphs.
+     * Length is the one thing that separates them, because the vocabulary is
+     * identical by definition.
+     */
+    let reported = terminal.error_message.clone().unwrap_or_default();
+    let answered = if terminal.text.len() <= NOTICE_MAX {
+        opening_lines(&terminal.text, OPENING_LINES)
+    } else {
+        String::new()
+    };
+    let prose = if terminal.text.is_empty() {
+        format!("{reported}\n{}", opening_lines(stdout, OPENING_LINES))
+    } else {
+        format!("{reported}\n{answered}")
     };
     if quota_signalled || looks_rate_limited(stderr) || looks_rate_limited(&prose) {
         return Error::RateLimited {
@@ -1142,10 +1173,15 @@ fn looks_rate_limited(text: &str) -> bool {
         "usage limit",
         "quota exceeded",
         "too many requests",
-        "429",
     ]
     .iter()
     .any(|needle| lower.contains(needle))
+        // A status code is a word, and `429` as a bare substring is in every
+        // line number, byte count, sha fragment and identifier that happens to
+        // contain those digits. `401` was already given this treatment after it
+        // matched inside a UUID and sent someone to re-login; this is the same
+        // rule, applied to the code that had been left as a substring.
+        || mentions_status(&lower, "429")
 }
 
 /// The most useful line of a CLI's output for an error message.
@@ -1533,6 +1569,44 @@ mod tests {
                 "{text:?} was not read as auth: {err:?}"
             );
         }
+    }
+
+    /// Reported from the field: a finished, successful turn that happened to be
+    /// *about* usage limits classified its own run as blocked, and the banner
+    /// quoted one of the answer's own sentences back as the provider's message.
+    /// An answer is evidence about its topic, not about the run that produced it.
+    #[test]
+    fn an_agent_writing_about_limits_is_not_a_limit() {
+        let answer = "The three retries cost nothing extra, so that is not where it \
+                      came from.\n\n\
+                      Providers do not rate limit on repetition: the limit is on \
+                      tokens per window, and a 429 is what you would see if one had \
+                      actually been reached. Each retry does re-send the whole \
+                      conversation, which is real spend, but spend is not the same \
+                      thing as a block and the run reported no blocking signal at \
+                      all.\n\
+                      Nothing here suggests the usage limit was reached, and the \
+                      banner quoted a sentence of this answer back as though a \
+                      provider had written it.";
+        let terminal = Terminal {
+            text: answer.into(),
+            ..Terminal::default()
+        };
+        let err = classify(Agent::Claude, "claude", 1, "", answer, &terminal);
+        assert!(
+            !matches!(err, Error::RateLimited { .. }),
+            "an answer discussing limits was read as one: {err:?}"
+        );
+    }
+
+    /// A status code is a word. These are the shapes that used to trip it.
+    #[test]
+    fn a_bare_429_in_prose_is_not_a_status_code() {
+        assert!(!looks_rate_limited("see run.rs:4291 for the caller"));
+        assert!(!looks_rate_limited("sha 8f429ac"));
+        assert!(looks_rate_limited("HTTP 429"));
+        assert!(looks_rate_limited("(status 429)"));
+        assert!(looks_rate_limited("Error: too many requests"));
     }
 
     /// Auth is the most specific reading, so it wins over a generic failure,
