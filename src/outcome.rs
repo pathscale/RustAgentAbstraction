@@ -36,8 +36,8 @@ pub struct Usage {
     pub context_tokens: Option<u64>,
     /// The selected model's context window, where the agent reports one.
     ///
-    /// Claude alone does. Without it a host can still show tokens used, just
-    /// not a share of the limit.
+    /// Claude and interactive Codex runs do. Without it a host can still show
+    /// tokens used, just not a share of the limit.
     pub context_window: Option<u64>,
     /// The most tokens the model may generate in one reply.
     pub max_output_tokens: Option<u64>,
@@ -129,9 +129,9 @@ impl Usage {
 
     /// Share of the context window in use, from 0.0 to 1.0.
     ///
-    /// `None` unless the agent reported both the tokens and the window, which
-    /// today means Claude. Returns the ratio rather than a formatted string or
-    /// a bar, so a host renders it however it likes.
+    /// `None` unless the agent reported both the tokens and the window. Returns
+    /// the ratio rather than a formatted string or a bar, so a host renders it
+    /// however it likes.
     #[must_use]
     pub fn context_used(&self) -> Option<f64> {
         let (used, window) = (self.context_tokens?, self.context_window?);

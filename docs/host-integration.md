@@ -25,11 +25,9 @@ run.send("actually, skip the tests and just fix the parser").await?;
 **Append the message to the transcript below the user's previous one, immediately, and
 carry on.** That is the entire contract. Do not wait for anything.
 
-Do **not** build echo-based ordering. Claude can re-emit messages with
-`--replay-user-messages` so an agent can sequence its own transcript, and this crate
-deliberately does not pass it: the host already knows what it sent, so an echo reports
-something it knew, and waiting for one would delay the exact thing this exists to make
-immediate. Render on send.
+Do **not** build echo-based ordering. The host already knows what it sent, so an echo
+reports something it knew, and waiting for one would delay the exact thing this exists to
+make immediate. Render on send.
 
 ### When the message takes effect
 
@@ -61,9 +59,9 @@ leaving the user believing it landed.
 
 ### Availability
 
-Claude only. Codex and Copilot return `Error::Unsupported` **before spawning**, so a host
-can check once at startup rather than discovering it mid-conversation. Neither reads a
-structured message stream on stdin.
+Claude and Codex. Interactive Codex runs switch to app-server, which carries `turn/steer`;
+ordinary runs remain on `codex exec`. Copilot returns `Error::Unsupported` **before
+spawning**, so a host can check once at startup.
 
 ## Asking a human about tool calls
 
@@ -108,9 +106,8 @@ the gate.
 
 ### Silence is not proof that nothing ran
 
-Claude decides what needs asking, and read-only commands run without a question: `whoami`
-runs unasked, `touch some-file` asks. Do not present "no approvals requested" as "no
-commands executed".
+The agent decides what needs asking, and read-only commands may run without a question.
+Do not present "no approvals requested" as "no commands executed".
 
 ## A worked shape
 
@@ -142,3 +139,20 @@ ui.append_usage(&outcome.usage);
 
 The user typing mid-turn calls `run.send(...)` from the UI thread and appends to the
 transcript at the same moment. Nothing in the loop above changes.
+
+## Workspace roots
+
+Give the run its actual workspace rather than asking the model to discover or clone it:
+
+```rust
+let request = Request::new(agent, prompt)
+    .cwd(workspace)
+    .add_dir(repository)
+    .permission(Permission::Auto)
+    .approvals();
+```
+
+`cwd` is the primary root. Each `add_dir` is another writable working root. On interactive
+Codex runs these become explicit app-server runtime and sandbox roots. With `approvals`, a
+Codex request for access outside those roots arrives as `Event::ApprovalRequest`, so the
+host can ask the user instead of leaving the model to work around a silent denial.

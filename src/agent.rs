@@ -260,6 +260,8 @@ pub struct Plan {
     pub format: Format,
     /// How this run continues an earlier one.
     pub cont: Continue,
+    /// Additional working roots beside the primary working directory.
+    pub extra_dirs: Vec<String>,
     /// True when the prompt is piped on stdin instead of riding the argv.
     pub stdin_prompt: bool,
     /// True when stdin stays open for the turn so the caller can send more.
@@ -493,8 +495,9 @@ impl Agent {
                 live_follow_up: true,
                 approvals: true,
             },
-            // `codex exec --json` emits `thread_id`; continuation is the
-            // `resume` subcommand and is linear (`codex fork` is TUI-only).
+            // `codex exec --json` emits `thread_id`; interactive turns use the
+            // app-server protocol, which exposes steering and approvals.
+            // Continuation remains linear (`codex fork` is TUI-only).
             Agent::Codex => Caps {
                 session: SessionSupport::Printed,
                 fork: false,
@@ -504,8 +507,8 @@ impl Agent {
                 // `agent_message` the conforming JSON, with no separate field.
                 schema: SchemaSupport::File,
                 commands: false,
-                live_follow_up: false,
-                approvals: false,
+                live_follow_up: true,
+                approvals: true,
             },
             // Verified against Copilot CLI 1.0.75: `--session-id <uuid>` both
             // mints a new session and resumes an existing one (one flag, both
@@ -614,12 +617,11 @@ impl Agent {
     /// # Errors
     /// [`Error::Unsupported`] if the plan needs a capability this agent lacks.
     pub(crate) fn typed_argv(self, plan: &Plan) -> Result<Vec<Arg>> {
-        // Verified against codex-cli 0.145.0 and Copilot CLI 1.0.75: `codex
-        // exec` has no approval callback, its sandbox mode being the answer
-        // decided before the run starts, and Copilot needs `--allow-all-tools`
-        // to run headlessly at all and gates only through `--deny-tool`. A run
-        // that quietly never asked would be the worst outcome here, since a
-        // caller would read silence as "nothing needed approval".
+        // Codex app-server supplies an approval callback. Copilot CLI 1.0.75
+        // needs `--allow-all-tools` to run headlessly at all and gates only
+        // through `--deny-tool`. A run that quietly never asked would be the
+        // worst outcome here, since a caller would read silence as "nothing
+        // needed approval".
         let caps = self.caps();
         if plan.approvals && !caps.approvals {
             return Err(Error::Unsupported {
@@ -627,9 +629,8 @@ impl Agent {
                 what: "routing tool approvals to the caller",
             });
         }
-        // Verified against codex-cli 0.145.0 and Copilot CLI 1.0.75: neither
-        // takes a structured message stream on stdin, so neither can be sent a
-        // second message once a turn is under way.
+        // Codex app-server accepts `turn/steer`. Copilot CLI 1.0.75 has no
+        // structured input stream and cannot take a second message mid-turn.
         if plan.duplex && !caps.live_follow_up {
             return Err(Error::Unsupported {
                 agent: self,
@@ -837,6 +838,12 @@ fn argv_claude(plan: &Plan) -> Vec<Arg> {
     if let Some(system) = &plan.system {
         a.secret("--append-system-prompt", system, Sensitivity::Prompt);
     }
+    // Verified against Claude Code 2.1.212: every value after one `--add-dir`
+    // widens tool access. Repeat the flag so a path beginning with a dash can
+    // never be mistaken for another option.
+    for dir in &plan.extra_dirs {
+        a.secret("--add-dir", dir, Sensitivity::Unchecked);
+    }
 
     match &plan.cont {
         Continue::New => {}
@@ -883,6 +890,13 @@ fn argv_claude(plan: &Plan) -> Vec<Arg> {
 /// `codex exec [resume <id>] --skip-git-repo-check [sandbox flags] [--model M]
 /// [--json] <prompt>`
 fn argv_codex(plan: &Plan) -> Vec<Arg> {
+    if plan.duplex || plan.approvals {
+        return Argv::new(&plan.bin)
+            .bare("app-server")
+            .bare("--stdio")
+            .done();
+    }
+
     let mut a = Argv::new(&plan.bin);
     a.bare("exec");
     if let Continue::Resume(id) = &plan.cont {
@@ -925,6 +939,12 @@ fn argv_codex(plan: &Plan) -> Vec<Arg> {
     // is refused by the provider with its own enum rather than by the CLI.
     if let Some(effort) = plan.effort.as_ref() {
         a.pair("-c", format!("model_reasoning_effort={effort}"));
+    }
+    // Verified against codex-cli 0.145.0. Options remain options after the
+    // positional prompt, but keeping roots before it makes the command's
+    // security posture readable and matches the CLI's help shape.
+    for dir in &plan.extra_dirs {
+        a.pair("--add-dir", dir);
     }
     // Codex reads the schema from a file, which the runner writes before the
     // spawn. `Request::argv` has no file to name, so it shows a placeholder:
@@ -1026,6 +1046,7 @@ mod tests {
             permission: Permission::ReadOnly,
             format: Format::Json,
             cont: Continue::New,
+            extra_dirs: Vec::new(),
             stdin_prompt: false,
             duplex: false,
             approvals: false,
@@ -1041,15 +1062,14 @@ mod tests {
 
     #[test]
     fn interactive_capabilities_match_the_supported_request_paths() {
-        let claude = Agent::Claude.caps();
-        assert!(claude.live_follow_up);
-        assert!(claude.approvals);
-
-        for agent in [Agent::Codex, Agent::Copilot] {
+        for agent in [Agent::Claude, Agent::Codex] {
             let caps = agent.caps();
-            assert!(!caps.live_follow_up, "{agent} cannot take live follow-ups");
-            assert!(!caps.approvals, "{agent} has no headless approval channel");
+            assert!(caps.live_follow_up, "{agent} can take live follow-ups");
+            assert!(caps.approvals, "{agent} has an approval channel");
         }
+        let copilot = Agent::Copilot.caps();
+        assert!(!copilot.live_follow_up);
+        assert!(!copilot.approvals);
     }
 
     fn pos(a: &[String], needle: &str) -> Option<usize> {
@@ -1102,21 +1122,19 @@ mod tests {
         );
     }
 
-    /// Neither other agent has a headless approval channel, so asking must fail
-    /// loudly. A run that quietly never asked is the dangerous outcome: silence
-    /// would read as "nothing needed approval".
+    /// Copilot has no headless approval channel, so asking must fail loudly. A
+    /// run that quietly never asked is the dangerous outcome.
     #[test]
     fn agents_without_an_approval_channel_refuse_before_spawning() {
         let mut p = plan("x");
         p.approvals = true;
         p.permission = Permission::Edit;
-        for agent in [Agent::Codex, Agent::Copilot] {
-            assert!(
-                matches!(agent.typed_argv(&p), Err(Error::Unsupported { .. })),
-                "{agent} should refuse to pretend it can ask"
-            );
-        }
+        assert!(matches!(
+            Agent::Copilot.typed_argv(&p),
+            Err(Error::Unsupported { .. })
+        ));
         assert!(Agent::Claude.typed_argv(&p).is_ok());
+        assert_eq!(argv(Agent::Codex, &p), ["x", "app-server", "--stdio"]);
     }
 
     /// Read-only removes the mutating tools outright, so there is nothing left
@@ -1176,17 +1194,17 @@ mod tests {
         assert_eq!(a[pos(&a, "--input-format").unwrap() + 1], "stream-json");
     }
 
-    /// Neither other agent reads a structured message stream on stdin.
+    /// Copilot does not expose a structured message stream on stdin. Codex
+    /// switches to app-server when a live follow-up is requested.
     #[test]
     fn agents_that_cannot_take_a_follow_up_refuse_before_spawning() {
         let mut p = plan("x");
         p.duplex = true;
-        for agent in [Agent::Codex, Agent::Copilot] {
-            assert!(
-                matches!(agent.typed_argv(&p), Err(Error::Unsupported { .. })),
-                "{agent} cannot be sent a second message mid-turn"
-            );
-        }
+        assert!(matches!(
+            Agent::Copilot.typed_argv(&p),
+            Err(Error::Unsupported { .. })
+        ));
+        assert_eq!(argv(Agent::Codex, &p), ["x", "app-server", "--stdio"]);
     }
 
     /// An ordinary run is untouched, so nothing about the default path changes.
@@ -1397,6 +1415,21 @@ mod tests {
                 argv(Agent::Codex, &p).contains(&"--skip-git-repo-check".to_string()),
                 "{cont:?} must still run outside a repo"
             );
+        }
+    }
+
+    #[test]
+    fn working_roots_reach_both_flag_based_agents() {
+        let mut p = plan("x");
+        p.extra_dirs = vec!["/repo-a".into(), "/repo-b".into()];
+        for agent in [Agent::Claude, Agent::Codex] {
+            let a = argv(agent, &p);
+            let roots: Vec<_> = a
+                .windows(2)
+                .filter(|pair| pair[0] == "--add-dir")
+                .map(|pair| pair[1].as_str())
+                .collect();
+            assert_eq!(roots, ["/repo-a", "/repo-b"], "{agent}: {a:?}");
         }
     }
 

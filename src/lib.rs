@@ -89,6 +89,7 @@ mod account;
 mod agent;
 mod approval;
 mod auth;
+mod codex_app_server;
 mod command;
 mod error;
 mod event;
