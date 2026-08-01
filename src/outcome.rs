@@ -168,9 +168,29 @@ pub struct RateLimit {
 impl RateLimit {
     /// Whether this signal means the request was actually refused, as opposed
     /// to an informational "still allowed" heartbeat.
+    ///
+    /// Every status the provider prefixes with `allowed` is a heartbeat, not a
+    /// refusal. This was an exact match on `allowed`, which made
+    /// `allowed_warning` a block: Claude emits that once an account passes a
+    /// utilization threshold, which is the *opposite* of being refused, and
+    /// the account keeps working for the rest of the window. Observed on
+    /// claude 2.1.212, seven-day window, at 77% of quota:
+    ///
+    /// ```json
+    /// {"status": "allowed_warning", "utilization": 0.77,
+    ///  "surpassedThreshold": 0.75, "rateLimitType": "seven_day"}
+    /// ```
+    ///
+    /// The consequence was that crossing 75% of a window turned every
+    /// finished, successful run into `Error::RateLimited` and discarded its
+    /// answer, for as long as the window stayed above the threshold.
+    ///
+    /// Callers who want to *show* the warning read `status` and `resets_at`,
+    /// which carry it. This one method answers only whether the request was
+    /// refused.
     #[must_use]
     pub fn is_blocking(&self) -> bool {
-        !self.status.eq_ignore_ascii_case("allowed")
+        !self.status.to_ascii_lowercase().starts_with("allowed")
     }
 }
 
@@ -249,6 +269,49 @@ impl Outcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Reported from the field, and the reason a healthy account stopped
+    /// working: a run that finished and answered was handed back as
+    /// `Error::RateLimited`, for every run, once the seven-day window passed
+    /// three quarters full.
+    ///
+    /// The record below is verbatim from claude 2.1.212 at the time. `status`
+    /// is `allowed_warning`, which is the provider saying the request went
+    /// through and the window is filling, and the old exact match on
+    /// `allowed` read every character of that as a refusal.
+    #[test]
+    fn a_warning_is_not_a_refusal() {
+        let warned = RateLimit {
+            status: "allowed_warning".into(),
+            window: Some("seven_day".into()),
+            resets_at: Some(1_785_765_600),
+            overage_status: None,
+            is_using_overage: Some(false),
+        };
+        assert!(
+            !warned.is_blocking(),
+            "a warning that the window is filling blocked a run that succeeded"
+        );
+
+        // The plain heartbeat, and the refusals, both still read correctly.
+        assert!(
+            !RateLimit {
+                status: "allowed".into(),
+                ..warned.clone()
+            }
+            .is_blocking()
+        );
+        for refusal in ["rejected", "blocked", "REJECTED"] {
+            assert!(
+                RateLimit {
+                    status: refusal.into(),
+                    ..warned.clone()
+                }
+                .is_blocking(),
+                "{refusal} must still be read as a refusal"
+            );
+        }
+    }
 
     /// The trap `accumulate` exists to avoid, and the one it once fell into
     /// next door. `context_tokens` is the conversation's size as the agent last
