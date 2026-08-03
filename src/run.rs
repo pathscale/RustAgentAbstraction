@@ -473,6 +473,13 @@ pub fn stream(request: &Request) -> Result<Run> {
         command.env(key, value);
     }
 
+    // Applied last so the dedicated `thinking(false)` switch is authoritative
+    // over the general env map. Only Claude has a lever, delivered as
+    // `MAX_THINKING_TOKENS=0`. See `Agent::thinking_env`.
+    if let Some((key, value)) = request.agent.thinking_env(request.thinking) {
+        command.env(key, value);
+    }
+
     // Put the agent in its own process group so the whole tree can be signalled
     // together. Killing only the CLI leaves the commands *it* spawned running:
     // a build, a test run, a server, still holding files and credentials after

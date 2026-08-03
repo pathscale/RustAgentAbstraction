@@ -28,6 +28,10 @@ pub struct Request {
     pub(crate) system: Option<String>,
     pub(crate) model: Option<String>,
     pub(crate) effort: Option<String>,
+    /// Whether the model may spend reasoning tokens before answering. `None`
+    /// leaves the agent's own default in place; `Some(false)` turns it off. See
+    /// [`Request::thinking`].
+    pub(crate) thinking: Option<bool>,
     pub(crate) duplex: bool,
     pub(crate) approvals: bool,
     pub(crate) permission: Permission,
@@ -74,6 +78,7 @@ impl Request {
             system: None,
             model: None,
             effort: None,
+            thinking: None,
             duplex: false,
             approvals: false,
             permission: Permission::ReadOnly,
@@ -162,6 +167,32 @@ impl Request {
     #[must_use]
     pub fn effort(mut self, effort: impl Into<String>) -> Self {
         self.effort = Some(effort.into());
+        self
+    }
+
+    /// Turn the model's reasoning ("thinking") on or off for this run.
+    ///
+    /// Left unset the agent keeps its own default, which for Claude is adaptive
+    /// thinking. `thinking(false)` disables it; `thinking(true)` is the same as
+    /// leaving it unset and exists so a caller driven by a UI toggle can pass
+    /// the switch through without branching.
+    ///
+    /// # Only Claude has a lever here
+    ///
+    /// Delivered as `MAX_THINKING_TOKENS=0` in the child's environment, which is
+    /// exactly the switch the `claude` CLI reads to decide whether to send a
+    /// `thinking` block to the API (verified against claude 2.1.212: the gate is
+    /// `MAX_THINKING_TOKENS > 0`, so `0` omits the block). It rides the
+    /// environment rather than an argument because the CLI exposes no flag for
+    /// it, and it wins over [`EnvPolicy`] the same way an explicit
+    /// [`Request::env`] does.
+    ///
+    /// Codex and Copilot have no equivalent off switch, so `thinking(false)` is
+    /// a no-op for them rather than a silent lie. Their reasoning is steered by
+    /// [`Request::effort`] instead.
+    #[must_use]
+    pub fn thinking(mut self, enabled: bool) -> Self {
+        self.thinking = Some(enabled);
         self
     }
 
@@ -457,6 +488,7 @@ impl Request {
             system: self.system.clone(),
             model: self.model.clone(),
             effort: self.effort.clone(),
+            thinking: self.thinking,
             duplex: self.duplex || self.approvals,
             approvals: self.approvals,
             permission: self.permission,

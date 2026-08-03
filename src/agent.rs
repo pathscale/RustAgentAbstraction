@@ -254,6 +254,11 @@ pub struct Plan {
     /// reason [`Plan::model`] is: the accepted set is the provider's to define
     /// and it has already grown once.
     pub effort: Option<String>,
+    /// Whether the model may spend reasoning tokens. `None` leaves the agent's
+    /// own default; `Some(false)` disables it. Only Claude has a lever, applied
+    /// as `MAX_THINKING_TOKENS=0` in the child environment. See
+    /// [`crate::Request::thinking`].
+    pub thinking: Option<bool>,
     /// Permission posture.
     pub permission: Permission,
     /// Requested output shape.
@@ -471,6 +476,27 @@ impl Agent {
             ],
         };
         BASE.iter().chain(WINDOWS).chain(agent).copied().collect()
+    }
+
+    /// The environment variable that turns reasoning off for this agent, if it
+    /// has one, given the request's `thinking` setting.
+    ///
+    /// Returns `Some` only when a caller asked to disable thinking and this
+    /// agent exposes a lever for it. Claude reads `MAX_THINKING_TOKENS`: the
+    /// `claude` CLI sends a `thinking` block to the API only while that value is
+    /// above zero (verified against claude 2.1.212, where the gate is
+    /// `MAX_THINKING_TOKENS > 0`), so `0` disables it. Codex and Copilot have no
+    /// equivalent, so they return `None` and steer reasoning through
+    /// [`crate::Request::effort`] instead.
+    ///
+    /// `None` for `thinking` (the default) and `Some(true)` both leave the
+    /// agent's own default untouched, so nothing is set.
+    #[must_use]
+    pub fn thinking_env(self, thinking: Option<bool>) -> Option<(&'static str, &'static str)> {
+        match (self, thinking) {
+            (Agent::Claude, Some(false)) => Some(("MAX_THINKING_TOKENS", "0")),
+            _ => None,
+        }
     }
 
     /// What this agent supports.
@@ -1043,6 +1069,7 @@ mod tests {
             system: None,
             model: None,
             effort: None,
+            thinking: None,
             permission: Permission::ReadOnly,
             format: Format::Json,
             cont: Continue::New,
@@ -1253,6 +1280,34 @@ mod tests {
                     .any(|arg| arg.starts_with("model_reasoning_effort")),
                 "{agent}: {a:?}"
             );
+        }
+    }
+
+    /// Disabling thinking is Claude's `MAX_THINKING_TOKENS=0`, and only
+    /// Claude's: the other two have no lever and must report none rather than
+    /// pretend.
+    #[test]
+    fn disabling_thinking_is_claudes_env_switch_alone() {
+        assert_eq!(
+            Agent::Claude.thinking_env(Some(false)),
+            Some(("MAX_THINKING_TOKENS", "0")),
+        );
+        for agent in [Agent::Codex, Agent::Copilot] {
+            assert_eq!(
+                agent.thinking_env(Some(false)),
+                None,
+                "{agent} has no lever"
+            );
+        }
+    }
+
+    /// The default and an explicit on both leave the agent's own thinking
+    /// default in place, so nothing is set for any agent.
+    #[test]
+    fn thinking_on_or_unset_sets_nothing() {
+        for agent in [Agent::Claude, Agent::Codex, Agent::Copilot] {
+            assert_eq!(agent.thinking_env(None), None, "{agent} default");
+            assert_eq!(agent.thinking_env(Some(true)), None, "{agent} explicit on");
         }
     }
 

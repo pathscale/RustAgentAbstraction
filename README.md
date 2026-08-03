@@ -205,6 +205,24 @@ returning the compiled list: both enumerate models only in an interactive picker
 caller asking for discovery is asking for freshness. `Agent::models_verified()` records how
 each compiled list was established and against which release.
 
+### Disabling thinking
+
+`Request::thinking(false)` turns the model's reasoning off for a run; left unset the agent
+keeps its own default, which for Claude is adaptive thinking:
+
+```rust
+let request = Request::new(Agent::Claude, prompt).thinking(false);
+```
+
+Only Claude has a lever, and it is not a flag. The `claude` CLI builds the API `thinking`
+block itself and gates it on `MAX_THINKING_TOKENS` (verified against claude 2.1.212: the
+block is sent only while that value is above zero), so `thinking(false)` sets
+`MAX_THINKING_TOKENS=0` in the child environment, which wins over `EnvPolicy` the same way an
+explicit `env()` does. Codex and Copilot have no equivalent off switch, so `thinking(false)`
+is a no-op for them and their reasoning is steered by `effort` instead. `effort` and
+`thinking` are independent: effort sets how hard the model reasons, thinking whether it
+reasons at all.
+
 ## Structured answers
 
 When the answer is data rather than prose, constrain it with a JSON Schema and read it
