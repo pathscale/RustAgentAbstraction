@@ -50,6 +50,20 @@ pub enum Error {
         partial: String,
     },
 
+    /// An interactive transport accepted a control request locally but never
+    /// acknowledged it. The agent process may still be alive, but the caller
+    /// must stop that run before retrying the input on a resumed session.
+    #[error(
+        "`{bin}` did not acknowledge interactive input within {} s; its transport may be stalled",
+        timeout.as_secs()
+    )]
+    ControlTimeout {
+        /// The agent binary whose transport stopped responding.
+        bin: String,
+        /// How long the delivery receipt was allowed to take.
+        timeout: Duration,
+    },
+
     /// The agent ran to completion but exited non-zero.
     #[error("`{bin}` exited with status {code}: {stderr}")]
     Failed {
@@ -244,10 +258,14 @@ impl Error {
     ///
     /// True for quota and timeout failures; false for a missing binary, an
     /// unsupported capability, or a session conflict, which need the caller to
-    /// change something first. This classifies; it does not retry.
+    /// change something first. This classifies; it does not retry. A caller
+    /// must stop the old run before retrying [`Error::ControlTimeout`].
     #[must_use]
     pub fn is_transient(&self) -> bool {
-        matches!(self, Error::RateLimited { .. } | Error::Timeout { .. })
+        matches!(
+            self,
+            Error::RateLimited { .. } | Error::Timeout { .. } | Error::ControlTimeout { .. }
+        )
     }
 
     /// Whether this run was stopped because the caller asked, rather than

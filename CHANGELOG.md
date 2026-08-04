@@ -8,6 +8,19 @@ appear in a patch rather than inflating the version toward 1.0 on a crate still 
 shape. **Where that happens the entry says so at the top**, because a version number that
 under-signals is only acceptable if the changelog over-signals to compensate.
 
+## 0.4.10
+
+### Fixed
+
+- **A stalled interactive transport can no longer hold follow-up delivery
+  forever.** `RunControl::send` now waits at most 15 seconds for the immediate
+  Codex `turn/steer` receipt. It returns a transient `ControlTimeout` when an
+  app-server keeps its pipes open but stops processing requests, allowing the
+  host to stop the stale run and retry the visible message on a resumed session.
+
+  Ordinary long-running turns are unaffected. The deadline covers only the
+  transport acknowledgement, not the model response or tool execution.
+
 ## 0.4.9
 
 ### Fixed

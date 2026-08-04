@@ -11,6 +11,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::process::Stdio;
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
@@ -159,6 +160,10 @@ pub struct RunControl {
     bin: String,
 }
 
+/// Interactive transports acknowledge steer requests immediately. A missing
+/// receipt means the live process can no longer be trusted to accept input.
+const CONTROL_RECEIPT_TIMEOUT: Duration = Duration::from_secs(15);
+
 impl RunControl {
     /// Send another message while the agent is still working.
     ///
@@ -170,7 +175,15 @@ impl RunControl {
     ///
     /// Returns [`Error::Unsupported`] when the run is not interactive, or
     /// [`Error::Cancelled`] when the run finishes before delivery is confirmed.
+    /// Returns [`Error::ControlTimeout`] when the live transport stops
+    /// acknowledging input. The caller should stop that run before retrying on
+    /// a resumed session.
     pub async fn send(&self, message: &str) -> Result<()> {
+        self.send_with_timeout(message, CONTROL_RECEIPT_TIMEOUT)
+            .await
+    }
+
+    async fn send_with_timeout(&self, message: &str, timeout: Duration) -> Result<()> {
         let Some(channel) = &self.to_agent else {
             return Err(Error::Unsupported {
                 agent: self.agent,
@@ -188,7 +201,13 @@ impl RunControl {
             })
             .await
             .map_err(|_| cancelled())?;
-        delivered.await.map_err(|_| cancelled())?
+        match tokio::time::timeout(timeout, delivered).await {
+            Ok(receipt) => receipt.map_err(|_| cancelled())?,
+            Err(_) => Err(Error::ControlTimeout {
+                bin: self.bin.clone(),
+                timeout,
+            }),
+        }
     }
 
     /// Answer an [`Event::ApprovalRequest`] without borrowing the event stream.
@@ -2403,12 +2422,49 @@ mod tests {
         run.finish().await.expect("run outcome");
     }
 
+    /// A live app-server can keep its pipes open after it stops processing
+    /// requests. Input delivery needs a deadline so the host can reap that run
+    /// and retry the visible message on the resumed session.
+    #[tokio::test]
+    async fn a_control_receipt_that_never_arrives_times_out() {
+        let (controls_tx, mut controls_rx) = mpsc::channel(1);
+        let control = RunControl {
+            agent: Agent::Codex,
+            to_agent: Some(controls_tx),
+            bin: "codex".into(),
+        };
+        let receiver = tokio::spawn(async move {
+            let Some(Control::Message { receipt, .. }) = controls_rx.recv().await else {
+                panic!("follow-up message")
+            };
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            drop(receipt);
+        });
+
+        let err = control
+            .send_with_timeout("are you there?", Duration::from_millis(10))
+            .await
+            .expect_err("the missing receipt must not wait forever");
+        assert!(
+            matches!(err, Error::ControlTimeout { .. }),
+            "expected ControlTimeout, got {err:?}"
+        );
+        receiver.abort();
+    }
+
     #[test]
     fn transient_errors_are_distinguished_from_permanent_ones() {
         assert!(
             Error::RateLimited {
                 bin: "claude".into(),
                 message: String::new()
+            }
+            .is_transient()
+        );
+        assert!(
+            Error::ControlTimeout {
+                bin: "codex".into(),
+                timeout: CONTROL_RECEIPT_TIMEOUT,
             }
             .is_transient()
         );

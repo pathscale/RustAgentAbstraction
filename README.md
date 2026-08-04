@@ -308,6 +308,9 @@ this crate does not use it: the caller already knows what it sent, so an echo wo
 report something it knew. `Run::send` does wait for transport acceptance before its future
 resolves. Codex must acknowledge `turn/steer`; Claude's input must be written and flushed.
 Render immediately on send, then recover the same visible message if that receipt fails.
+Codex acknowledgement is capped at 15 seconds: `Error::ControlTimeout` means the host
+should stop the stale run before retrying the message on a resumed session. This deadline
+does not limit the turn itself or any tool the agent is running.
 
 ### One boundary worth handling
 
