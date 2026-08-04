@@ -8,6 +8,20 @@ appear in a patch rather than inflating the version toward 1.0 on a crate still 
 shape. **Where that happens the entry says so at the top**, because a version number that
 under-signals is only acceptable if the changelog over-signals to compensate.
 
+## 0.4.8
+
+### Fixed
+
+- **A successful `Run::send` now means the interactive transport accepted the
+  message.** Codex waits for the matching `turn/steer` JSON-RPC response, and
+  Claude waits for its input to be written and flushed. A turn that settles in
+  the delivery race now returns an error so a host can retry the visible message
+  in a fresh resumed turn instead of silently losing it.
+
+  Transcript rendering remains immediate and no provider echo is enabled. The
+  receipt confirms transport delivery; it does not duplicate words the host
+  already rendered.
+
 ## 0.4.1
 
 ### Added
