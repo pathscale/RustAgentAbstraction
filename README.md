@@ -299,11 +299,12 @@ The agent takes it at its **next step boundary**, not mid-token. Verified agains
 Append the message to the transcript below the user's previous one, immediately, and carry
 on. That is the whole rule.
 
-There is deliberately no acknowledgement to wait for. The CLI can echo messages back with
+There is deliberately no message echo to wait for. The CLI can echo messages back with
 `--replay-user-messages` for a host that wants the agent to sequence its transcript, and
 this crate does not use it: the caller already knows what it sent, so an echo would only
-report something it knew, and waiting for one would delay the exact thing this exists to
-make immediate. Render on send, not on echo.
+report something it knew. `Run::send` does wait for transport acceptance before its future
+resolves. Codex must acknowledge `turn/steer`; Claude's input must be written and flushed.
+Render immediately on send, then recover the same visible message if that receipt fails.
 
 ### One boundary worth handling
 

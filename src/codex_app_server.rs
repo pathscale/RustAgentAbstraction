@@ -5,11 +5,12 @@
 //! both over JSON-RPC on stdio, while also producing token-level assistant
 //! deltas and an explicit set of writable roots.
 //!
-//! The shapes here were generated from and exercised against codex-cli 0.145.0
-//! on 2026-08-02. They are kept as small `serde_json::Value` projections rather
+//! The shapes here were generated from codex-cli 0.145.0 and exercised against
+//! codex-cli 0.146.0 on 2026-08-04. They are kept as small `serde_json::Value`
+//! projections rather
 //! than vendoring the multi-megabyte generated schema into this crate.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
@@ -35,6 +36,21 @@ enum PendingApproval {
 pub(crate) struct Step {
     pub events: Vec<Event>,
     pub writes: Vec<String>,
+    pub steer_responses: Vec<SteerResponse>,
+}
+
+/// One `turn/steer` request written to app-server.
+#[derive(Debug)]
+pub(crate) struct SteerRequest {
+    pub id: u64,
+    pub wire: String,
+}
+
+/// App-server's acceptance or rejection of one `turn/steer` request.
+#[derive(Debug)]
+pub(crate) struct SteerResponse {
+    pub id: u64,
+    pub result: std::result::Result<String, String>,
 }
 
 /// State that spans the JSON-RPC records of one turn.
@@ -47,6 +63,7 @@ pub(crate) struct Protocol {
     pub finished: bool,
     pub failure: Option<String>,
     pending: HashMap<String, PendingApproval>,
+    pending_steers: HashSet<u64>,
     next_id: u64,
 }
 
@@ -60,6 +77,7 @@ impl Protocol {
             finished: false,
             failure: None,
             pending: HashMap::new(),
+            pending_steers: HashSet::new(),
             next_id: 10,
         }
     }
@@ -118,7 +136,7 @@ impl Protocol {
         let plan = self.request.plan();
         let roots = roots(&self.request);
         // app-server does not implicitly add `cwd` to a turn's writable roots.
-        // Verified against codex-cli 0.145.0 on 2026-08-02: omitting the first
+        // Verified against codex-cli 0.146.0 on 2026-08-04: omitting the first
         // root leaves a one-directory request able to read its cwd but unable
         // to write there. Every declared root therefore belongs in both the
         // runtime scope and the workspace-write sandbox policy.
@@ -196,6 +214,27 @@ impl Protocol {
             } else if let Some(turn_id) = value.pointer("/result/turn/id").and_then(Value::as_str) {
                 self.turn_id = Some(turn_id.to_string());
             }
+            return step;
+        }
+
+        // Unlike streamed notifications, `turn/steer` has a decisive JSON-RPC
+        // response: `{ result: { turnId } }` means Codex accepted the input,
+        // while an error means it did not enter the turn. Keep that receipt
+        // separate from transcript rendering so a host can still render on
+        // send without mistaking a local pipe write for provider acceptance.
+        if let Some(id) = value.get("id").and_then(Value::as_u64)
+            && self.pending_steers.remove(&id)
+        {
+            let result = if let Some(error) = rpc_error(value) {
+                Err(error)
+            } else {
+                value
+                    .pointer("/result/turnId")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .ok_or_else(|| "turn/steer returned no accepted turn id".to_string())
+            };
+            step.steer_responses.push(SteerResponse { id, result });
             return step;
         }
 
@@ -305,20 +344,24 @@ impl Protocol {
     }
 
     /// Encode a same-turn user message once thread and turn ids are known.
-    pub fn steer(&mut self, message: &str) -> Option<String> {
+    pub fn steer(&mut self, message: &str) -> Option<SteerRequest> {
         let thread_id = self.thread_id.as_ref()?;
         let turn_id = self.turn_id.as_ref()?;
         let id = self.next_id;
         self.next_id += 1;
-        Some(wire(&json!({
-            "id": id,
-            "method": "turn/steer",
-            "params": {
-                "threadId": thread_id,
-                "expectedTurnId": turn_id,
-                "input": [{"type": "text", "text": message}],
-            },
-        })))
+        self.pending_steers.insert(id);
+        Some(SteerRequest {
+            id,
+            wire: wire(&json!({
+                "id": id,
+                "method": "turn/steer",
+                "params": {
+                    "threadId": thread_id,
+                    "expectedTurnId": turn_id,
+                    "input": [{"type": "text", "text": message}],
+                },
+            })),
+        })
     }
 
     /// Encode the response to a server-side permission request.
@@ -591,6 +634,58 @@ mod tests {
         }));
 
         assert_eq!(step.events, vec![Event::MessageBoundary]);
+    }
+
+    fn running_protocol() -> Protocol {
+        let mut protocol = Protocol::new(request());
+        protocol.push(&json!({
+            "id": OPEN_ID,
+            "result": {"thread": {"id": "thread-7"}, "model": "gpt-5.6-sol"},
+        }));
+        protocol.push(&json!({
+            "id": TURN_ID,
+            "result": {"turn": {"id": "turn-9"}},
+        }));
+        protocol
+    }
+
+    #[test]
+    fn a_steer_resolves_only_from_its_acceptance_response() {
+        let mut protocol = running_protocol();
+        let request = protocol.steer("change course").expect("steer request");
+        let wire: Value = serde_json::from_str(&request.wire).unwrap();
+        assert_eq!(wire["method"], "turn/steer");
+        assert_eq!(wire["params"]["expectedTurnId"], "turn-9");
+
+        let unrelated = protocol.push(&json!({
+            "id": request.id + 1,
+            "result": {"turnId": "turn-9"},
+        }));
+        assert!(unrelated.steer_responses.is_empty());
+
+        let accepted = protocol.push(&json!({
+            "id": request.id,
+            "result": {"turnId": "turn-9"},
+        }));
+        assert!(matches!(
+            accepted.steer_responses.as_slice(),
+            [SteerResponse { id, result: Ok(turn_id) }]
+                if *id == request.id && turn_id == "turn-9"
+        ));
+    }
+
+    #[test]
+    fn a_rejected_steer_preserves_the_app_server_error() {
+        let mut protocol = running_protocol();
+        let request = protocol.steer("too late").expect("steer request");
+        let rejected = protocol.push(&json!({
+            "id": request.id,
+            "error": {"code": -32602, "message": "no active turn"},
+        }));
+        assert!(matches!(
+            rejected.steer_responses.as_slice(),
+            [SteerResponse { result: Err(message), .. }] if message == "no active turn"
+        ));
     }
 
     #[test]

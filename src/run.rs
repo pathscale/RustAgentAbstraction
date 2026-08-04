@@ -9,7 +9,7 @@
 //! the moment the other filled its pipe buffer, which for a chatty agent is a
 //! matter of seconds.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::process::Stdio;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
@@ -93,7 +93,10 @@ const EVENT_BUFFER: usize = 256;
 /// the intent and lets the selected transport serialize it at the boundary.
 #[derive(Debug)]
 enum Control {
-    Message(String),
+    Message {
+        body: String,
+        receipt: tokio::sync::oneshot::Sender<Result<()>>,
+    },
     Approval {
         id: String,
         decision: crate::Decision,
@@ -160,16 +163,17 @@ impl Run {
     /// The agent takes it at its **next step boundary**, not mid-token, so an
     /// answer already being written finishes first and a long tool-using task
     /// changes course at its next step. Verified against claude 2.1.212 and
-    /// codex-cli 0.145.0.
+    /// codex-cli 0.146.0.
     ///
-    /// # Ordering, and why there is no acknowledgement
+    /// # Ordering and delivery acknowledgement
     ///
     /// The caller already knows what it sent, so the intended pattern is to
     /// append the message to the transcript immediately, below the user's
     /// previous one, and carry on. This deliberately does not ask the agent to
-    /// echo the message back for sequencing: an echo would only tell a UI
-    /// something it already knew, and waiting for one would delay the very
-    /// thing this exists to make immediate.
+    /// echo the message back for sequencing. The future resolves only after
+    /// the transport accepts the message: Codex has acknowledged `turn/steer`,
+    /// or Claude's input was written and flushed successfully. Rendering stays
+    /// immediate while a settle-race becomes an error the host can recover.
     ///
     /// # Errors
     /// [`Error::Unsupported`] on a run that did not open the channel with
@@ -184,12 +188,18 @@ impl Run {
                 what: "sending a follow-up on a run that is not interactive",
             });
         };
+        let cancelled = || Error::Cancelled {
+            bin: self.argv.first().cloned().unwrap_or_default(),
+        };
+        let (receipt, delivered) = tokio::sync::oneshot::channel();
         channel
-            .send(Control::Message(message.to_string()))
-            .await
-            .map_err(|_| Error::Cancelled {
-                bin: self.argv.first().cloned().unwrap_or_default(),
+            .send(Control::Message {
+                body: message.to_string(),
+                receipt,
             })
+            .await
+            .map_err(|_| cancelled())?;
+        delivered.await.map_err(|_| cancelled())?
     }
 
     /// Answer an [`Event::ApprovalRequest`].
@@ -676,26 +686,46 @@ async fn drive(
         // closing, or the turn settling.
         let (close_tx, mut close_rx) = tokio::sync::oneshot::channel::<()>();
         close_stdin = Some(close_tx);
+        let decision_bin = bin.clone();
         decision_task = decisions.map(|mut rx| {
             tokio::spawn(async move {
                 loop {
                     tokio::select! {
+                        biased;
+                        // Once the terminal record has arrived there is no
+                        // turn left to receive another message. Prioritizing
+                        // closure makes a simultaneous late send fail instead
+                        // of being reported as delivered to a finished turn.
+                        _ = &mut close_rx => break,
                         reply = rx.recv() => {
                             let Some(control) = reply else { break };
-                            let reply = match control {
-                                Control::Message(message) => {
-                                    crate::approval::user_message(&message)
+                            match control {
+                                Control::Message { body, receipt } => {
+                                    let wire = crate::approval::user_message(&body);
+                                    let result = async {
+                                        stdin.write_all(wire.as_bytes()).await?;
+                                        stdin.flush().await
+                                    }
+                                    .await
+                                    .map_err(|source| Error::Spawn {
+                                        bin: decision_bin.clone(),
+                                        source,
+                                    });
+                                    let failed = result.is_err();
+                                    let _ = receipt.send(result);
+                                    if failed {
+                                        break;
+                                    }
                                 }
-                                Control::Approval { id, decision } => decision.wire(&id),
-                            };
-                            if stdin.write_all(reply.as_bytes()).await.is_err() {
-                                break;
+                                Control::Approval { id, decision } => {
+                                    let wire = decision.wire(&id);
+                                    if stdin.write_all(wire.as_bytes()).await.is_err() {
+                                        break;
+                                    }
+                                    let _ = stdin.flush().await;
+                                }
                             }
-                            let _ = stdin.flush().await;
                         }
-                        // The turn is over. Dropping stdin is what lets claude
-                        // exit rather than wait for another message.
-                        _ = &mut close_rx => break,
                     }
                 }
                 drop(stdin);
@@ -1036,6 +1066,7 @@ async fn drive_codex_app_server(
     let mut line = String::new();
     let mut raw = String::new();
     let mut pending = VecDeque::new();
+    let mut steer_receipts = HashMap::new();
     let mut bound = false;
     let mut persist_result: Result<()> = Ok(());
     let deadline = async {
@@ -1059,7 +1090,13 @@ async fn drive_codex_app_server(
                     continue;
                 };
                 pending.push_back(control);
-                flush_codex_controls(&mut protocol, &mut pending, &mut stdin, &bin).await?;
+                flush_codex_controls(
+                    &mut protocol,
+                    &mut pending,
+                    &mut steer_receipts,
+                    &mut stdin,
+                    &bin,
+                ).await?;
                 stdin.flush().await.map_err(|source| Error::Spawn {
                     bin: bin.clone(), source
                 })?;
@@ -1069,6 +1106,7 @@ async fn drive_codex_app_server(
                     append_capped(&mut raw, &line);
                     if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
                         let step = protocol.push(&value);
+                        settle_codex_steers(&mut steer_receipts, step.steer_responses, &bin);
                         for event in step.events {
                             if let Event::Started { session, .. } = &event
                                 && !bound
@@ -1083,8 +1121,13 @@ async fn drive_codex_app_server(
                                 Error::Spawn { bin: bin.clone(), source }
                             })?;
                         }
-                        flush_codex_controls(&mut protocol, &mut pending, &mut stdin, &bin)
-                            .await?;
+                        flush_codex_controls(
+                            &mut protocol,
+                            &mut pending,
+                            &mut steer_receipts,
+                            &mut stdin,
+                            &bin,
+                        ).await?;
                         stdin.flush().await.map_err(|source| Error::Spawn {
                             bin: bin.clone(), source
                         })?;
@@ -1180,14 +1223,30 @@ async fn drive_codex_app_server(
 async fn flush_codex_controls(
     protocol: &mut crate::codex_app_server::Protocol,
     pending: &mut VecDeque<Control>,
+    steer_receipts: &mut HashMap<u64, tokio::sync::oneshot::Sender<Result<()>>>,
     stdin: &mut tokio::process::ChildStdin,
     bin: &str,
 ) -> Result<()> {
     let mut waiting = VecDeque::new();
     while let Some(control) = pending.pop_front() {
-        let encoded = match &control {
-            Control::Message(message) => protocol.steer(message),
-            Control::Approval { id, decision } => protocol.respond(id, decision),
+        let encoded = match control {
+            Control::Message { body, receipt } => {
+                if let Some(request) = protocol.steer(&body) {
+                    steer_receipts.insert(request.id, receipt);
+                    Some(request.wire)
+                } else {
+                    waiting.push_back(Control::Message { body, receipt });
+                    None
+                }
+            }
+            Control::Approval { id, decision } => {
+                if let Some(encoded) = protocol.respond(&id, &decision) {
+                    Some(encoded)
+                } else {
+                    waiting.push_back(Control::Approval { id, decision });
+                    None
+                }
+            }
         };
         if let Some(encoded) = encoded {
             stdin
@@ -1197,12 +1256,36 @@ async fn flush_codex_controls(
                     bin: bin.to_string(),
                     source,
                 })?;
-        } else {
-            waiting.push_back(control);
         }
     }
     pending.append(&mut waiting);
     Ok(())
+}
+
+/// Resolve the public `Run::send` future only after app-server has answered
+/// the matching `turn/steer` request. Dropping an unresolved sender when the
+/// turn completes is deliberate: the caller receives `Error::Cancelled` and
+/// can put the message into a fresh resumed turn.
+fn settle_codex_steers(
+    receipts: &mut HashMap<u64, tokio::sync::oneshot::Sender<Result<()>>>,
+    responses: Vec<crate::codex_app_server::SteerResponse>,
+    bin: &str,
+) {
+    for response in responses {
+        let Some(receipt) = receipts.remove(&response.id) else {
+            continue;
+        };
+        let result = response
+            .result
+            .map(|_| ())
+            .map_err(|message| Error::AgentError {
+                agent: crate::Agent::Codex,
+                bin: bin.to_string(),
+                status: None,
+                message,
+            });
+        let _ = receipt.send(result);
+    }
 }
 
 /// Kill the process group, reap the child, and join the stderr reader.
