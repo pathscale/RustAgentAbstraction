@@ -287,8 +287,11 @@ a run already under way:
 let request = Request::new(Agent::Claude, prompt).interactive();
 let mut run = stream(&request)?;
 
+// Keep input independent from the task continuously draining run.recv().
+let control = run.control();
+
 // ... from the UI thread, the moment the user hits enter:
-run.send("actually, skip the tests and just fix the parser").await?;
+control.send("actually, skip the tests and just fix the parser").await?;
 ```
 
 The agent takes it at its **next step boundary**, not mid-token. Verified against claude

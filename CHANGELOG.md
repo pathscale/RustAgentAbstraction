@@ -8,6 +8,20 @@ appear in a patch rather than inflating the version toward 1.0 on a crate still 
 shape. **Where that happens the entry says so at the top**, because a version number that
 under-signals is only acceptable if the changelog over-signals to compensate.
 
+## 0.4.9
+
+### Fixed
+
+- **Interactive input no longer has to block event draining.** `Run::control`
+  returns a cloneable `RunControl`, so a host can await a Codex `turn/steer`
+  acknowledgement while continuing to consume the agent event stream. Awaiting
+  `Run::send` on the event-loop task could fill the bounded event channel before
+  app-server's acknowledgement was read, leaving both sides waiting forever.
+
+  `Run::send` and `Run::respond` remain available and keep their existing
+  behaviour. Hosts that multiplex input and output should use the independent
+  control handle.
+
 ## 0.4.8
 
 ### Fixed

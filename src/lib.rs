@@ -112,5 +112,5 @@ pub use model::{Kind, Model, Source, Verified};
 pub use outcome::{Outcome, RateLimit, Stop, Usage};
 pub use probe::{Probe, Version, VersionStatus};
 pub use request::Request;
-pub use run::{Run, run, stream};
+pub use run::{Run, RunControl, run, stream};
 pub use session::{Phase, SessionRecord, SessionStore};

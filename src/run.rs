@@ -123,8 +123,9 @@ enum Control {
 #[derive(Debug)]
 pub struct Run {
     events: mpsc::Receiver<Event>,
-    /// Which agent this is, so `respond` can name it in an error.
-    agent: crate::Agent,
+    /// A cloneable route back into the run. Kept separate from the event
+    /// receiver so a host can drain output while a delivery receipt is pending.
+    control: RunControl,
     /// The typed command line, kept so both the plain and redacted views come
     /// from the same source.
     typed: Vec<crate::agent::Arg>,
@@ -134,11 +135,6 @@ pub struct Run {
     /// Set by the driver once the child has been reaped, so `Drop` never
     /// signals a pid the OS may since have handed to someone else.
     reaped: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Lines on the way back to the agent: follow-up messages and approval
-    /// decisions share one channel because they share one stdin. `None` unless
-    /// the request opened it, which is what lets [`Run::send`] and
-    /// [`Run::respond`] refuse rather than silently do nothing.
-    to_agent: Option<mpsc::Sender<Control>>,
     /// Dropping or firing this asks the driver to tear down in order. Held as
     /// an `Option` so `detach` can discard it without signalling.
     cancel: Option<tokio::sync::oneshot::Sender<()>>,
@@ -149,10 +145,90 @@ pub struct Run {
     argv: Vec<String>,
 }
 
+/// A cloneable route for sending input to a live [`Run`].
+///
+/// Keep this beside the task that drains [`Run::recv`]. A delivery receipt may
+/// arrive after a burst of agent events, so awaiting [`Self::send`] on the same
+/// task that owns the mutable `Run` can apply backpressure to the event stream
+/// and prevent the receipt itself from being read. A separate control handle
+/// lets both directions make progress concurrently.
+#[derive(Clone, Debug)]
+pub struct RunControl {
+    agent: crate::Agent,
+    to_agent: Option<mpsc::Sender<Control>>,
+    bin: String,
+}
+
+impl RunControl {
+    /// Send another message while the agent is still working.
+    ///
+    /// The future resolves only after the transport accepts the message. It is
+    /// safe to await from a separate task while the owner continues draining
+    /// [`Run::recv`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Unsupported`] when the run is not interactive, or
+    /// [`Error::Cancelled`] when the run finishes before delivery is confirmed.
+    pub async fn send(&self, message: &str) -> Result<()> {
+        let Some(channel) = &self.to_agent else {
+            return Err(Error::Unsupported {
+                agent: self.agent,
+                what: "sending a follow-up on a run that is not interactive",
+            });
+        };
+        let cancelled = || Error::Cancelled {
+            bin: self.bin.clone(),
+        };
+        let (receipt, delivered) = tokio::sync::oneshot::channel();
+        channel
+            .send(Control::Message {
+                body: message.to_string(),
+                receipt,
+            })
+            .await
+            .map_err(|_| cancelled())?;
+        delivered.await.map_err(|_| cancelled())?
+    }
+
+    /// Answer an [`Event::ApprovalRequest`] without borrowing the event stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Unsupported`] when the run does not accept approvals,
+    /// or [`Error::Cancelled`] when the run finishes before the response is sent.
+    pub async fn respond(&self, id: &str, decision: &crate::Decision) -> Result<()> {
+        let Some(channel) = &self.to_agent else {
+            return Err(Error::Unsupported {
+                agent: self.agent,
+                what: "answering an approval on a run that did not request them",
+            });
+        };
+        channel
+            .send(Control::Approval {
+                id: id.to_string(),
+                decision: decision.clone(),
+            })
+            .await
+            .map_err(|_| Error::Cancelled {
+                bin: self.bin.clone(),
+            })
+    }
+}
+
 impl Run {
     /// The next event, or `None` once the agent has finished producing them.
     pub async fn recv(&mut self) -> Option<Event> {
         self.events.recv().await
+    }
+
+    /// Clone the route used for follow-up messages and approval decisions.
+    ///
+    /// Use this when input and output must progress concurrently. The handle
+    /// does not keep the process alive after the `Run` settles or is dropped.
+    #[must_use]
+    pub fn control(&self) -> RunControl {
+        self.control.clone()
     }
 
     /// Send another message while the agent is still working.
@@ -182,24 +258,7 @@ impl Run {
     /// **a message sent after the turn ends is too late** and belongs in a new
     /// run resuming the session, so this reports it rather than dropping it.
     pub async fn send(&self, message: &str) -> Result<()> {
-        let Some(channel) = &self.to_agent else {
-            return Err(Error::Unsupported {
-                agent: self.agent,
-                what: "sending a follow-up on a run that is not interactive",
-            });
-        };
-        let cancelled = || Error::Cancelled {
-            bin: self.argv.first().cloned().unwrap_or_default(),
-        };
-        let (receipt, delivered) = tokio::sync::oneshot::channel();
-        channel
-            .send(Control::Message {
-                body: message.to_string(),
-                receipt,
-            })
-            .await
-            .map_err(|_| cancelled())?;
-        delivered.await.map_err(|_| cancelled())?
+        self.control.send(message).await
     }
 
     /// Answer an [`Event::ApprovalRequest`].
@@ -218,21 +277,7 @@ impl Run {
     /// already finished or been torn down, which is the same reason a decision
     /// can no longer be delivered.
     pub async fn respond(&self, id: &str, decision: &crate::Decision) -> Result<()> {
-        let Some(channel) = &self.to_agent else {
-            return Err(Error::Unsupported {
-                agent: self.agent,
-                what: "answering an approval on a run that did not request them",
-            });
-        };
-        channel
-            .send(Control::Approval {
-                id: id.to_string(),
-                decision: decision.clone(),
-            })
-            .await
-            .map_err(|_| Error::Cancelled {
-                bin: self.argv.first().cloned().unwrap_or_default(),
-            })
+        self.control.respond(id, decision).await
     }
 
     /// The exact command line that was spawned.
@@ -552,12 +597,15 @@ pub fn stream(request: &Request) -> Result<Run> {
     });
     Ok(Run {
         events: rx,
-        agent: request_agent,
+        control: RunControl {
+            agent: request_agent,
+            to_agent: decisions_tx,
+            bin: argv.first().cloned().unwrap_or_default(),
+        },
         typed,
         pid,
         reaped,
         cancel: Some(cancel_tx),
-        to_agent: decisions_tx,
         task: Some(task),
         argv,
     })
@@ -2287,6 +2335,72 @@ mod tests {
         };
         assert_eq!(agent, Agent::Claude);
         assert!(hint.contains("claude-code"));
+    }
+
+    /// Regression for the `AgencyZero` hang: Codex can put its steer receipt
+    /// behind more events than fit in the bounded channel. Input must wait on a
+    /// handle independent from the mutable event receiver, or the producer and
+    /// consumer block each other permanently.
+    #[tokio::test]
+    async fn a_control_receipt_can_wait_behind_a_full_event_buffer() {
+        let (events_tx, events_rx) = mpsc::channel(EVENT_BUFFER);
+        let (controls_tx, mut controls_rx) = mpsc::channel(1);
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _cancel_rx = cancel_rx;
+            let Some(Control::Message { receipt, .. }) = controls_rx.recv().await else {
+                panic!("follow-up message")
+            };
+            for index in 0..=EVENT_BUFFER {
+                events_tx
+                    .send(Event::Thinking(index.to_string()))
+                    .await
+                    .expect("the host keeps draining events");
+            }
+            let _ = receipt.send(Ok(()));
+            Ok(Outcome {
+                agent: Agent::Codex,
+                session: None,
+                text: String::new(),
+                usage: crate::Usage::default(),
+                stop: Stop::Completed,
+                rate_limit: None,
+                exit_code: 0,
+                stderr: String::new(),
+                unparsed: 0,
+                first_unparsed: None,
+                structured: None,
+            })
+        });
+        let reaped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut run = Run {
+            events: events_rx,
+            control: RunControl {
+                agent: Agent::Codex,
+                to_agent: Some(controls_tx),
+                bin: "codex".into(),
+            },
+            typed: Vec::new(),
+            pid: None,
+            reaped,
+            cancel: Some(cancel_tx),
+            task: Some(task),
+            argv: vec!["codex".into()],
+        };
+
+        let control = run.control();
+        let delivery = tokio::spawn(async move { control.send("change course").await });
+        let mut seen = 0;
+        while run.recv().await.is_some() {
+            seen += 1;
+        }
+
+        assert_eq!(seen, EVENT_BUFFER + 1);
+        delivery
+            .await
+            .expect("delivery task")
+            .expect("transport receipt");
+        run.finish().await.expect("run outcome");
     }
 
     #[test]
