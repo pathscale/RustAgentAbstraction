@@ -661,6 +661,57 @@ async fn codex_app_server_routes_approvals() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The allow half of the app-server approval round trip. `AgencyZero` can
+/// remember a scoped decision and answer immediately, so an accepted request
+/// must resume the same turn rather than leaving it waiting forever.
+#[tokio::test]
+#[ignore = "spawns a real agent and consumes quota"]
+async fn codex_app_server_resumes_after_an_allowed_approval() {
+    if !available(Agent::Codex) {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!(
+        "agent-abstraction-codex-allow-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let outside = std::path::PathBuf::from(std::env::var_os("HOME").expect("home dir"))
+        .join(format!(".codex-allowed-outside-{}", std::process::id()));
+    let _ = std::fs::remove_file(&outside);
+
+    let request = Request::new(
+        Agent::Codex,
+        format!(
+            "Use a shell command to create exactly this file, then reply done: {}",
+            outside.display()
+        ),
+    )
+    .cwd(&dir)
+    .permission(Permission::Auto)
+    .approvals()
+    .timeout(Duration::from_secs(180));
+
+    let mut run = stream(&request).expect("app-server should start");
+    let mut asked = false;
+    while let Some(event) = run.recv().await {
+        if let Event::ApprovalRequest(approval) = event {
+            asked = true;
+            run.respond(&approval.id, &agent_abstraction::Decision::Allow)
+                .await
+                .expect("the approval should reach app-server");
+        }
+    }
+    let outcome = run
+        .finish()
+        .await
+        .expect("an approval should resume the turn");
+    assert!(asked, "Codex did not ask for the out-of-root write");
+    assert!(outside.exists(), "the approved write did not run");
+    assert!(outcome.is_ok(), "the turn did not complete: {outcome:?}");
+    let _ = std::fs::remove_file(&outside);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A live counter has to agree with the number that replaces it when the run
 /// ends, or a UI would show a total that jumps at the last moment. Drives a
 /// multi-step task so several model calls report, then checks the accumulated
