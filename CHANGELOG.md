@@ -8,6 +8,15 @@ appear in a patch rather than inflating the version toward 1.0 on a crate still 
 shape. **Where that happens the entry says so at the top**, because a version number that
 under-signals is only acceptable if the changelog over-signals to compensate.
 
+## 0.4.13
+
+### Fixed
+
+- **Writable Codex runs retain the git repository safety check.**
+  `--skip-git-repo-check` is now limited to ReadOnly and Plan, whose sandbox
+  cannot edit files. Edit, Auto, and Bypass no longer waive Codex's guard
+  against changes without a version-control recovery path.
+
 ## 0.4.12
 
 ### Fixed

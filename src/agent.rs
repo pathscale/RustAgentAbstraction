@@ -931,13 +931,14 @@ fn argv_codex(plan: &Plan) -> Vec<Arg> {
             .arg_sensitive(id.clone(), Sensitivity::SessionId);
     }
 
-    // `codex exec` aborts outside a git repository unless told not to. That
-    // check guards against an agent editing files with no way to undo them, but
-    // this crate is embedded in hosts that legitimately run against scratch
-    // directories, worktrees and review checkouts, and a hard abort there is
-    // useless to them. The real containment is the sandbox below, which is
-    // `read-only` by default, so nothing is unrecoverable regardless.
-    a.bare("--skip-git-repo-check");
+    // `codex exec` aborts outside a git repository unless told not to. Waiving
+    // that check is safe only while the sandbox cannot write: scratch
+    // directories and review exports remain readable, while Edit, Auto, and
+    // Bypass retain Codex's guard against changes with no version-control
+    // recovery path.
+    if matches!(plan.permission, Permission::ReadOnly | Permission::Plan) {
+        a.bare("--skip-git-repo-check");
+    }
 
     // `codex exec` takes `--sandbox`, but `codex exec resume` does **not**: it
     // rejects the flag outright and takes the same setting as a `-c` config
@@ -1458,18 +1459,30 @@ mod tests {
         }
     }
 
-    /// `codex exec` aborts outside a git repository. A host embedding this
-    /// crate runs against scratch dirs and review checkouts, so the check is
-    /// waived on every invocation; the sandbox is what actually contains a run.
+    /// Read-only runs can inspect scratch dirs and review exports safely. A
+    /// writable posture keeps Codex's repository guard, since there may be no
+    /// way to undo a change outside version control.
     #[test]
-    fn codex_always_waives_the_git_repo_check() {
+    fn codex_waives_the_git_repo_check_only_without_writes() {
         for cont in [Continue::New, Continue::Resume("t-1".into())] {
-            let mut p = plan("codex");
-            p.cont = cont.clone();
-            assert!(
-                argv(Agent::Codex, &p).contains(&"--skip-git-repo-check".to_string()),
-                "{cont:?} must still run outside a repo"
-            );
+            for permission in [Permission::ReadOnly, Permission::Plan] {
+                let mut p = plan("codex");
+                p.cont = cont.clone();
+                p.permission = permission;
+                assert!(
+                    argv(Agent::Codex, &p).contains(&"--skip-git-repo-check".to_string()),
+                    "{cont:?} {permission:?} must still read outside a repo"
+                );
+            }
+            for permission in [Permission::Edit, Permission::Auto, Permission::Bypass] {
+                let mut p = plan("codex");
+                p.cont = cont.clone();
+                p.permission = permission;
+                assert!(
+                    !argv(Agent::Codex, &p).contains(&"--skip-git-repo-check".to_string()),
+                    "{cont:?} {permission:?} must keep Codex's repository guard"
+                );
+            }
         }
     }
 

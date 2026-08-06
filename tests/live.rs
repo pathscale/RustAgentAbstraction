@@ -916,10 +916,9 @@ async fn copilot_answers_and_reports_a_session() {
     );
 }
 
-/// `codex exec` aborts outside a git repository unless the check is waived.
-/// This crate waives it on every invocation, so a run from a scratch directory
-/// must still work. Running the rest of the suite from the repo would never
-/// catch a regression here, because the repo *is* a git checkout.
+/// A read-only `codex exec` can safely inspect a non-repository scratch
+/// directory. Running the rest of the suite from the repo would never catch a
+/// regression here, because the repo already satisfies Codex's guard.
 #[tokio::test]
 #[ignore = "spawns a real agent and consumes quota"]
 async fn codex_runs_outside_a_git_repository() {
@@ -933,9 +932,11 @@ async fn codex_runs_outside_a_git_repository() {
         "the point of this test is that it is not a repo"
     );
 
-    let outcome = run(&ping(Agent::Codex).cwd(&scratch))
-        .await
-        .expect("codex refused to run outside a git repo");
+    let outcome = run(&ping(Agent::Codex)
+        .cwd(&scratch)
+        .permission(Permission::ReadOnly))
+    .await
+    .expect("codex refused to run outside a git repo");
 
     assert!(outcome.is_ok(), "unexpected stop: {outcome:?}");
     assert!(

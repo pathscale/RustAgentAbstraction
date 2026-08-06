@@ -534,10 +534,10 @@ own variables do not reach the child.
 
 ## Gotchas worth knowing
 
-- **`codex exec` refuses to run outside a git repository.** This crate always passes
-  `--skip-git-repo-check`, so it runs anywhere. That check exists to stop an agent editing
-  files with no way to undo them; the sandbox is the real containment here, and it defaults
-  to `read-only`.
+- **`codex exec` refuses writable runs outside a git repository.** This crate passes
+  `--skip-git-repo-check` only for `ReadOnly` and `Plan`, where the sandbox prevents edits.
+  `Edit`, `Auto`, and `Bypass` retain Codex's guard because a change outside version control
+  may have no recovery path.
 - **`codex exec resume` does not accept `--sandbox`.** It is a different option set from
   `codex exec` and rejects the flag outright, so the permission posture is applied as
   `-c sandbox_mode=...` on the resume path. Only a multi-turn run reveals this: every
