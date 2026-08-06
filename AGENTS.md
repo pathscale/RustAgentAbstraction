@@ -52,14 +52,11 @@ Copilot CLIs headlessly behind one API. Consumed as a direct dependency by the
 
 ## CI runners
 
-**Never `runs-on: ubuntu-latest`**, or any other GitHub-hosted label. CI here runs on
-Ubicloud: `ubicloud-standard-2` / `-4` / `-8`. A GitHub-hosted label is not a neutral
-default, it silently bills GitHub Actions minutes instead.
-
-Size by what the job actually needs. This crate's checks finish in well under a minute, so
-`-2` is correct; Ubicloud bills by vCPU-minute and a bigger runner costs more for no
-wall-clock gain. Ubicloud must also be enabled for a repository before its runners will
-pick up jobs, so a new repo needs that done first or workflows queue forever.
+Use the explicitly pinned GitHub-hosted `ubuntu-24.04` image. Keep the complete CI
+decision in one job so checkout, toolchain setup, dependency resolution, and runner
+startup happen once per pull request. Do not add an external runner dependency without
+an operational fallback: unavailable third-party capacity must not leave releases queued
+indefinitely.
 
 ## Build & run
 

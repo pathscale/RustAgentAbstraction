@@ -8,6 +8,16 @@ appear in a patch rather than inflating the version toward 1.0 on a crate still 
 shape. **Where that happens the entry says so at the top**, because a version number that
 under-signals is only acceptable if the changelog over-signals to compensate.
 
+## 0.4.12
+
+### Fixed
+
+- **Codex Auto runs can use GitHub without an approval round trip.** The Codex
+  workspace sandbox now enables network access for Auto while retaining its
+  configured writable roots. Edit remains offline and Ask remains interactive.
+- Release and pull request checks now use a pinned GitHub-hosted runner so an
+  unavailable external runner pool cannot leave a release queued indefinitely.
+
 ## 0.4.10
 
 ### Fixed
