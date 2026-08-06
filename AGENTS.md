@@ -88,12 +88,13 @@ the registry is a no-op, so a rerun or a revert cannot double-publish.
 
 Two consequences worth holding on to:
 
-- **A version bump is a release.** There is no staging step between merging one and it being
-  permanent on crates.io, where a version number can never be reused. Bump the version in the
-  commit you intend to ship, not ahead of it.
-- **The publish job re-runs the full check suite itself** rather than trusting the CI
-  workflow. Both fire on the same push and nothing orders them, and a publish is the one
-  action that cannot be taken back.
+- **A version bump is a release.** Required PR CI is the verification gate, then
+  `cargo publish` performs the final package build. There is no staging step between merging
+  one and it being permanent on crates.io, where a version number can never be reused. Bump
+  the version in the commit you intend to ship, not ahead of it.
+- **Do not repeat the full check suite in the publish job.** The required PR job already ran
+  formatting, clippy, tests, docs, package validation, and audit against that commit. Running
+  the same work again after merge costs another runner without testing different code.
 
 Requires the `CARGO_REGISTRY_TOKEN` repository secret. Without it the job fails with that
 name in the message rather than an opaque auth error from cargo.

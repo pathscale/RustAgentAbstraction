@@ -28,7 +28,7 @@ env:
 jobs:
   publish:
     name: publish to crates.io
-    runs-on: ubicloud-standard-2
+    runs-on: ${{ vars.UBICLOUD_RUNNER || 'ubicloud-standard-2-arm' }}
     permissions:
       # For pushing the version tag.
       contents: write
@@ -83,24 +83,14 @@ jobs:
       - name: Install the toolchain
         if: steps.check.outputs.needed == 'true'
         uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
         if: steps.check.outputs.needed == 'true'
 
-      # Re-verified here rather than trusting the CI workflow to have finished.
-      # Both run on the same push, so nothing orders them, and a publish is the
-      # one action that cannot be taken back.
-      - name: Verify before publishing
-        if: steps.check.outputs.needed == 'true'
-        run: |
-          cargo fmt --all --check
-          cargo clippy --all-targets -- -D warnings
-          cargo test --all-targets
-          cargo test --doc
-          cargo package
-
+      # The PR's single required CI job already ran fmt, clippy, tests, docs,
+      # package validation, and audit. `cargo publish` performs the final
+      # package build; repeating the entire suite here consumed another runner
+      # without testing different code.
       - name: Publish
         if: steps.check.outputs.needed == 'true'
         run: cargo publish
