@@ -117,6 +117,19 @@ pub enum Error {
         requested: Agent,
     },
 
+    /// Another run currently owns the same named session.
+    ///
+    /// The lease is cross-process and ends when that run settles or its process
+    /// dies. Retrying later is safe; running both would fork the provider's
+    /// conversation and leave the store pointing at whichever finished last.
+    #[error("session `{name}` for project `{project}` already has a run in progress")]
+    SessionBusy {
+        /// The caller-owned session name.
+        name: String,
+        /// The project namespace containing it.
+        project: String,
+    },
+
     /// The session store could not be read or written.
     #[error("session store I/O failed at {path}: {source}")]
     Store {
@@ -256,15 +269,19 @@ pub enum Error {
 impl Error {
     /// Whether retrying this exact request later could plausibly succeed.
     ///
-    /// True for quota and timeout failures; false for a missing binary, an
-    /// unsupported capability, or a session conflict, which need the caller to
-    /// change something first. This classifies; it does not retry. A caller
-    /// must stop the old run before retrying [`Error::ControlTimeout`].
+    /// True for quota and timeout failures, and for a named session whose prior
+    /// run has not settled yet. False for a missing binary, an unsupported
+    /// capability, or an agent mismatch, which need the caller to change
+    /// something first. This classifies; it does not retry. A caller must stop
+    /// the old run before retrying [`Error::ControlTimeout`].
     #[must_use]
     pub fn is_transient(&self) -> bool {
         matches!(
             self,
-            Error::RateLimited { .. } | Error::Timeout { .. } | Error::ControlTimeout { .. }
+            Error::RateLimited { .. }
+                | Error::Timeout { .. }
+                | Error::ControlTimeout { .. }
+                | Error::SessionBusy { .. }
         )
     }
 

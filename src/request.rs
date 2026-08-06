@@ -62,6 +62,7 @@ pub(crate) struct Binding {
     pub(crate) project: PathBuf,
     pub(crate) name: String,
     pub(crate) phase: Phase,
+    pub(crate) fork: bool,
 }
 
 impl Request {
@@ -425,6 +426,7 @@ impl Request {
             project,
             name,
             phase,
+            fork,
         });
         // A named session needs an id back. The default format carries one, so
         // this only has to refuse a format the caller pinned that cannot:

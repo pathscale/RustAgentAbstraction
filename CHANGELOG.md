@@ -8,6 +8,16 @@ appear in a patch rather than inflating the version toward 1.0 on a crate still 
 shape. **Where that happens the entry says so at the top**, because a version number that
 under-signals is only acceptable if the changelog over-signals to compensate.
 
+## 0.4.14
+
+### Added
+
+- **Named sessions now have cross-process concurrency control.** A run holds a
+  non-blocking OS lease across the full read-run-commit cycle. A second run on
+  the same project and session returns `Error::SessionBusy`, which is transient,
+  instead of forking the provider conversation and silently losing one binding.
+  The lease is released by the kernel if its holder is killed.
+
 ## 0.4.13
 
 ### Fixed

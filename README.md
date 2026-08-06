@@ -129,6 +129,13 @@ in two checkouts never collides, and written through a temp file and a rename so
 concurrent reader never sees a half-written record. A corrupt record reads as absent: the
 next turn opens a fresh conversation rather than failing over a cache nobody asked about.
 
+One named session can have only one run at a time, across processes. `stream()` takes a
+non-blocking OS lease for the full read-run-commit cycle and returns `Error::SessionBusy`
+when another holder is active. Rebuild or retry the request after that run settles; the
+binding is re-read under the lease, so a request prepared while the prior run was active
+cannot resume a stale token. The kernel releases the lease if its holder is killed, so a
+crashed host cannot deadlock the session.
+
 Names are percent-encoded into a single path segment, which is **injective**: two different
 names can never land on the same file. That matters more than it sounds, because the failure
 mode of a lossy scheme is silent, not loud. Folding unsafe characters to `-` would map
