@@ -611,6 +611,49 @@ async fn codex_app_server_can_write_inside_its_cwd() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Auto is the workspace-rooted posture that may also use the network without
+/// asking the host. `AgencyZero` relies on this for ordinary GitHub reads and
+/// pushes; an approval request here can strand the whole turn before its card
+/// reaches the frontend.
+#[tokio::test]
+#[ignore = "spawns a real agent, uses the network, and consumes quota"]
+async fn codex_auto_uses_github_without_an_approval_request() {
+    if !available(Agent::Codex) {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!(
+        "agent-abstraction-codex-auto-network-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+
+    let request = Request::new(
+        Agent::Codex,
+        "Run exactly this read-only command: git ls-remote https://github.com/pathscale/agencyzero.git HEAD. Then reply done.",
+    )
+    .cwd(&dir)
+    .permission(Permission::Auto)
+    .interactive()
+    .approvals()
+    .timeout(Duration::from_secs(180));
+
+    let mut run = stream(&request).expect("app-server should start");
+    let mut asked = false;
+    while let Some(event) = run.recv().await {
+        if matches!(event, Event::ApprovalRequest(_)) {
+            asked = true;
+        }
+    }
+    let outcome = run.finish().await.expect("the GitHub read should complete");
+
+    assert!(
+        !asked,
+        "Codex asked the host to approve an Auto network read"
+    );
+    assert!(outcome.is_ok(), "the turn did not complete: {outcome:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A Codex sandbox escape is a server request the host can deny mid-turn.
 #[tokio::test]
 #[ignore = "spawns a real agent and consumes quota"]

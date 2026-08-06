@@ -136,19 +136,25 @@ impl Protocol {
         let plan = self.request.plan();
         let roots = roots(&self.request);
         // app-server does not implicitly add `cwd` to a turn's writable roots.
-        // Verified against codex-cli 0.146.0 on 2026-08-04: omitting the first
-        // root leaves a one-directory request able to read its cwd but unable
-        // to write there. Every declared root therefore belongs in both the
-        // runtime scope and the workspace-write sandbox policy.
+        // Verified against codex-cli 0.146.0 on 2026-08-06: omitting the first
+        // root leaves a one-directory request unable to write there, while
+        // `networkAccess: true` permits a network command without widening the
+        // filesystem beyond these roots. Auto enables that documented network
+        // lane; Edit keeps network gated so its approvals remain meaningful.
         let writable = roots.clone();
         let sandbox = match plan.permission {
             Permission::ReadOnly | Permission::Plan => {
                 json!({"type": "readOnly", "networkAccess": false})
             }
-            Permission::Edit | Permission::Auto => json!({
+            Permission::Edit => json!({
+                "type": "workspaceWrite",
+                "writableRoots": writable.clone(),
+                "networkAccess": false,
+            }),
+            Permission::Auto => json!({
                 "type": "workspaceWrite",
                 "writableRoots": writable,
-                "networkAccess": false,
+                "networkAccess": true,
             }),
             Permission::Bypass => json!({"type": "dangerFullAccess"}),
         };
@@ -583,6 +589,30 @@ mod tests {
         ));
         let turn: Value = serde_json::from_str(&step.writes[0]).unwrap();
         assert_eq!(turn["params"]["sandboxPolicy"]["type"], "workspaceWrite");
+        assert_eq!(turn["params"]["sandboxPolicy"]["networkAccess"], true);
+        assert_eq!(
+            turn["params"]["sandboxPolicy"]["writableRoots"],
+            json!(["/workspace", "/repo"])
+        );
+    }
+
+    #[test]
+    fn edit_keeps_network_gated_inside_the_same_workspace_roots() {
+        let edit = Request::new(Agent::Codex, "hello")
+            .cwd("/workspace")
+            .add_dir("/repo")
+            .permission(Permission::Edit)
+            .interactive()
+            .approvals();
+        let mut protocol = Protocol::new(edit);
+        let step = protocol.push(&json!({
+            "id": OPEN_ID,
+            "result": {"thread": {"id": "thread-edit"}, "model": "gpt-5.6-sol"},
+        }));
+        let turn: Value = serde_json::from_str(&step.writes[0]).unwrap();
+
+        assert_eq!(turn["params"]["sandboxPolicy"]["type"], "workspaceWrite");
+        assert_eq!(turn["params"]["sandboxPolicy"]["networkAccess"], false);
         assert_eq!(
             turn["params"]["sandboxPolicy"]["writableRoots"],
             json!(["/workspace", "/repo"])
