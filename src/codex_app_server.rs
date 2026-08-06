@@ -288,7 +288,14 @@ impl Protocol {
             }
             "thread/tokenUsage/updated" => {
                 if let Some(usage) = usage(&params) {
-                    self.terminal.usage = usage;
+                    // `last` is one model call, not the whole interactive
+                    // turn. Tool-heavy turns receive one update after every
+                    // call; replacing here made the live stream correctly add
+                    // 1.7M processed tokens while the terminal outcome fell
+                    // back to only its final 226k call. The snapshots are
+                    // disjoint billing traffic, so accumulate their additive
+                    // fields while keeping context-shaped fields latest.
+                    self.terminal.usage.accumulate(&usage);
                     step.events.push(Event::Usage(usage));
                 }
             }
@@ -649,6 +656,28 @@ mod tests {
         assert_eq!(usage.input_tokens, Some(40));
         assert_eq!(usage.context_tokens, Some(100));
         assert_eq!(usage.context_window, Some(258_400));
+    }
+
+    #[test]
+    fn codex_terminal_usage_accumulates_every_model_call_in_the_turn() {
+        let mut protocol = Protocol::new(request());
+        for (input, cached, output) in [(206_011, 188_160, 321), (206_692, 204_544, 285)] {
+            protocol.push(&json!({
+                "method": "thread/tokenUsage/updated",
+                "params": {"tokenUsage": {"last": {
+                    "inputTokens": input,
+                    "cachedInputTokens": cached,
+                    "outputTokens": output,
+                    "reasoningOutputTokens": 0
+                }, "modelContextWindow": 997_500}},
+            }));
+        }
+
+        assert_eq!(protocol.terminal.usage.input_tokens, Some(19_999));
+        assert_eq!(protocol.terminal.usage.cache_read_tokens, Some(392_704));
+        assert_eq!(protocol.terminal.usage.output_tokens, Some(606));
+        assert_eq!(protocol.terminal.usage.context_tokens, Some(206_692));
+        assert_eq!(protocol.terminal.usage.context_window, Some(997_500));
     }
 
     #[test]
