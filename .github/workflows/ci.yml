@@ -17,11 +17,13 @@ env:
 jobs:
   check:
     name: fmt, clippy, test
-    # One GitHub-hosted runner for the complete decision. Audit used to be a
-    # second VM that repeated checkout, toolchain setup, and dependency
-    # resolution. Pin the image so an upstream `latest` change cannot move the
-    # toolchain underneath an otherwise unchanged pull request.
-    runs-on: ubuntu-24.04
+    # One runner for the complete decision. Audit used to be a second VM that
+    # repeated checkout, toolchain setup, and dependency resolution.
+    # `-2` is deliberate: this job finishes in well under a minute, and
+    # Ubicloud bills by vCPU-minute, so a larger runner costs more for no
+    # wall-clock gain. The repository variable keeps a pool switch operational
+    # rather than requiring another workflow change.
+    runs-on: ${{ vars.UBICLOUD_RUNNER || 'ubicloud-standard-2-arm' }}
     steps:
       - uses: actions/checkout@v4
 
