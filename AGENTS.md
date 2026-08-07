@@ -52,11 +52,15 @@ Copilot CLIs headlessly behind one API. Consumed as a direct dependency by the
 
 ## CI runners
 
-Use the explicitly pinned GitHub-hosted `ubuntu-24.04` image. Keep the complete CI
-decision in one job so checkout, toolchain setup, dependency resolution, and runner
-startup happen once per pull request. Do not add an external runner dependency without
-an operational fallback: unavailable third-party capacity must not leave releases queued
-indefinitely.
+Use the configurable Ubicloud runner in both CI and publishing. The default is
+`ubicloud-standard-2-arm`: this pure Rust crate finishes in well under a minute, and a
+larger runner adds billed vCPU-minutes without shortening the decision. Keep the complete
+CI decision in one job so checkout, toolchain setup, dependency resolution, and runner
+startup happen once per pull request.
+
+Ubicloud must be enabled for the repository before its runners can pick up jobs. Change
+the `UBICLOUD_RUNNER` repository variable when capacity moves rather than editing workflow
+files or silently falling back to GitHub-hosted minutes.
 
 ## Build & run
 

@@ -63,6 +63,22 @@ pub struct SessionStore {
     dir: PathBuf,
 }
 
+/// An exclusive lease on one named session.
+///
+/// The file remains on disk after release, but the OS lock does not: closing
+/// the handle, including when a process is killed, releases it. Keeping the
+/// inert file avoids an unlink race where a new opener could lock a different
+/// inode while the prior holder still owns the old one.
+pub(crate) struct SessionLease {
+    file: fs::File,
+}
+
+impl Drop for SessionLease {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.file);
+    }
+}
+
 impl SessionStore {
     /// A store rooted at `dir`. The directory is created lazily on first write.
     pub fn open(dir: impl Into<PathBuf>) -> Self {
@@ -97,6 +113,41 @@ impl SessionStore {
         self.dir
             .join(project_slug(project))
             .join(format!("{}.json", encode_segment(name)))
+    }
+
+    /// Claim one named session until the returned guard is dropped.
+    ///
+    /// Advisory file locks are cross-process and are released by the OS when a
+    /// holder dies, so a crashed agent host cannot strand a stale lease. The
+    /// lock is non-blocking: a queue or server can report contention and decide
+    /// its own retry policy instead of tying up a worker indefinitely.
+    pub(crate) fn lease(&self, project: &Path, name: &str) -> Result<SessionLease> {
+        let path = self.path_of(project, name).with_extension("lock");
+        let store_err = |source| Error::Store {
+            path: path.display().to_string(),
+            source,
+        };
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(store_err)?;
+            restrict_to_owner(parent).map_err(store_err)?;
+        }
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(store_err)?;
+        match fs2::FileExt::try_lock_exclusive(&file) {
+            Ok(()) => Ok(SessionLease { file }),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                Err(Error::SessionBusy {
+                    name: name.to_string(),
+                    project: project.display().to_string(),
+                })
+            }
+            Err(error) => Err(store_err(error)),
+        }
     }
 
     /// The stored record, or `None` when there is none.
@@ -152,8 +203,10 @@ impl SessionStore {
         let mut out = Vec::new();
         for entry in entries {
             let path = entry.map_err(|e| store_err(&dir, e))?.path();
-            // Skip the temp files a concurrent write may have in flight.
-            if path.extension().is_some_and(|ext| ext == "tmp") {
+            // Only records belong in the result. Temp files can be present
+            // during an atomic write and `.lock` files persist so every process
+            // coordinates on the same inode.
+            if path.extension().is_none_or(|ext| ext != "json") {
                 continue;
             }
             let text = fs::read_to_string(&path).map_err(|e| store_err(&path, e))?;

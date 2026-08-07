@@ -166,8 +166,8 @@ impl Agent {
             },
             Agent::Codex => Verified {
                 source: Source::Cli,
-                checked: "2026-07-29",
-                against: "codex-cli 0.145.0",
+                checked: "2026-08-07",
+                against: "codex-cli 0.146.0",
             },
             // Read from the `/model` picker. Copilot has no headless list; see
             // `discover_models`.
@@ -382,8 +382,8 @@ fn claude_pinned() -> Vec<Model> {
 
 /// Codex, in the priority order the CLI itself reports.
 ///
-/// Verified by running `codex debug models` against codex-cli 0.145.0 on
-/// 2026-07-29. `codex-auto-review` is reported with `visibility: "hide"` and is
+/// Verified by running `codex debug models` against codex-cli 0.146.0 on
+/// 2026-08-07. `codex-auto-review` is reported with `visibility: "hide"` and is
 /// left out for that reason; [`discover_codex`] applies the same filter.
 fn codex_models() -> Vec<Model> {
     const FULL: &[&str] = &["low", "medium", "high", "xhigh", "max", "ultra"];
@@ -557,10 +557,12 @@ fn parse_codex_models(stdout: &str) -> Result<Vec<Model>> {
     // so it is read rather than assumed.
     let mut ranked: Vec<(u64, Model)> = listed
         .iter()
-        // `visibility` is how Codex marks its internal models, and
-        // `codex-auto-review` is one. Offering it in a picker hands a user a
-        // model the vendor deliberately withheld.
+        // `visibility` marks internal models such as `codex-auto-review`.
+        // Separately, Codex can list a visible model for inline coding while
+        // saying `supported_in_api: false`; it is not runnable through this
+        // crate's app-server/exec paths and must not reach their picker.
         .filter(|m| m.get("visibility").and_then(Value::as_str) != Some("hide"))
+        .filter(|m| m.get("supported_in_api").and_then(Value::as_bool) != Some(false))
         .filter_map(|m| {
             let id = m.get("slug").and_then(Value::as_str)?;
             let model = Model {
@@ -628,6 +630,9 @@ mod tests {
        "supported_reasoning_levels":[{"effort":"low"},{"effort":"medium"},{"effort":"high"}]},
       {"slug":"codex-auto-review","display_name":"Codex Auto Review","description":"Internal.",
        "visibility":"hide","priority":43,"supported_reasoning_levels":[{"effort":"low"}]},
+      {"slug":"gpt-5.3-codex-spark","display_name":"GPT-5.3-Codex-Spark","description":"Inline only.",
+       "visibility":"list","supported_in_api":false,"priority":26,
+       "supported_reasoning_levels":[{"effort":"high"}]},
       {"slug":"gpt-5.6-sol","display_name":"GPT-5.6-Sol","description":"Latest frontier model.",
        "default_reasoning_level":"low","visibility":"list","priority":1,
        "supported_reasoning_levels":[{"effort":"low"},{"effort":"ultra"}]}
@@ -664,6 +669,15 @@ mod tests {
         assert!(
             !models.iter().any(|m| m.id == "codex-auto-review"),
             "a hidden model must not reach a picker"
+        );
+    }
+
+    #[test]
+    fn codex_discovery_drops_visible_models_that_are_not_api_supported() {
+        let models = parse_codex_models(CODEX_OUTPUT).expect("should parse");
+        assert!(
+            !models.iter().any(|m| m.id == "gpt-5.3-codex-spark"),
+            "inline-only models cannot run through the crate's API paths"
         );
     }
 

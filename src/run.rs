@@ -484,6 +484,26 @@ pub fn stream(request: &Request) -> Result<Run> {
     // hide that, so the context is checked and reported as an ordinary error.
     let runtime = tokio::runtime::Handle::try_current().map_err(|_| Error::NoRuntime)?;
 
+    let mut request = request.clone();
+    let session_lease = if let Some(binding) = &request.binding {
+        let lease = binding.store.lease(&binding.project, &binding.name)?;
+        // `Request::session` may have been built while a prior run still held
+        // the lease. Re-plan now, under the lease, so retrying that same request
+        // resumes the binding the prior run committed rather than starting from
+        // the stale token it observed earlier.
+        let (phase, cont) =
+            binding
+                .store
+                .plan(request.agent, &binding.project, &binding.name, binding.fork)?;
+        request.cont = cont;
+        if let Some(binding) = &mut request.binding {
+            binding.phase = phase;
+        }
+        Some(lease)
+    } else {
+        None
+    };
+
     let initial_plan = request.plan();
     let codex_app_server =
         request.agent == crate::Agent::Codex && (initial_plan.duplex || initial_plan.approvals);
@@ -500,7 +520,6 @@ pub fn stream(request: &Request) -> Result<Run> {
         }
         _ => None,
     };
-    let mut request = request.clone();
     if let Some(file) = &schema_file {
         request.schema_file = Some(file.0.display().to_string());
     }
@@ -605,6 +624,10 @@ pub fn stream(request: &Request) -> Result<Run> {
     let reaped_for_task = std::sync::Arc::clone(&reaped);
     let request = request.clone();
     let task = runtime.spawn(async move {
+        // Held across the whole read-run-commit cycle. It deliberately lives in
+        // the driver task rather than `Run`, so `detach` keeps the session
+        // reserved until the background agent actually exits.
+        let _session_lease = session_lease;
         // Moved in so the file outlives the run and is removed with it.
         let _schema_file = schema_file;
         if codex_app_server {

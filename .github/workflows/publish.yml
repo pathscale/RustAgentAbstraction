@@ -28,7 +28,7 @@ env:
 jobs:
   publish:
     name: publish to crates.io
-    runs-on: ubuntu-24.04
+    runs-on: ${{ vars.UBICLOUD_RUNNER || 'ubicloud-standard-2-arm' }}
     permissions:
       # For pushing the version tag.
       contents: write

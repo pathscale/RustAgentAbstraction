@@ -62,6 +62,7 @@ pub(crate) struct Binding {
     pub(crate) project: PathBuf,
     pub(crate) name: String,
     pub(crate) phase: Phase,
+    pub(crate) fork: bool,
 }
 
 impl Request {
@@ -335,7 +336,7 @@ impl Request {
     ///
     /// The two CLIs that support this take it differently, and the difference
     /// is hidden: Claude accepts the schema inline, Codex reads it from a file
-    /// this crate writes for the run and removes afterwards. **Copilot 1.0.75
+    /// this crate writes for the run and removes afterwards. **Copilot 1.0.78
     /// has no schema support**, so asking is [`crate::Error::Unsupported`]
     /// rather than a prose answer presented as data.
     ///
@@ -425,6 +426,7 @@ impl Request {
             project,
             name,
             phase,
+            fork,
         });
         // A named session needs an id back. The default format carries one, so
         // this only has to refuse a format the caller pinned that cannot:

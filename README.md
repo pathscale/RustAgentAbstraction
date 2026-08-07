@@ -35,7 +35,7 @@ println!("{:?}", outcome.usage.cost_usd);
 
 ## What each agent can actually do
 
-Verified live, against `claude 2.1.205`, `codex-cli 0.145.0` and `GitHub Copilot CLI 1.0.75`
+Verified live, against `claude 2.1.205`, `codex-cli 0.146.0` and `GitHub Copilot CLI 1.0.78`
 and not inferred from documentation.
 
 | | session id | fork | events | system prompt | resume flag |
@@ -128,6 +128,13 @@ Records live at `<dir>/<project-slug>/<name>.json`, partitioned by project so th
 in two checkouts never collides, and written through a temp file and a rename so a
 concurrent reader never sees a half-written record. A corrupt record reads as absent: the
 next turn opens a fresh conversation rather than failing over a cache nobody asked about.
+
+One named session can have only one run at a time, across processes. `stream()` takes a
+non-blocking OS lease for the full read-run-commit cycle and returns `Error::SessionBusy`
+when another holder is active. Rebuild or retry the request after that run settles; the
+binding is re-read under the lease, so a request prepared while the prior run was active
+cannot resume a stale token. The kernel releases the lease if its holder is killed, so a
+crashed host cannot deadlock the session.
 
 Names are percent-encoded into a single path segment, which is **injective**: two different
 names can never land on the same file. That matters more than it sounds, because the failure
@@ -240,7 +247,7 @@ assert_eq!(outcome.structured.unwrap()["name"], "Alice");
 
 The delivery differs and is hidden: Claude takes the schema inline and reports the value in
 its own field, Codex reads it from a file this crate writes and removes, and returns the
-value as its answer text. **Copilot 1.0.75 has no schema support at all**, so asking is an
+value as its answer text. **Copilot 1.0.78 has no schema support at all**, so asking is an
 `Error::Unsupported` rather than prose dressed up as data.
 
 **Write schemas strictly.** Codex sends yours to OpenAI's structured-output API, which
@@ -534,10 +541,10 @@ own variables do not reach the child.
 
 ## Gotchas worth knowing
 
-- **`codex exec` refuses to run outside a git repository.** This crate always passes
-  `--skip-git-repo-check`, so it runs anywhere. That check exists to stop an agent editing
-  files with no way to undo them; the sandbox is the real containment here, and it defaults
-  to `read-only`.
+- **`codex exec` refuses writable runs outside a git repository.** This crate passes
+  `--skip-git-repo-check` only for `ReadOnly` and `Plan`, where the sandbox prevents edits.
+  `Edit`, `Auto`, and `Bypass` retain Codex's guard because a change outside version control
+  may have no recovery path.
 - **`codex exec resume` does not accept `--sandbox`.** It is a different option set from
   `codex exec` and rejects the flag outright, so the permission posture is applied as
   `-c sandbox_mode=...` on the resume path. Only a multi-turn run reveals this: every
@@ -766,7 +773,7 @@ A Rust port of [nickderobertis/oneharness](https://github.com/nickderobertis/one
 
 Some findings did not survive re-verification against the current CLIs. oneharness models
 Copilot as having no headless session id and no event stream (`session_formats: &[]`,
-`events_format: None`); Copilot 1.0.75 has both. Where this crate and oneharness disagree,
+`events_format: None`); Copilot 1.0.78 has both. Where this crate and oneharness disagree,
 this crate matches what the CLI does today.
 
 ## License

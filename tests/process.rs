@@ -13,7 +13,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use agent_abstraction::{Agent, EnvPolicy, Request, stream};
+use agent_abstraction::{Agent, EnvPolicy, Error, Request, SessionStore, stream};
 
 /// A scratch directory unique to one test.
 fn scratch(tag: &str) -> PathBuf {
@@ -47,6 +47,20 @@ fn fake_agent(dir: &Path) -> PathBuf {
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
+    script
+}
+
+/// Write a quiet long-running process for session lease tests.
+fn sleeping_agent(dir: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let script = dir.join("sleeping-agent.sh");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\necho '{\"type\":\"system\",\"session_id\":\"session-from-agent\"}'\nsleep 120\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
     script
 }
 
@@ -109,6 +123,46 @@ async fn wait_until_dead(pid: i32, limit: Duration) -> bool {
 /// Long enough to absorb a loaded CI runner, short enough that a genuine leak
 /// still fails the test rather than hanging it.
 const TEARDOWN_GRACE: Duration = Duration::from_secs(10);
+
+/// The session lease covers the whole run, not just the atomic record write.
+/// A second host must fail before spawning and leave the sole binding intact;
+/// once the holder settles, the same name is immediately usable again.
+#[tokio::test]
+async fn one_named_session_admits_exactly_one_run() {
+    let dir = scratch("session-lease");
+    let script = sleeping_agent(&dir);
+    let store = SessionStore::open(dir.join("sessions"));
+    let project = dir.join("project");
+    let request = || {
+        Request::new(Agent::Claude, "hi")
+            .bin(script.to_str().unwrap())
+            .session(&store, &project, "thread-42", false)
+            .unwrap()
+    };
+
+    let first = stream(&request()).expect("first run should claim the session");
+    let binding = store.get(&project, "thread-42").unwrap().unwrap();
+
+    let conflict = stream(&request()).expect_err("second run must not share the session");
+    assert!(
+        matches!(conflict, Error::SessionBusy { ref name, .. } if name == "thread-42"),
+        "got {conflict:?}"
+    );
+    assert!(conflict.is_transient(), "the holder can settle and free it");
+    assert_eq!(
+        store.get(&project, "thread-42").unwrap().unwrap(),
+        binding,
+        "a rejected concurrent run must not rewrite the binding"
+    );
+
+    let cancelled = first.cancel().await.unwrap_err();
+    assert!(cancelled.is_cancelled());
+
+    let next = stream(&request()).expect("the settled holder must release the session");
+    let cancelled = next.cancel().await.unwrap_err();
+    assert!(cancelled.is_cancelled());
+    std::fs::remove_dir_all(&dir).ok();
+}
 
 /// The default that matters for a GUI: closing a window must stop the agent,
 /// not leave it running invisibly and spending quota.
