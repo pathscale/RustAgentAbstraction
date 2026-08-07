@@ -151,6 +151,10 @@ async fn the_codex_catalogue_still_matches_what_codex_reports() {
         !discovered.iter().any(|m| m.id == "codex-auto-review"),
         "a model codex marks hidden must not reach a picker"
     );
+    assert!(
+        !discovered.iter().any(|m| m.id == "gpt-5.3-codex-spark"),
+        "a visible model codex marks unsupported in the API must not reach a picker"
+    );
 }
 
 /// Both of these have an interactive picker and no headless listing, so asking

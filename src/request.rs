@@ -336,7 +336,7 @@ impl Request {
     ///
     /// The two CLIs that support this take it differently, and the difference
     /// is hidden: Claude accepts the schema inline, Codex reads it from a file
-    /// this crate writes for the run and removes afterwards. **Copilot 1.0.75
+    /// this crate writes for the run and removes afterwards. **Copilot 1.0.78
     /// has no schema support**, so asking is [`crate::Error::Unsupported`]
     /// rather than a prose answer presented as data.
     ///

@@ -35,7 +35,7 @@ println!("{:?}", outcome.usage.cost_usd);
 
 ## What each agent can actually do
 
-Verified live, against `claude 2.1.205`, `codex-cli 0.145.0` and `GitHub Copilot CLI 1.0.75`
+Verified live, against `claude 2.1.205`, `codex-cli 0.146.0` and `GitHub Copilot CLI 1.0.78`
 and not inferred from documentation.
 
 | | session id | fork | events | system prompt | resume flag |
@@ -247,7 +247,7 @@ assert_eq!(outcome.structured.unwrap()["name"], "Alice");
 
 The delivery differs and is hidden: Claude takes the schema inline and reports the value in
 its own field, Codex reads it from a file this crate writes and removes, and returns the
-value as its answer text. **Copilot 1.0.75 has no schema support at all**, so asking is an
+value as its answer text. **Copilot 1.0.78 has no schema support at all**, so asking is an
 `Error::Unsupported` rather than prose dressed up as data.
 
 **Write schemas strictly.** Codex sends yours to OpenAI's structured-output API, which
@@ -773,7 +773,7 @@ A Rust port of [nickderobertis/oneharness](https://github.com/nickderobertis/one
 
 Some findings did not survive re-verification against the current CLIs. oneharness models
 Copilot as having no headless session id and no event stream (`session_formats: &[]`,
-`events_format: None`); Copilot 1.0.75 has both. Where this crate and oneharness disagree,
+`events_format: None`); Copilot 1.0.78 has both. Where this crate and oneharness disagree,
 this crate matches what the CLI does today.
 
 ## License

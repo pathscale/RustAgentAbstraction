@@ -388,10 +388,10 @@ impl Agent {
         let (major, minor, patch) = match self {
             // `claude --version` -> "2.1.212 (Claude Code)"
             Agent::Claude => (2, 1, 212),
-            // `codex --version` -> "codex-cli 0.145.0"
-            Agent::Codex => (0, 145, 0),
-            // `copilot --version` -> "GitHub Copilot CLI 1.0.75."
-            Agent::Copilot => (1, 0, 75),
+            // `codex --version` -> "codex-cli 0.146.0"
+            Agent::Codex => (0, 146, 0),
+            // `copilot --version` -> "GitHub Copilot CLI 1.0.78."
+            Agent::Copilot => (1, 0, 78),
         };
         crate::Version {
             major,
@@ -536,7 +536,7 @@ impl Agent {
                 live_follow_up: true,
                 approvals: true,
             },
-            // Verified against Copilot CLI 1.0.75: `--session-id <uuid>` both
+            // Verified against Copilot CLI 1.0.78: `--session-id <uuid>` both
             // mints a new session and resumes an existing one (one flag, both
             // directions), and `--output-format json` is a JSONL event stream.
             // There is no headless fork.
@@ -545,7 +545,7 @@ impl Agent {
                 fork: false,
                 events: true,
                 native_system: false,
-                // Copilot 1.0.75 exposes no schema flag at all.
+                // Copilot 1.0.78 exposes no schema flag at all.
                 schema: SchemaSupport::None,
                 commands: false,
                 live_follow_up: false,
@@ -643,7 +643,7 @@ impl Agent {
     /// # Errors
     /// [`Error::Unsupported`] if the plan needs a capability this agent lacks.
     pub(crate) fn typed_argv(self, plan: &Plan) -> Result<Vec<Arg>> {
-        // Codex app-server supplies an approval callback. Copilot CLI 1.0.75
+        // Codex app-server supplies an approval callback. Copilot CLI 1.0.78
         // needs `--allow-all-tools` to run headlessly at all and gates only
         // through `--deny-tool`. A run that quietly never asked would be the
         // worst outcome here, since a caller would read silence as "nothing
@@ -655,7 +655,7 @@ impl Agent {
                 what: "routing tool approvals to the caller",
             });
         }
-        // Codex app-server accepts `turn/steer`. Copilot CLI 1.0.75 has no
+        // Codex app-server accepts `turn/steer`. Copilot CLI 1.0.78 has no
         // structured input stream and cannot take a second message mid-turn.
         if plan.duplex && !caps.live_follow_up {
             return Err(Error::Unsupported {
@@ -942,7 +942,7 @@ fn argv_codex(plan: &Plan) -> Vec<Arg> {
 
     // `codex exec` takes `--sandbox`, but `codex exec resume` does **not**: it
     // rejects the flag outright and takes the same setting as a `-c` config
-    // override instead. Verified against codex-cli 0.145.0, where passing
+    // override instead. Verified against codex-cli 0.146.0, where passing
     // `--sandbox` to a resume fails with "unexpected argument '--sandbox'".
     // Dropping the sandbox on resume would silently run a continued turn under a
     // different posture than the caller asked for.
@@ -961,13 +961,13 @@ fn argv_codex(plan: &Plan) -> Vec<Arg> {
     };
 
     a.opt("--model", plan.model.as_ref());
-    // Verified against codex-cli 0.145.0: `codex exec` has no effort flag, it
+    // Verified against codex-cli 0.146.0: `codex exec` has no effort flag, it
     // is a config override, and `--strict-config` accepts this key. A bad value
     // is refused by the provider with its own enum rather than by the CLI.
     if let Some(effort) = plan.effort.as_ref() {
         a.pair("-c", format!("model_reasoning_effort={effort}"));
     }
-    // Verified against codex-cli 0.145.0. Options remain options after the
+    // Verified against codex-cli 0.146.0. Options remain options after the
     // positional prompt, but keeping roots before it makes the command's
     // security posture readable and matches the CLI's help shape.
     for dir in &plan.extra_dirs {
@@ -1001,7 +1001,7 @@ fn argv_codex(plan: &Plan) -> Vec<Arg> {
 
 /// `copilot -p <prompt> --allow-all-tools [...] [--session-id <uuid>]`
 ///
-/// Flags verified against Copilot CLI 1.0.75. Two of its conventions matter:
+/// Flags verified against Copilot CLI 1.0.78. Two of its conventions matter:
 /// `--allow-all-tools` is *required* for non-interactive mode, and the
 /// repeatable tool filters are declared `--allow-tool[=tools...]`, an optional
 /// value, which only binds with `=`, never across a space.
@@ -1032,7 +1032,7 @@ fn argv_copilot(plan: &Plan) -> Vec<Arg> {
     };
 
     a.opt("--model", plan.model.as_ref());
-    // Verified against Copilot CLI 1.0.75: `--effort` is the documented spelling
+    // Verified against Copilot CLI 1.0.78: `--effort` is the documented spelling
     // and `--reasoning-effort` its alias (none, minimal, low, medium, high,
     // xhigh, max). A wider set than Claude's, which is why the level is passed
     // through rather than mapped to a shared enum.
@@ -1531,7 +1531,7 @@ mod tests {
         assert!(!a.iter().any(|arg| arg.contains("\"type\"")));
     }
 
-    /// Copilot 1.0.75 has no schema flag, and a prose answer presented as data
+    /// Copilot 1.0.78 has no schema flag, and a prose answer presented as data
     /// is exactly the silent downgrade this crate refuses elsewhere.
     #[test]
     fn copilot_refuses_a_schema_rather_than_answering_in_prose() {

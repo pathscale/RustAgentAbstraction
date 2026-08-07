@@ -8,6 +8,19 @@ appear in a patch rather than inflating the version toward 1.0 on a crate still 
 shape. **Where that happens the entry says so at the top**, because a version number that
 under-signals is only acceptable if the changelog over-signals to compensate.
 
+## 0.4.15
+
+### Fixed
+
+- **Codex terminal usage now includes every model call in a tool-heavy turn.**
+  Interactive token updates report disjoint calls. Their additive fields are
+  accumulated while context-shaped fields remain latest-wins, so the terminal
+  outcome no longer collapses to only the final call.
+- The verified Codex boundary is now CLI `0.146.0`. Visible models marked
+  `supported_in_api: false`, including inline-only
+  `gpt-5.3-codex-spark`, are excluded from the runnable catalogue.
+- Copilot's flag mapping is verified against CLI `1.0.78`.
+
 ## 0.4.14
 
 ### Added
@@ -34,8 +47,7 @@ under-signals is only acceptable if the changelog over-signals to compensate.
 - **Codex Auto runs can use GitHub without an approval round trip.** The Codex
   workspace sandbox now enables network access for Auto while retaining its
   configured writable roots. Edit remains offline and Ask remains interactive.
-- Release and pull request checks now use a pinned GitHub-hosted runner so an
-  unavailable external runner pool cannot leave a release queued indefinitely.
+- Release and pull request checks use one configurable Ubicloud runner.
 
 ## 0.4.10
 
