@@ -18,6 +18,12 @@ under-signals is only acceptable if the changelog over-signals to compensate.
   protocol. `--permission-prompt-tool` left `claude --help` but is still
   accepted, verified by direct invocation, so the approvals path is unaffected.
 - Copilot's boundary stays at `1.0.78`, which was not upgraded.
+- **`Permission::Auto` now means the same thing on both Codex transports.**
+  The app-server path grants `networkAccess: true` for Auto and withholds it
+  for Edit, while `codex exec` set no network configuration at all, so a caller
+  asking for Auto received the Edit posture whenever approvals were off. The
+  exec path now carries the documented
+  `sandbox_workspace_write.network_access` override. Edit stays gated.
 
 ## 0.4.15
 
