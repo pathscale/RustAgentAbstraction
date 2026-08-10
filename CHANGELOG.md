@@ -8,6 +8,17 @@ appear in a patch rather than inflating the version toward 1.0 on a crate still 
 shape. **Where that happens the entry says so at the top**, because a version number that
 under-signals is only acceptable if the changelog over-signals to compensate.
 
+## 0.4.17
+
+### Fixed
+
+- **`Permission::Auto` now means the same thing on both Codex transports.**
+  The app-server path grants `networkAccess: true` for Auto and withholds it
+  for Edit, while `codex exec` set no network configuration at all, so a caller
+  asking for Auto received the Edit posture whenever approvals were off. The
+  exec path now carries the documented
+  `sandbox_workspace_write.network_access` override. Edit stays gated.
+
 ## 0.4.16
 
 ### Fixed
