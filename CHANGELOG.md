@@ -8,6 +8,17 @@ appear in a patch rather than inflating the version toward 1.0 on a crate still 
 shape. **Where that happens the entry says so at the top**, because a version number that
 under-signals is only acceptable if the changelog over-signals to compensate.
 
+## 0.4.16
+
+### Fixed
+
+- The verified boundary moves to claude `2.1.220` and codex-cli `0.147.0`. Both
+  pass the live suite with no mapping change: every Claude flag still resolves,
+  and every app-server method the Codex path speaks is still in the 0.147.0
+  protocol. `--permission-prompt-tool` left `claude --help` but is still
+  accepted, verified by direct invocation, so the approvals path is unaffected.
+- Copilot's boundary stays at `1.0.78`, which was not upgraded.
+
 ## 0.4.15
 
 ### Fixed
