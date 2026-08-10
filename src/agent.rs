@@ -960,6 +960,18 @@ fn argv_codex(plan: &Plan) -> Vec<Arg> {
         (Some(mode), true) => a.pair("-c", format!("sandbox_mode={mode}")),
     };
 
+    // Auto means the same thing on both transports.
+    //
+    // The app-server path grants `networkAccess: true` for Auto and withholds
+    // it for Edit, so a caller asking for Auto over `codex exec` was quietly
+    // getting the Edit posture: same `Permission`, different capability, chosen
+    // by whether approvals happened to be enabled for that run. `codex exec`
+    // has no network flag, so the documented config key carries it, which is
+    // the same lever the CLI's own help points at.
+    if matches!(plan.permission, Permission::Auto) {
+        a.pair("-c", "sandbox_workspace_write.network_access=true");
+    }
+
     a.opt("--model", plan.model.as_ref());
     // Verified against codex-cli 0.146.0: `codex exec` has no effort flag, it
     // is a config override, and `--strict-config` accepts this key. A bad value
@@ -1689,6 +1701,32 @@ mod tests {
             Agent::Codex.argv(&p),
             Err(Error::Unsupported { .. })
         ));
+    }
+
+    /// Auto is one posture, not one posture per transport.
+    ///
+    /// The app-server path grants `networkAccess: true` for Auto and withholds
+    /// it for Edit. `codex exec` has no network flag, so without the config
+    /// override a caller asking for Auto silently received the Edit posture
+    /// whenever approvals were off.
+    #[test]
+    fn auto_grants_network_on_the_codex_exec_path_too() {
+        let mut p = plan("codex");
+        p.permission = Permission::Auto;
+        let auto = Agent::Codex.argv(&p).expect("auto builds");
+        assert!(
+            auto.iter()
+                .any(|arg| arg == "sandbox_workspace_write.network_access=true"),
+            "Auto must grant network on exec as it does on app-server: {auto:?}"
+        );
+
+        let mut p = plan("codex");
+        p.permission = Permission::Edit;
+        let edit = Agent::Codex.argv(&p).expect("edit builds");
+        assert!(
+            !edit.iter().any(|arg| arg.contains("network_access")),
+            "Edit keeps network gated so its approvals stay meaningful: {edit:?}"
+        );
     }
 
     /// The failure mode this refusal exists to prevent is a silent one: an
