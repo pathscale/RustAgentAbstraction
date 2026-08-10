@@ -386,10 +386,10 @@ impl Agent {
     #[must_use]
     pub fn verified_version(self) -> crate::Version {
         let (major, minor, patch) = match self {
-            // `claude --version` -> "2.1.212 (Claude Code)"
-            Agent::Claude => (2, 1, 212),
-            // `codex --version` -> "codex-cli 0.146.0"
-            Agent::Codex => (0, 146, 0),
+            // `claude --version` -> "2.1.220 (Claude Code)"
+            Agent::Claude => (2, 1, 220),
+            // `codex --version` -> "codex-cli 0.147.0"
+            Agent::Codex => (0, 147, 0),
             // `copilot --version` -> "GitHub Copilot CLI 1.0.78."
             Agent::Copilot => (1, 0, 78),
         };
