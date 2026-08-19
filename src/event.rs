@@ -735,7 +735,7 @@ impl Parser {
             //      "type":"deferred_tools_delta",
             //      "addedNames":[...],"removedNames":[...],
             //      "readdedNames":[...],"pendingMcpServers":["..."]}}
-            "attachment" => self.claude_attachment(v),
+            "attachment" => Self::claude_attachment(v),
             // Both roles carry content blocks: `assistant` holds text/thinking/
             // tool_use, `user` carries the tool_result observations back.
             // The approval question, carried on Claude's control channel.
@@ -877,7 +877,7 @@ impl Parser {
     /// A delta that changes nothing is not reported: a server can announce
     /// itself as pending and settle without its catalogue ever moving, and a
     /// host that redrew on every such record would flicker for no reason.
-    fn claude_attachment(&mut self, v: &Value) -> Vec<Event> {
+    fn claude_attachment(v: &Value) -> Vec<Event> {
         let Some(attachment) = v.get("attachment") else {
             return Vec::new();
         };
