@@ -108,6 +108,26 @@ pub enum Event {
     /// user commands differ per install. Claude only; nothing else publishes
     /// one.
     Commands(crate::command::Commands),
+    /// An MCP server's tools left or rejoined the run mid-turn.
+    ///
+    /// A server that drops takes its tools out of the model's catalogue and
+    /// puts them back when it returns, without the session or the turn being
+    /// affected: the run is still working throughout. Claude reports each
+    /// change, and a host that ignores them sees an otherwise healthy run go
+    /// quiet for as long as the server takes to settle, which an idle watchdog
+    /// reads as a stall.
+    ///
+    /// Surfaced so a host can keep such a run alive and, if it shows anything
+    /// at all, collapse a flapping server into one line rather than one per
+    /// change. Claude only.
+    ToolsChanged {
+        /// How many tools joined the catalogue.
+        added: usize,
+        /// How many left it.
+        removed: usize,
+        /// Servers still connecting, by name, when the agent says.
+        pending: Vec<String>,
+    },
 }
 
 /// The ceiling on any single captured buffer.
@@ -273,6 +293,18 @@ fn enforce_bounds(event: Event) -> Event {
         },
         // Numbers only, with nothing a bound could apply to.
         Event::Usage(usage) => Event::Usage(usage),
+        // Counts, plus server names the agent chose. Bounding each name keeps
+        // a hostile or misconfigured server from carrying an arbitrary string
+        // into a host's UI.
+        Event::ToolsChanged {
+            added,
+            removed,
+            pending,
+        } => Event::ToolsChanged {
+            added,
+            removed,
+            pending: pending.into_iter().map(bound_identifier).collect(),
+        },
         Event::ApprovalRequest(approval) => {
             Event::ApprovalRequest(crate::approval::Approval {
                 // The id has to survive intact or the answer cannot be matched
@@ -600,7 +632,13 @@ impl Parser {
         match self.agent {
             Agent::Claude => matches!(
                 ty,
-                "system" | "assistant" | "user" | "result" | "rate_limit_event" | "control_request"
+                "system"
+                    | "assistant"
+                    | "user"
+                    | "result"
+                    | "rate_limit_event"
+                    | "control_request"
+                    | "attachment"
             ),
             Agent::Codex => {
                 ty.starts_with("thread.") || ty.starts_with("turn.") || ty.starts_with("item.")
@@ -691,6 +729,13 @@ impl Parser {
             }
             // Token-level deltas, present only with `--include-partial-messages`.
             "stream_event" => self.claude_delta(v),
+            // An MCP server joining or leaving mid-run. Verified against
+            // claude 2.1.212:
+            //   {"type":"attachment","attachment":{
+            //      "type":"deferred_tools_delta",
+            //      "addedNames":[...],"removedNames":[...],
+            //      "readdedNames":[...],"pendingMcpServers":["..."]}}
+            "attachment" => self.claude_attachment(v),
             // Both roles carry content blocks: `assistant` holds text/thinking/
             // tool_use, `user` carries the tool_result observations back.
             // The approval question, carried on Claude's control channel.
@@ -820,6 +865,54 @@ impl Parser {
             }
             _ => Vec::new(),
         }
+    }
+
+    /// An MCP server's tools joining or leaving, from Claude's `attachment`
+    /// records.
+    ///
+    /// Only `deferred_tools_delta` is surfaced. Other attachment kinds describe
+    /// content this crate already reports through the ordinary vocabulary, and
+    /// inventing an event for them would say the same thing twice.
+    ///
+    /// A delta that changes nothing is not reported: a server can announce
+    /// itself as pending and settle without its catalogue ever moving, and a
+    /// host that redrew on every such record would flicker for no reason.
+    fn claude_attachment(&mut self, v: &Value) -> Vec<Event> {
+        let Some(attachment) = v.get("attachment") else {
+            return Vec::new();
+        };
+        if attachment.get("type").and_then(Value::as_str) != Some("deferred_tools_delta") {
+            return Vec::new();
+        }
+        let count = |key: &str| -> usize {
+            attachment
+                .get(key)
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len)
+        };
+        // `readdedNames` is a subset of `addedNames` rather than a third group,
+        // so counting both would double every recovery.
+        let added = count("addedNames");
+        let removed = count("removedNames");
+        let pending: Vec<String> = attachment
+            .get("pendingMcpServers")
+            .and_then(Value::as_array)
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if added == 0 && removed == 0 && pending.is_empty() {
+            return Vec::new();
+        }
+        vec![Event::ToolsChanged {
+            added,
+            removed,
+            pending,
+        }]
     }
 
     /// One token-level delta from Claude's `stream_event` records.
@@ -1316,6 +1409,73 @@ mod tests {
     }
 
     // Lines below are trimmed copies of transcripts captured from the live CLIs.
+
+    /// An MCP server dropping and rejoining mid-run.
+    ///
+    /// Records copied from claude 2.1.212: the Adobe connector flapped seven
+    /// times in one session, each drop taking 85 tools out of the catalogue and
+    /// each recovery putting them back. The session id never changed and no
+    /// `result` was written, so the run was healthy throughout.
+    ///
+    /// Before this was parsed the records fell through to an empty vec, so a
+    /// host saw nothing at all for as long as the server took to settle. That
+    /// is what an idle watchdog reads as a stalled run.
+    #[test]
+    fn an_mcp_server_flapping_is_reported_rather_than_dropped() {
+        let (events, _) = run(
+            Agent::Claude,
+            &[
+                r#"{"type":"system","subtype":"init","session_id":"s","model":"claude-opus-5","slash_commands":["compact"]}"#,
+                r#"{"type":"attachment","attachment":{"type":"deferred_tools_delta","addedNames":[],"removedNames":["mcp__adobe__a","mcp__adobe__b"],"readdedNames":[],"pendingMcpServers":["claude.ai Adobe for creativity"]}}"#,
+                r#"{"type":"attachment","attachment":{"type":"deferred_tools_delta","addedNames":["mcp__adobe__a","mcp__adobe__b"],"removedNames":[],"readdedNames":["mcp__adobe__a","mcp__adobe__b"],"pendingMcpServers":[]}}"#,
+                r#"{"type":"result","subtype":"success","is_error":false,"result":"done","session_id":"s"}"#,
+            ],
+        );
+        let changes: Vec<&Event> = events
+            .iter()
+            .filter(|event| matches!(event, Event::ToolsChanged { .. }))
+            .collect();
+        assert_eq!(
+            changes,
+            vec![
+                &Event::ToolsChanged {
+                    added: 0,
+                    removed: 2,
+                    pending: vec!["claude.ai Adobe for creativity".to_string()],
+                },
+                // `readdedNames` repeats `addedNames`, so a recovery of two
+                // tools must report two, not four.
+                &Event::ToolsChanged {
+                    added: 2,
+                    removed: 0,
+                    pending: Vec::new(),
+                },
+            ],
+            "a server leaving and rejoining must be two reported changes",
+        );
+    }
+
+    /// A delta that moves nothing must stay silent.
+    ///
+    /// A server can announce itself and settle without its catalogue changing,
+    /// and a host that redrew on every such record would flicker for no reason.
+    #[test]
+    fn an_empty_tools_delta_reports_nothing() {
+        let (events, _) = run(
+            Agent::Claude,
+            &[
+                r#"{"type":"attachment","attachment":{"type":"deferred_tools_delta","addedNames":[],"removedNames":[],"readdedNames":[],"pendingMcpServers":[]}}"#,
+                r#"{"type":"attachment","attachment":{"type":"file","path":"/tmp/x"}}"#,
+                r#"{"type":"result","subtype":"success","is_error":false,"result":"","session_id":"s"}"#,
+            ],
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::ToolsChanged { .. })),
+            "an unchanged catalogue, and a non-tool attachment, must both stay quiet",
+        );
+    }
 
     /// The compaction lifecycle, from a real `/compact` run.
     ///

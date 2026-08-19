@@ -8,6 +8,32 @@ appear in a patch rather than inflating the version toward 1.0 on a crate still 
 shape. **Where that happens the entry says so at the top**, because a version number that
 under-signals is only acceptable if the changelog over-signals to compensate.
 
+## 0.4.18
+
+### Added
+
+- **MCP servers joining or leaving a run are now reported**, as
+  `Event::ToolsChanged { added, removed, pending }`. A patch rather than a
+  minor: this adds an enum variant and changes no existing behaviour.
+
+  Claude announces each change as an `attachment` record carrying
+  `deferred_tools_delta`. Nothing matched that record type, so it fell through
+  to an empty vec and a host saw nothing at all while a server settled.
+  Measured on one AgencyZero session, a single connector flapped seven times,
+  each drop taking 85 tools out of the catalogue and each recovery putting them
+  back, with the session id unchanged throughout: the run was healthy the whole
+  time.
+
+  That silence matters to a host with an idle watchdog, which cannot tell a run
+  waiting on a reconnecting server from one that has wedged. Reporting the
+  change lets it keep such a run alive, and lets it collapse a flapping server
+  into one line rather than one per change.
+
+  `readdedNames` repeats `addedNames` rather than naming a third group, so a
+  recovery reports what actually rejoined. A delta that moves nothing reports
+  nothing, because a server can announce itself and settle without its
+  catalogue ever changing.
+
 ## 0.4.17
 
 ### Fixed
