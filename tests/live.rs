@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use agent_abstraction::{
     Agent, AuthState, AuthStatus, EnvPolicy, Event, Format, Permission, Probe, Request,
-    SessionStore, VersionStatus, run, stream,
+    SessionStore, VersionStatus, interrupt, run, stream,
 };
 
 /// A prompt with exactly one correct answer, so the assertion is about the
@@ -309,6 +309,53 @@ async fn codex_reports_account_usage_without_a_terminal() {
         "a percentage is the point of asking: {window:?}"
     );
     assert!(window.window_minutes.is_some(), "{window:?}");
+}
+
+/// Provider-level recovery without a model call. The caller supplies a Codex
+/// thread that currently has an orphaned `inProgress` turn; the test proves the
+/// one-shot control path reaches `turn/interrupt` without submitting a prompt.
+#[tokio::test]
+#[ignore = "requires AGENT_ABSTRACTION_INTERRUPT_SESSION naming an active Codex turn"]
+async fn codex_interrupts_an_orphaned_active_turn() {
+    if !available(Agent::Codex) {
+        return;
+    }
+    let session = std::env::var("AGENT_ABSTRACTION_INTERRUPT_SESSION")
+        .expect("set AGENT_ABSTRACTION_INTERRUPT_SESSION to an active Codex thread id");
+    let request = Request::new(Agent::Codex, "")
+        .resume(session)
+        .permission(Permission::ReadOnly)
+        .timeout(Duration::from_secs(20));
+
+    assert!(
+        interrupt(&request)
+            .await
+            .expect("Codex session interruption failed"),
+        "the supplied thread had no active turn"
+    );
+}
+
+/// Long-lived idle threads used to exceed the bounded JSON line on resume and
+/// time out before the caller could learn that no recovery was needed.
+#[tokio::test]
+#[ignore = "requires AGENT_ABSTRACTION_IDLE_SESSION naming an idle Codex thread id"]
+async fn codex_reads_a_long_idle_session_without_starting_a_turn() {
+    if !available(Agent::Codex) {
+        return;
+    }
+    let session = std::env::var("AGENT_ABSTRACTION_IDLE_SESSION")
+        .expect("set AGENT_ABSTRACTION_IDLE_SESSION to an idle Codex thread id");
+    let request = Request::new(Agent::Codex, "")
+        .resume(session)
+        .permission(Permission::ReadOnly)
+        .timeout(Duration::from_secs(20));
+
+    assert!(
+        !interrupt(&request)
+            .await
+            .expect("Codex idle-session inspection failed"),
+        "the supplied thread unexpectedly had an active turn"
+    );
 }
 
 /// Claude's context tracker, end to end: it is the one agent that reports the
