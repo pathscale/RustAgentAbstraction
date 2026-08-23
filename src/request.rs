@@ -53,6 +53,18 @@ pub struct Request {
     /// Set by [`Request::command`]: the prompt is a slash command, so the
     /// capability check refuses agents that have no command vocabulary.
     pub(crate) is_command: bool,
+    /// Whether this request runs a prompt or only repairs a resumed session.
+    pub(crate) operation: Operation,
+}
+
+/// The lifecycle operation a request asks the provider transport to perform.
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub(crate) enum Operation {
+    /// Submit the request's prompt as a turn.
+    #[default]
+    Run,
+    /// Interrupt an orphaned active turn without starting a replacement.
+    Interrupt,
 }
 
 /// A named session this run is attached to.
@@ -95,6 +107,7 @@ impl Request {
             timeout: None,
             binding: None,
             is_command: false,
+            operation: Operation::Run,
         }
     }
 

@@ -468,6 +468,36 @@ pub async fn run(request: &Request) -> Result<Outcome> {
     stream(request)?.finish().await
 }
 
+/// Interrupt an orphaned active Codex turn without starting a replacement.
+///
+/// The request must resume a Codex session. Its binary, environment policy,
+/// environment overrides, and working directory are retained, while its prompt
+/// is never submitted. Returns `true` when Codex reported an active turn and
+/// accepted `turn/interrupt`, or `false` when the session had no active turn.
+///
+/// # Errors
+/// Returns [`Error::Unsupported`] for another provider or a request that does
+/// not resume a session, and the ordinary spawn/protocol errors otherwise.
+pub async fn interrupt(request: &Request) -> Result<bool> {
+    if request.agent != crate::Agent::Codex {
+        return Err(Error::Unsupported {
+            agent: request.agent,
+            what: "provider-level session interruption",
+        });
+    }
+    if !matches!(request.cont, crate::agent::Continue::Resume(_)) {
+        return Err(Error::Unsupported {
+            agent: request.agent,
+            what: "interrupting without a resumed session",
+        });
+    }
+    let mut request = request.clone();
+    request.duplex = true;
+    request.operation = crate::request::Operation::Interrupt;
+    let outcome = run(&request).await?;
+    Ok(matches!(outcome.stop, Stop::Other(ref reason) if reason == "interrupted"))
+}
+
 /// Start `request`, returning a handle that streams its events.
 ///
 /// Returns as soon as the child is spawned; the work proceeds on a task.
@@ -1236,6 +1266,8 @@ async fn drive_codex_app_server(
             }
             () = &mut deadline => {
                 let partial = protocol.terminal.text.clone();
+                interrupt_codex_turn(&mut protocol, &mut stdin, &mut reader, &mut line, &mut raw)
+                    .await;
                 shut_down(&mut child, stderr_task).await;
                 reaped.store(true, std::sync::atomic::Ordering::SeqCst);
                 return Err(Error::Timeout {
@@ -1245,6 +1277,8 @@ async fn drive_codex_app_server(
                 });
             }
             _ = &mut cancel => {
+                interrupt_codex_turn(&mut protocol, &mut stdin, &mut reader, &mut line, &mut raw)
+                    .await;
                 shut_down(&mut child, stderr_task).await;
                 reaped.store(true, std::sync::atomic::Ordering::SeqCst);
                 return Err(Error::Cancelled { bin });
@@ -1306,6 +1340,46 @@ async fn drive_codex_app_server(
         first_unparsed: terminal.first_unparsed,
         structured,
     })
+}
+
+/// Ask Codex to settle its server-owned turn before its local app-server dies.
+///
+/// Two seconds bounds a provider that is already wedged. Failure still falls
+/// through to process-group teardown, but a healthy app-server gets the
+/// `turn/interrupt` it needs to make this thread resumable again.
+async fn interrupt_codex_turn(
+    protocol: &mut crate::codex_app_server::Protocol,
+    stdin: &mut tokio::process::ChildStdin,
+    reader: &mut BufReader<tokio::process::ChildStdout>,
+    line: &mut String,
+    raw: &mut String,
+) {
+    let Some(encoded) = protocol.interrupt() else {
+        return;
+    };
+    if stdin.write_all(encoded.as_bytes()).await.is_err() || stdin.flush().await.is_err() {
+        return;
+    }
+    let settle = async {
+        while !protocol.finished {
+            let Ok(Some(_)) = read_bounded_line(reader, line).await else {
+                break;
+            };
+            append_capped(raw, line);
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
+                let step = protocol.push(&value);
+                for write in step.writes {
+                    if stdin.write_all(write.as_bytes()).await.is_err() {
+                        return;
+                    }
+                }
+                if stdin.flush().await.is_err() {
+                    return;
+                }
+            }
+        }
+    };
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), settle).await;
 }
 
 /// Write every control whose protocol ids are available, preserving earlier
