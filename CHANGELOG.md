@@ -8,6 +8,25 @@ appear in a patch rather than inflating the version toward 1.0 on a crate still 
 shape. **Where that happens the entry says so at the top**, because a version number that
 under-signals is only acceptable if the changelog over-signals to compensate.
 
+## 0.4.20
+
+### Added
+
+- **Grok Build as a fourth agent**, over `grok agent stdio` (ACP). A patch
+  rather than a minor: this adds `Agent::Grok` and changes no existing
+  behaviour.
+
+  One child per `stream()`, so an IDE can keep many Grok sessions and many
+  other backends live in parallel. Mid-turn input is `_x.ai/interject`
+  (same turn, does not cancel or queue). Interrupt is `session/cancel`
+  (kicks the in-flight turn; the session stays and can reattach). Auto is
+  native `--permission-mode auto`, not `--always-approve`. `/compact` maps
+  to `_x.ai/compact_conversation`. `/clear` is refused: Grok has `/new`.
+
+  No new crates. Codex `app-server` and Claude `-p` are untouched. Verified
+  against grok 1.0.30 `--help` and the live ACP method names; a live
+  `grok agent stdio` smoke is still outstanding.
+
 ## 0.4.18
 
 ### Added

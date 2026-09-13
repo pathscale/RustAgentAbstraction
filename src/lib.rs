@@ -1,6 +1,6 @@
-//! Drive Claude Code, Codex and GitHub Copilot headlessly from Rust.
+//! Drive Claude Code, Codex, GitHub Copilot and Grok headlessly from Rust.
 //!
-//! One request type, one event vocabulary and one session model across three
+//! One request type, one event vocabulary and one session model across four
 //! agent CLIs that agree on none of those things. This is a **library**: your
 //! program links it and spawns the agent itself, with no intermediate CLI
 //! marshalling a request through stdout and back.
@@ -72,6 +72,7 @@
 //! | Claude Code | caller-minted (`--session-id`) | yes | yes | native flag |
 //! | Codex | agent-printed (`thread_id`) | no | yes | prepended |
 //! | Copilot | caller-minted (`--session-id`) | no | yes | prepended |
+//! | Grok | agent-printed (`session/new`) | yes | yes | native (`--rules`) |
 //!
 //! Asking for something an agent cannot do is always an [`Error::Unsupported`],
 //! never a silent downgrade. A caller that asked to fork and got a linear
@@ -93,6 +94,7 @@ mod codex_app_server;
 mod command;
 mod error;
 mod event;
+mod grok_acp;
 mod model;
 mod outcome;
 mod probe;

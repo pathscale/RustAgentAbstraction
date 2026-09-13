@@ -158,7 +158,7 @@ impl Agent {
             // Deliberately an error rather than a half-answer assembled from a
             // past run's rate-limit event: that would be neither current nor
             // account-wide, and would read as though it were both.
-            Agent::Claude | Agent::Copilot => Err(Error::Unsupported {
+            Agent::Claude | Agent::Copilot | Agent::Grok => Err(Error::Unsupported {
                 agent: self,
                 what: "reporting account usage without a terminal",
             }),

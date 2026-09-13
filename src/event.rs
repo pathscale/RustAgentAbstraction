@@ -537,6 +537,8 @@ impl Parser {
             Agent::Claude => self.claude(&value),
             Agent::Codex => self.codex(&value),
             Agent::Copilot => self.copilot(&value),
+            // Grok's live path is ACP in `grok_acp`, not this line parser.
+            Agent::Grok => Vec::new(),
         };
         // Every event leaves through here, so bounding once at the exit covers
         // all three agents rather than each parser remembering.
@@ -649,6 +651,7 @@ impl Parser {
                     || ty.starts_with("tool.")
                     || ty.starts_with("session.")
             }
+            Agent::Grok => false,
         }
     }
 

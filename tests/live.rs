@@ -41,7 +41,7 @@ fn ping(agent: Agent) -> Request {
     match agent {
         // The cheapest model on each side; Codex and Copilot pick their own.
         Agent::Claude => request.model("haiku"),
-        Agent::Codex | Agent::Copilot => request,
+        Agent::Codex | Agent::Copilot | Agent::Grok => request,
     }
 }
 
