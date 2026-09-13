@@ -479,7 +479,7 @@ pub async fn run(request: &Request) -> Result<Outcome> {
 /// Returns [`Error::Unsupported`] for another provider or a request that does
 /// not resume a session, and the ordinary spawn/protocol errors otherwise.
 pub async fn interrupt(request: &Request) -> Result<bool> {
-    if request.agent != crate::Agent::Codex {
+    if !matches!(request.agent, crate::Agent::Codex | crate::Agent::Grok) {
         return Err(Error::Unsupported {
             agent: request.agent,
             what: "provider-level session interruption",
@@ -535,13 +535,14 @@ pub fn stream(request: &Request) -> Result<Run> {
     };
 
     let initial_plan = request.plan();
+    let grok_acp = request.agent == crate::Agent::Grok;
     let codex_app_server =
         request.agent == crate::Agent::Codex && (initial_plan.duplex || initial_plan.approvals);
 
     // Written before the argv is built, because the argv has to name it. The
     // app-server protocol accepts the schema inline instead.
     let schema_file = match (&request.schema, request.agent.caps().schema) {
-        (Some(_), _) if codex_app_server => None,
+        (Some(_), _) if codex_app_server || grok_acp => None,
         (Some(schema), crate::agent::SchemaSupport::File) => {
             Some(SchemaFile::write(schema).map_err(|source| Error::Spawn {
                 bin: request.agent.bin().to_string(),
@@ -562,16 +563,18 @@ pub fn stream(request: &Request) -> Result<Run> {
     let mut command = Command::new(&argv[0]);
     command
         .args(&argv[1..])
-        .stdin(if plan.stdin_prompt || plan.duplex || plan.approvals {
-            // An interactive run needs stdin for the whole turn, not just to
-            // deliver a prompt: it is the channel follow-up messages and
-            // approval decisions travel back on.
-            Stdio::piped()
-        } else {
-            // Close stdin so an agent that would otherwise wait on it exits
-            // instead of hanging forever with nothing to read.
-            Stdio::null()
-        })
+        .stdin(
+            if grok_acp || plan.stdin_prompt || plan.duplex || plan.approvals {
+                // An interactive run needs stdin for the whole turn, not just to
+                // deliver a prompt: it is the channel follow-up messages and
+                // approval decisions travel back on.
+                Stdio::piped()
+            } else {
+                // Close stdin so an agent that would otherwise wait on it exits
+                // instead of hanging forever with nothing to read.
+                Stdio::null()
+            },
+        )
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         // Without this a killed run can leave the child alive holding the pipes.
@@ -643,7 +646,7 @@ pub fn stream(request: &Request) -> Result<Run> {
     let (tx, rx) = mpsc::channel(EVENT_BUFFER);
     // Only created for an approvals run, so `respond` can tell "no channel" from
     // "channel closed" and refuse the first rather than hanging on it.
-    let (decisions_tx, decisions_rx) = if plan.duplex || plan.approvals {
+    let (decisions_tx, decisions_rx) = if grok_acp || plan.duplex || plan.approvals {
         let (tx, rx) = mpsc::channel::<Control>(APPROVAL_BUFFER);
         (Some(tx), Some(rx))
     } else {
@@ -660,7 +663,9 @@ pub fn stream(request: &Request) -> Result<Run> {
         let _session_lease = session_lease;
         // Moved in so the file outlives the run and is removed with it.
         let _schema_file = schema_file;
-        if codex_app_server {
+        if grok_acp {
+            drive_grok_acp(child, request, tx, cancel_rx, reaped_for_task, decisions_rx).await
+        } else if codex_app_server {
             drive_codex_app_server(child, request, tx, cancel_rx, reaped_for_task, decisions_rx)
                 .await
         } else {
@@ -1113,6 +1118,318 @@ async fn drive(
         // Prose is never reinterpreted as data.
         structured,
     })
+}
+
+/// Drive one Grok turn over `grok agent stdio` (ACP).
+///
+/// One child per `stream()`, so many Grok sessions and many other backends can
+/// run in parallel. Mid-turn input is `_x.ai/interject`. A drop or cancel
+/// sends `session/cancel` first so the session stays resumable, same idea as
+/// Codex `turn/interrupt`.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one select loop owns the protocol, control channel, deadline, and child lifecycle"
+)]
+async fn drive_grok_acp(
+    child: Child,
+    request: Request,
+    events: mpsc::Sender<Event>,
+    cancel: tokio::sync::oneshot::Receiver<()>,
+    reaped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    controls: Option<mpsc::Receiver<Control>>,
+) -> Result<Outcome> {
+    let mut child = ChildGuard { child, armed: true };
+    let plan = request.plan();
+    let bin = plan.bin.clone();
+    let Some(mut stdin) = child.child.stdin.take() else {
+        return Err(Error::Spawn {
+            bin,
+            source: std::io::Error::other("stdin was not piped for Grok ACP"),
+        });
+    };
+    let Some(stdout) = child.child.stdout.take() else {
+        return Err(Error::Spawn {
+            bin,
+            source: std::io::Error::other("stdout was not piped for Grok ACP"),
+        });
+    };
+    let mut controls = if let Some(controls) = controls {
+        controls
+    } else {
+        let (_tx, rx) = mpsc::channel(1);
+        rx
+    };
+
+    let stderr = child.child.stderr.take();
+    let stderr_task = tokio::spawn(async move {
+        let mut buf = String::new();
+        if let Some(handle) = stderr {
+            let mut reader = BufReader::new(handle);
+            let mut line = String::new();
+            while let Ok(Some(_)) = read_bounded_line(&mut reader, &mut line).await {
+                append_capped(&mut buf, &line);
+            }
+        }
+        buf
+    });
+
+    let mut protocol = crate::grok_acp::Protocol::new(request.clone());
+    for opening in crate::grok_acp::Protocol::opening() {
+        stdin
+            .write_all(opening.as_bytes())
+            .await
+            .map_err(|source| Error::Spawn {
+                bin: bin.clone(),
+                source,
+            })?;
+    }
+    stdin.flush().await.map_err(|source| Error::Spawn {
+        bin: bin.clone(),
+        source,
+    })?;
+
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+    let mut raw = String::new();
+    let mut pending = VecDeque::new();
+    let mut steer_receipts = HashMap::new();
+    let mut bound = false;
+    let mut persist_result: Result<()> = Ok(());
+    let deadline = async {
+        match request.timeout {
+            Some(limit) => tokio::time::sleep(limit).await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(deadline);
+    tokio::pin!(cancel);
+
+    while !protocol.finished {
+        tokio::select! {
+            biased;
+            control = controls.recv() => {
+                let Some(control) = control else {
+                    continue;
+                };
+                pending.push_back(control);
+                flush_grok_controls(
+                    &mut protocol,
+                    &mut pending,
+                    &mut steer_receipts,
+                    &mut stdin,
+                    &bin,
+                ).await?;
+                stdin.flush().await.map_err(|source| Error::Spawn {
+                    bin: bin.clone(), source
+                })?;
+            }
+            record = read_bounded_line(&mut reader, &mut line) => {
+                if record.map_err(|source| Error::Spawn { bin: bin.clone(), source })?.is_some() {
+                    append_capped(&mut raw, &line);
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
+                        let step = protocol.push(&value);
+                        settle_grok_steers(&mut steer_receipts, step.steer_responses, &bin);
+                        for event in step.events {
+                            if let Event::Started { session, .. } = &event
+                                && !bound
+                            {
+                                bound = true;
+                                persist_result = persist_session(&request, session);
+                            }
+                            let _ = events.send(event).await;
+                        }
+                        for write in step.writes {
+                            stdin.write_all(write.as_bytes()).await.map_err(|source| {
+                                Error::Spawn { bin: bin.clone(), source }
+                            })?;
+                        }
+                        flush_grok_controls(
+                            &mut protocol,
+                            &mut pending,
+                            &mut steer_receipts,
+                            &mut stdin,
+                            &bin,
+                        ).await?;
+                        stdin.flush().await.map_err(|source| Error::Spawn {
+                            bin: bin.clone(), source
+                        })?;
+                    } else {
+                        protocol.terminal.unparsed += 1;
+                        if protocol.terminal.first_unparsed.is_none() {
+                            protocol.terminal.first_unparsed = Some(line.clone());
+                        }
+                    }
+                } else {
+                    protocol.failure.get_or_insert_with(|| {
+                        "Grok ACP closed stdout before the turn settled".to_string()
+                    });
+                    protocol.finished = true;
+                }
+            }
+            () = &mut deadline => {
+                let partial = protocol.terminal.text.clone();
+                interrupt_grok_turn(&mut protocol, &mut stdin, &mut reader, &mut line, &mut raw)
+                    .await;
+                shut_down(&mut child, stderr_task).await;
+                reaped.store(true, std::sync::atomic::Ordering::SeqCst);
+                return Err(Error::Timeout {
+                    bin,
+                    timeout: request.timeout.unwrap_or_default(),
+                    partial,
+                });
+            }
+            _ = &mut cancel => {
+                interrupt_grok_turn(&mut protocol, &mut stdin, &mut reader, &mut line, &mut raw)
+                    .await;
+                shut_down(&mut child, stderr_task).await;
+                reaped.store(true, std::sync::atomic::Ordering::SeqCst);
+                return Err(Error::Cancelled { bin });
+            }
+        }
+    }
+
+    drop(stdin);
+    if tokio::time::timeout(std::time::Duration::from_secs(2), child.child.wait())
+        .await
+        .is_err()
+    {
+        kill_process_group(&child.child);
+        let _ = child.child.kill().await;
+    }
+    child.armed = false;
+    reaped.store(true, std::sync::atomic::Ordering::SeqCst);
+    drop(events);
+    let stderr = stderr_task.await.unwrap_or_default();
+
+    persist_result?;
+    if let Some(detail) = protocol.failure {
+        return Err(Error::Parse {
+            agent: request.agent,
+            detail,
+        });
+    }
+
+    let terminal = protocol.terminal;
+    if terminal.stop == Stop::Error {
+        return Err(classify_run(
+            request.agent,
+            &bin,
+            0,
+            &stderr,
+            &raw,
+            &terminal,
+        ));
+    }
+    let structured = terminal.structured.clone().or_else(|| {
+        request
+            .schema
+            .as_ref()
+            .and_then(|_| serde_json::from_str(&terminal.text).ok())
+    });
+    Ok(Outcome {
+        agent: request.agent,
+        session: terminal.session,
+        text: terminal.text,
+        usage: terminal.usage,
+        stop: terminal.stop,
+        rate_limit: terminal.rate_limit,
+        exit_code: 0,
+        stderr,
+        unparsed: terminal.unparsed,
+        first_unparsed: terminal.first_unparsed,
+        structured,
+    })
+}
+
+async fn interrupt_grok_turn(
+    protocol: &mut crate::grok_acp::Protocol,
+    stdin: &mut tokio::process::ChildStdin,
+    reader: &mut BufReader<tokio::process::ChildStdout>,
+    line: &mut String,
+    raw: &mut String,
+) {
+    let Some(encoded) = protocol.interrupt() else {
+        return;
+    };
+    if stdin.write_all(encoded.as_bytes()).await.is_err() || stdin.flush().await.is_err() {
+        return;
+    }
+    let settle = async {
+        while !protocol.finished {
+            let Ok(Some(_)) = read_bounded_line(reader, line).await else {
+                break;
+            };
+            append_capped(raw, line);
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
+                let _ = protocol.push(&value);
+            }
+        }
+    };
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), settle).await;
+}
+
+async fn flush_grok_controls(
+    protocol: &mut crate::grok_acp::Protocol,
+    pending: &mut VecDeque<Control>,
+    steer_receipts: &mut HashMap<u64, tokio::sync::oneshot::Sender<Result<()>>>,
+    stdin: &mut tokio::process::ChildStdin,
+    bin: &str,
+) -> Result<()> {
+    let mut waiting = VecDeque::new();
+    while let Some(control) = pending.pop_front() {
+        let encoded = match control {
+            Control::Message { body, receipt } => {
+                if let Some(request) = protocol.steer(&body) {
+                    steer_receipts.insert(request.id, receipt);
+                    Some(request.wire)
+                } else {
+                    waiting.push_back(Control::Message { body, receipt });
+                    None
+                }
+            }
+            Control::Approval { id, decision } => {
+                if let Some(encoded) = protocol.respond(&id, &decision) {
+                    Some(encoded)
+                } else {
+                    waiting.push_back(Control::Approval { id, decision });
+                    None
+                }
+            }
+        };
+        if let Some(encoded) = encoded {
+            stdin
+                .write_all(encoded.as_bytes())
+                .await
+                .map_err(|source| Error::Spawn {
+                    bin: bin.to_string(),
+                    source,
+                })?;
+        }
+    }
+    pending.append(&mut waiting);
+    Ok(())
+}
+
+fn settle_grok_steers(
+    receipts: &mut HashMap<u64, tokio::sync::oneshot::Sender<Result<()>>>,
+    responses: Vec<crate::grok_acp::SteerResponse>,
+    bin: &str,
+) {
+    for response in responses {
+        let Some(receipt) = receipts.remove(&response.id) else {
+            continue;
+        };
+        let result = response
+            .result
+            .map(|_| ())
+            .map_err(|message| Error::AgentError {
+                agent: crate::Agent::Grok,
+                bin: bin.to_string(),
+                status: None,
+                message,
+            });
+        let _ = receipt.send(result);
+    }
 }
 
 /// Drive one interactive Codex turn over app-server's JSON-RPC transport.
@@ -2095,6 +2412,7 @@ mod tests {
             (Agent::Claude, "setup-token"),
             (Agent::Codex, "codex login"),
             (Agent::Copilot, "copilot login"),
+            (Agent::Grok, "grok login"),
         ] {
             let err = classify_run(
                 agent,

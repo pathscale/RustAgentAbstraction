@@ -43,6 +43,7 @@ and not inferred from documentation.
 | **Claude Code** | caller-minted (`--session-id`) | yes (`--fork-session`) | `stream-json` | native (`--append-system-prompt`) | `--resume` |
 | **Codex** | agent-printed (`thread_id`) | no | `--json` | prepended to prompt | `exec resume <id>` |
 | **Copilot** | caller-minted (`--session-id`) | no | `--output-format json` | prepended to prompt | `--session-id` |
+| **Grok** | agent-printed (`session/new`) | yes (`session/fork`) | ACP stdio | native (`--rules`) | `session/load` |
 
 ### Can I choose the session id, or do I have to read it back?
 
@@ -53,6 +54,7 @@ Both, depending on the agent. Verified by round-trip, not from `--help`:
 | **Claude Code** | yes, `.session_id(uuid)` | also reported |
 | **Copilot** | yes, `.session_id(uuid)` | also reported |
 | **Codex** | **no** | `thread_id`, before it answers |
+| **Grok** | **no** | `sessionId`, from `session/new` |
 
 ```rust
 // Claude and Copilot: the id is yours to pick, so it can match a thread id

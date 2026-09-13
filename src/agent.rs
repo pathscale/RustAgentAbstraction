@@ -1,4 +1,4 @@
-//! The three agents, what each can do, and how a request becomes an argv.
+//! The four agents, what each can do, and how a request becomes an argv.
 //!
 //! Everything here is pure: [`Agent::argv`] builds a command line from a
 //! [`Plan`] without touching the filesystem, the clock, or a process, so every
@@ -21,6 +21,8 @@ pub enum Agent {
     Codex,
     /// GitHub Copilot CLI (`copilot`).
     Copilot,
+    /// Grok Build (`grok`).
+    Grok,
 }
 
 /// How an agent's native session id is obtained. This is the axis deciding whether
@@ -308,7 +310,7 @@ pub(crate) const MAX_COMMAND_LINE: usize = 512 * 1024;
 
 impl Agent {
     /// Every agent, in a stable order.
-    pub const ALL: [Agent; 3] = [Agent::Claude, Agent::Codex, Agent::Copilot];
+    pub const ALL: [Agent; 4] = [Agent::Claude, Agent::Codex, Agent::Copilot, Agent::Grok];
 
     /// The stable identifier used in session records and logs.
     #[must_use]
@@ -317,6 +319,7 @@ impl Agent {
             Agent::Claude => "claude-code",
             Agent::Codex => "codex",
             Agent::Copilot => "copilot",
+            Agent::Grok => "grok",
         }
     }
 
@@ -327,6 +330,7 @@ impl Agent {
             Agent::Claude => "claude",
             Agent::Codex => "codex",
             Agent::Copilot => "copilot",
+            Agent::Grok => "grok",
         }
     }
 
@@ -343,6 +347,11 @@ impl Agent {
             Agent::Claude => Some(&["auth", "status", "--json"]),
             Agent::Codex => Some(&["login", "status"]),
             Agent::Copilot => None,
+            // Verified against grok 1.0.30: there is no `auth status`. `grok
+            // models` prints "You are logged in with grok.com." when a session
+            // exists. Logged-out wording is not recorded here, so a miss stays
+            // `Unknown` rather than `LoggedOut`.
+            Agent::Grok => Some(&["models"]),
         }
     }
 
@@ -357,6 +366,7 @@ impl Agent {
             Agent::Claude => &["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"],
             Agent::Codex => &["CODEX_API_KEY", "OPENAI_API_KEY"],
             Agent::Copilot => &["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"],
+            Agent::Grok => &["XAI_API_KEY"],
         }
     }
 
@@ -374,6 +384,7 @@ impl Agent {
             }
             Agent::Codex => "run `codex login`",
             Agent::Copilot => "run `copilot login`",
+            Agent::Grok => "run `grok login`",
         }
     }
 
@@ -392,6 +403,8 @@ impl Agent {
             Agent::Codex => (0, 147, 0),
             // `copilot --version` -> "GitHub Copilot CLI 1.0.78."
             Agent::Copilot => (1, 0, 78),
+            // `grok --version` -> "grok 1.0.30 (04b7ffed98c6) [stable]"
+            Agent::Grok => (1, 0, 30),
         };
         crate::Version {
             major,
@@ -407,6 +420,7 @@ impl Agent {
             Agent::Claude => "npm install -g @anthropic-ai/claude-code",
             Agent::Codex => "npm install -g @openai/codex",
             Agent::Copilot => "npm install -g @github/copilot",
+            Agent::Grok => "curl -fsSL https://x.ai/cli/install.sh | bash",
         }
     }
 
@@ -474,6 +488,7 @@ impl Agent {
                 "GITHUB_TOKEN",
                 "XDG_CONFIG_HOME",
             ],
+            Agent::Grok => &["XAI_API_KEY", "GROK_HOME"],
         };
         BASE.iter().chain(WINDOWS).chain(agent).copied().collect()
     }
@@ -495,6 +510,8 @@ impl Agent {
     pub fn thinking_env(self, thinking: Option<bool>) -> Option<(&'static str, &'static str)> {
         match (self, thinking) {
             (Agent::Claude, Some(false)) => Some(("MAX_THINKING_TOKENS", "0")),
+            // grok 1.0.30 steers reasoning with `--effort` / `--reasoning-effort`,
+            // not an environment variable.
             _ => None,
         }
     }
@@ -551,6 +568,27 @@ impl Agent {
                 live_follow_up: false,
                 approvals: false,
             },
+            // Verified against grok 1.0.30 `--help` and ACP stdio: `session/new`
+            // prints the id, `session/fork` / `_x.ai/session/fork` branches,
+            // `_x.ai/interject` steers mid-turn (confirmed live; bare
+            // `x.ai/interject` is -32601), `session/cancel` interrupts,
+            // `session/request_permission` asks. Auto is native
+            // `--permission-mode auto`, same as Claude: opening the approval
+            // channel would replace it with a round trip the host would only
+            // answer yes to.
+            Agent::Grok => Caps {
+                session: SessionSupport::Printed,
+                fork: true,
+                events: true,
+                native_system: true,
+                schema: SchemaSupport::Inline,
+                // `/compact` is a Grok command and an ACP method. `/clear` is
+                // not: Grok uses `/new`. Other names are refused rather than
+                // sent as prose.
+                commands: true,
+                live_follow_up: true,
+                approvals: true,
+            },
         }
     }
 
@@ -563,9 +601,8 @@ impl Agent {
             // cheaper default when the caller did not ask to stream.
             SessionSupport::Minted | SessionSupport::Printed => Some(match self {
                 Agent::Claude => Format::Json,
-                // `--json` IS Codex's stream and Copilot's `json` is JSONL;
-                // neither has a single-document form.
-                Agent::Codex | Agent::Copilot => Format::Stream,
+                // ACP stdio, `codex --json`, and Copilot `json` are all streams.
+                Agent::Codex | Agent::Copilot | Agent::Grok => Format::Stream,
             }),
             SessionSupport::None => None,
         }
@@ -682,6 +719,7 @@ impl Agent {
             Agent::Claude => argv_claude(plan),
             Agent::Codex => argv_codex(plan),
             Agent::Copilot => argv_copilot(plan),
+            Agent::Grok => argv_grok(plan),
         })
     }
 
@@ -1071,6 +1109,57 @@ fn argv_copilot(plan: &Plan) -> Vec<Arg> {
     a.done()
 }
 
+/// `grok [--permission-mode M] agent [--model M] [--always-approve] stdio`
+///
+/// Flag placement verified against grok 1.0.30 `--help` and the live ACP
+/// client: `--permission-mode` is top-level `grok`, `--model` /
+/// `--reasoning-effort` / `--always-approve` sit on `grok agent` before
+/// `stdio`. The prompt never rides the argv; it is `session/prompt` after
+/// initialize. Auto is `--permission-mode auto`, not `--always-approve`:
+/// native auto, same token Claude uses, and Grok has the same token.
+/// Bypass is `--always-approve`. Mid-turn steer is `_x.ai/interject` on the
+/// open stdio, not a second spawn.
+fn argv_grok(plan: &Plan) -> Vec<Arg> {
+    let mut a = Argv::new(&plan.bin);
+    a.bare("--no-auto-update");
+    a.pair("--permission-mode", grok_mode(plan.permission));
+    if plan.permission == Permission::ReadOnly {
+        // Internal ids from grok's own headless docs (`--disallowed-tools
+        // run_terminal_cmd`, `search_replace`, `Agent`). Comma-separated is
+        // one argument.
+        a.pair(
+            "--disallowed-tools",
+            "run_terminal_cmd,search_replace,Agent",
+        );
+    }
+    if let Some(system) = &plan.system {
+        a.secret("--rules", system, Sensitivity::Prompt);
+    }
+    if let Some(schema) = &plan.schema {
+        a.secret("--json-schema", schema, Sensitivity::Prompt);
+    }
+    a.bare("agent");
+    a.opt("--model", plan.model.as_ref());
+    if let Some(effort) = &plan.effort {
+        a.pair("--reasoning-effort", effort);
+    }
+    if plan.permission == Permission::Bypass {
+        a.bare("--always-approve");
+    }
+    a.bare("stdio");
+    a.done()
+}
+
+fn grok_mode(p: Permission) -> &'static str {
+    match p {
+        Permission::ReadOnly => "dontAsk",
+        Permission::Plan => "plan",
+        Permission::Edit => "acceptEdits",
+        Permission::Auto => "auto",
+        Permission::Bypass => "bypassPermissions",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1102,7 +1191,7 @@ mod tests {
 
     #[test]
     fn interactive_capabilities_match_the_supported_request_paths() {
-        for agent in [Agent::Claude, Agent::Codex] {
+        for agent in [Agent::Claude, Agent::Codex, Agent::Grok] {
             let caps = agent.caps();
             assert!(caps.live_follow_up, "{agent} can take live follow-ups");
             assert!(caps.approvals, "{agent} has an approval channel");
@@ -1174,6 +1263,7 @@ mod tests {
             Err(Error::Unsupported { .. })
         ));
         assert!(Agent::Claude.typed_argv(&p).is_ok());
+        assert!(Agent::Grok.typed_argv(&p).is_ok());
         assert_eq!(argv(Agent::Codex, &p), ["x", "app-server", "--stdio"]);
     }
 
@@ -1245,6 +1335,9 @@ mod tests {
             Err(Error::Unsupported { .. })
         ));
         assert_eq!(argv(Agent::Codex, &p), ["x", "app-server", "--stdio"]);
+        let grok = argv(Agent::Grok, &p);
+        assert!(grok.contains(&"stdio".to_string()), "{grok:?}");
+        assert!(grok.contains(&"agent".to_string()), "{grok:?}");
     }
 
     /// An ordinary run is untouched, so nothing about the default path changes.
@@ -1749,6 +1842,8 @@ mod tests {
             Agent::Claude.argv(&p).is_ok(),
             "Claude publishes a catalogue and acts on them"
         );
+        p.bin = "grok".into();
+        assert!(Agent::Grok.argv(&p).is_ok(), "Grok maps /compact over ACP");
     }
 
     /// All three expose an id, so all three can back a named session, but only
@@ -1758,6 +1853,7 @@ mod tests {
         assert_eq!(Agent::Claude.session_format(), Some(Format::Json));
         assert_eq!(Agent::Codex.session_format(), Some(Format::Stream));
         assert_eq!(Agent::Copilot.session_format(), Some(Format::Stream));
+        assert_eq!(Agent::Grok.session_format(), Some(Format::Stream));
     }
 
     /// Claude and Copilot let the caller assign the id, so a run that dies
@@ -1769,5 +1865,43 @@ mod tests {
             .filter(|a| a.caps().session == SessionSupport::Minted)
             .collect();
         assert_eq!(minting, [Agent::Claude, Agent::Copilot]);
+    }
+
+    #[test]
+    fn grok_stdio_keeps_auto_native_and_puts_flags_in_the_right_place() {
+        let mut p = plan("grok");
+        p.permission = Permission::Auto;
+        p.model = Some("grok-4.6".into());
+        p.effort = Some("high".into());
+        p.system = Some("be brief".into());
+        let a = argv(Agent::Grok, &p);
+        assert_eq!(a[0], "grok");
+        let agent_at = pos(&a, "agent").expect("agent subcommand");
+        let stdio_at = pos(&a, "stdio").expect("stdio");
+        assert!(agent_at < stdio_at);
+        assert!(pos(&a, "--permission-mode").unwrap() < agent_at);
+        assert_eq!(a[pos(&a, "--permission-mode").unwrap() + 1], "auto");
+        assert!(pos(&a, "--model").unwrap() > agent_at);
+        assert_eq!(a[pos(&a, "--model").unwrap() + 1], "grok-4.6");
+        assert!(pos(&a, "--reasoning-effort").unwrap() > agent_at);
+        assert_eq!(a[pos(&a, "--reasoning-effort").unwrap() + 1], "high");
+        assert!(pos(&a, "--rules").unwrap() < agent_at);
+        assert!(!a.iter().any(|arg| arg == "--always-approve"));
+        assert!(
+            !a.iter().any(|arg| arg == "hi"),
+            "prompt is ACP not argv: {a:?}"
+        );
+    }
+
+    #[test]
+    fn grok_bypass_is_always_approve_not_auto() {
+        let mut p = plan("grok");
+        p.permission = Permission::Bypass;
+        let a = argv(Agent::Grok, &p);
+        assert!(a.iter().any(|arg| arg == "--always-approve"), "{a:?}");
+        assert_eq!(
+            a[pos(&a, "--permission-mode").unwrap() + 1],
+            "bypassPermissions"
+        );
     }
 }

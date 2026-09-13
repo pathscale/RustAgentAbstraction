@@ -148,6 +148,7 @@ impl Agent {
             Agent::Claude => claude_models(),
             Agent::Codex => codex_models(),
             Agent::Copilot => copilot_models(),
+            Agent::Grok => grok_models(),
         }
     }
 
@@ -176,6 +177,11 @@ impl Agent {
                 checked: "2026-07-29",
                 against: "Copilot CLI 1.0.75",
             },
+            Agent::Grok => Verified {
+                source: Source::Cli,
+                checked: "2026-09-13",
+                against: "grok 1.0.30",
+            },
         }
     }
 
@@ -196,6 +202,7 @@ impl Agent {
     pub async fn discover_models(&self) -> Result<Vec<Model>> {
         match self {
             Agent::Codex => discover_codex(self.bin()).await,
+            Agent::Grok => discover_grok(self.bin()).await,
             // Neither can be asked without a terminal, verified against
             // Copilot CLI 1.0.75 and claude 2.1.212. Copilot has no `models`
             // subcommand, rejects an unknown `--model` without listing the valid
@@ -506,6 +513,89 @@ fn copilot_models() -> Vec<Model> {
 /// picker shows ids and nothing else.
 fn pinned(id: &'static str, name: &'static str) -> Model {
     Model::new(id, name, "", Kind::Pinned, COPILOT_EFFORTS, false)
+}
+
+/// Grok, from `grok models` on 1.0.30 (2026-09-13).
+///
+/// Effort tokens from grok `--help` (`--reasoning-effort` / `--effort`) and
+/// the session config option `reasoning_effort`.
+const GROK_EFFORTS: &[&str] = &["minimal", "low", "medium", "high", "xhigh"];
+
+fn grok_models() -> Vec<Model> {
+    vec![
+        Model::new(
+            "grok-4.6",
+            "Grok 4.6",
+            "Default Grok Build model",
+            Kind::Pinned,
+            GROK_EFFORTS,
+            true,
+        ),
+        Model::new(
+            "grok-4.5",
+            "Grok 4.5",
+            "",
+            Kind::Pinned,
+            GROK_EFFORTS,
+            false,
+        ),
+    ]
+}
+
+async fn discover_grok(bin: &str) -> Result<Vec<Model>> {
+    let output = tokio::process::Command::new(bin)
+        .arg("models")
+        .output()
+        .await
+        .map_err(|source| {
+            if source.kind() == std::io::ErrorKind::NotFound {
+                Error::NotInstalled {
+                    agent: Agent::Grok,
+                    bin: bin.to_string(),
+                    hint: Agent::Grok.install_hint(),
+                }
+            } else {
+                Error::Spawn {
+                    bin: bin.to_string(),
+                    source,
+                }
+            }
+        })?;
+    parse_grok_models(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn parse_grok_models(stdout: &str) -> Result<Vec<Model>> {
+    let mut models = Vec::new();
+    for line in stdout.lines() {
+        let line = line.trim();
+        let rest = line
+            .strip_prefix("* ")
+            .or_else(|| line.strip_prefix("- "))
+            .unwrap_or("");
+        if rest.is_empty() {
+            continue;
+        }
+        let id = rest.split_whitespace().next().unwrap_or(rest);
+        let is_default = rest.contains("(default)");
+        models.push(Model {
+            id: id.to_string().into(),
+            name: id.to_string().into(),
+            note: Cow::Borrowed(""),
+            kind: Kind::Pinned,
+            efforts: GROK_EFFORTS.iter().map(|e| Cow::Borrowed(*e)).collect(),
+            is_default,
+        });
+    }
+    if models.is_empty() {
+        return Err(Error::Parse {
+            agent: Agent::Grok,
+            detail: "`grok models` listed no models".into(),
+        });
+    }
+    if !models.iter().any(|model| model.is_default) {
+        models[0].is_default = true;
+    }
+    Ok(models)
 }
 
 /// Read Codex's own model list.

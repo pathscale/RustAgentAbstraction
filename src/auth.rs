@@ -164,6 +164,20 @@ impl AuthStatus {
             // Unreachable: `auth_status_argv` returns None, so `check_bin`
             // never gets here for Copilot.
             Agent::Copilot => {}
+            Agent::Grok => {
+                let lower = text.to_ascii_lowercase();
+                status.state = if lower.contains("not logged in") || lower.contains("logged out") {
+                    AuthState::LoggedOut
+                } else if lower.contains("logged in") {
+                    status.method = text
+                        .rsplit_once(" with ")
+                        .or_else(|| text.rsplit_once(" using "))
+                        .map(|(_, method)| method.trim().trim_end_matches('.').to_string());
+                    AuthState::LoggedIn
+                } else {
+                    AuthState::Unknown
+                };
+            }
         }
         status
     }
