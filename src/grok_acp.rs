@@ -78,6 +78,10 @@ struct PendingApproval {
 
 /// State that spans the JSON-RPC records of one turn.
 #[derive(Debug)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "each flag is one independent latch in the ACP turn, not a state enum"
+)]
 pub(crate) struct Protocol {
     request: Request,
     pub terminal: Terminal,
@@ -865,8 +869,7 @@ fn command_names(update: &Value) -> Vec<String> {
 fn unix_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_secs())
 }
 
 fn info_wire(session_id: &str, id: u64, fallback: bool) -> String {
@@ -927,8 +930,14 @@ fn usage_wire(session_id: &str, fallback: bool) -> String {
 fn json_f64(value: &Value) -> Option<f64> {
     value
         .as_f64()
-        .or_else(|| value.as_u64().map(|n| n as f64))
-        .or_else(|| value.as_i64().map(|n| n as f64))
+        .or_else(|| {
+            #[allow(clippy::cast_precision_loss, reason = "token counts never reach 2^53")]
+            value.as_u64().map(|n| n as f64)
+        })
+        .or_else(|| {
+            #[allow(clippy::cast_precision_loss, reason = "token counts never reach 2^53")]
+            value.as_i64().map(|n| n as f64)
+        })
 }
 
 fn first_f64(root: &Value, keys: &[&str]) -> Option<f64> {
@@ -990,7 +999,7 @@ fn parse_iso_utc(s: &str) -> Option<i64> {
     let yoe = y - era * 400;
     let doy = (153 * m + 2) / 5 + d - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146097 + doe - 719468;
+    let days = era * 146_097 + doe - 719_468;
     Some(days * 86400 + hh * 3600 + mm * 60 + ss)
 }
 
@@ -1027,6 +1036,11 @@ fn first_u64(root: &Value, keys: &[&str]) -> Option<u64> {
         }
         if let Some(n) = root.get(*key).and_then(Value::as_f64) {
             if n >= 0.0 {
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "guarded non-negative; token counts are whole and bounded"
+                )]
                 return Some(n as u64);
             }
         }
@@ -1118,7 +1132,12 @@ fn grok_usage(usage: &Value) -> Usage {
         cost_usd: usage
             .get("costUsdTicks")
             .or_else(|| usage.get("cost_usd_ticks"))
-            .and_then(|value| value.as_f64().or_else(|| value.as_u64().map(|n| n as f64)))
+            .and_then(|value| {
+                value.as_f64().or_else(|| {
+                    #[allow(clippy::cast_precision_loss, reason = "token counts never reach 2^53")]
+                    value.as_u64().map(|n| n as f64)
+                })
+            })
             // CLI `costUsdTicks` is 1e-9 USD (session 01a09ca7: 1.644e9 ticks).
             // xAI API `cost_in_usd_ticks` is 1e-10; do not mix the two.
             .map(|ticks| ticks / 1_000_000_000.0)
@@ -1313,7 +1332,7 @@ mod tests {
                         "inputTokens": 18033,
                         "outputTokens": 189,
                         "cachedReadTokens": 0,
-                        "costUsdTicks": 126480000
+                        "costUsdTicks": 126_480_000
                     }
                 }
             }
