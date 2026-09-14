@@ -2184,6 +2184,7 @@ mod tests {
                 resets_at: None,
                 overage_status: None,
                 is_using_overage: None,
+                used_percent: None,
             }),
             ..Terminal::default()
         };
@@ -2202,6 +2203,7 @@ mod tests {
                 resets_at: None,
                 overage_status: None,
                 is_using_overage: None,
+                used_percent: None,
             }),
             ..Terminal::default()
         };
@@ -2264,6 +2266,7 @@ mod tests {
                 resets_at: Some(1_785_331_800),
                 overage_status: None,
                 is_using_overage: None,
+                used_percent: None,
             }),
             ..Terminal::default()
         };
@@ -2285,6 +2288,7 @@ mod tests {
                 resets_at: None,
                 overage_status: None,
                 is_using_overage: None,
+                used_percent: None,
             }),
             ..Terminal::default()
         };
@@ -2345,6 +2349,7 @@ mod tests {
                 resets_at: None,
                 overage_status: None,
                 is_using_overage: None,
+                used_percent: None,
             }),
             ..Terminal::default()
         };

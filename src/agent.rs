@@ -1122,6 +1122,9 @@ fn argv_copilot(plan: &Plan) -> Vec<Arg> {
 fn argv_grok(plan: &Plan) -> Vec<Arg> {
     let mut a = Argv::new(&plan.bin);
     a.bare("--no-auto-update");
+    // ACP has no TUI for plan approval. `enter_plan_mode` / `exit_plan_mode`
+    // hang until the host's liveness ping aborts the turn (session 01a09bd5).
+    a.bare("--no-plan");
     a.pair("--permission-mode", grok_mode(plan.permission));
     if plan.permission == Permission::ReadOnly {
         // Internal ids from grok's own headless docs (`--disallowed-tools
@@ -1886,6 +1889,7 @@ mod tests {
         assert!(pos(&a, "--reasoning-effort").unwrap() > agent_at);
         assert_eq!(a[pos(&a, "--reasoning-effort").unwrap() + 1], "high");
         assert!(pos(&a, "--rules").unwrap() < agent_at);
+        assert!(pos(&a, "--no-plan").unwrap() < agent_at);
         assert!(!a.iter().any(|arg| arg == "--always-approve"));
         assert!(
             !a.iter().any(|arg| arg == "hi"),
