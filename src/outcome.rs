@@ -163,6 +163,12 @@ pub struct RateLimit {
     pub overage_status: Option<String>,
     /// Whether the run was already drawing on overage rather than the plan.
     pub is_using_overage: Option<bool>,
+    /// 0–100, when the provider reports how full the window is.
+    ///
+    /// Grok's `x.ai/session/usage` carries this. Claude's in-run rate-limit
+    /// object does not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used_percent: Option<f64>,
 }
 
 impl RateLimit {
@@ -287,6 +293,7 @@ mod tests {
             resets_at: Some(1_785_765_600),
             overage_status: None,
             is_using_overage: Some(false),
+            used_percent: None,
         };
         assert!(
             !warned.is_blocking(),

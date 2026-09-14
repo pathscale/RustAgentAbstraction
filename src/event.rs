@@ -321,6 +321,7 @@ fn enforce_bounds(event: Event) -> Event {
             resets_at: limit.resets_at,
             overage_status: limit.overage_status.map(bound_identifier),
             is_using_overage: limit.is_using_overage,
+            used_percent: limit.used_percent,
         }),
         // The agent's own refusal sentence, bounded like any other prose it
         // hands back.
@@ -1271,6 +1272,7 @@ fn claude_rate_limit(v: Option<&Value>) -> Option<RateLimit> {
             .and_then(Value::as_str)
             .map(str::to_string),
         is_using_overage: v.get("isUsingOverage").and_then(Value::as_bool),
+        used_percent: None,
     })
 }
 
@@ -1961,6 +1963,7 @@ mod tests {
             resets_at: Some(1_785_260_400),
             overage_status: None,
             is_using_overage: None,
+            used_percent: None,
         };
         assert!(events.contains(&Event::RateLimit(limit.clone())));
         assert_eq!(term.rate_limit, Some(limit.clone()));
