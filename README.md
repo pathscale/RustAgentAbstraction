@@ -45,7 +45,7 @@ Every entry point that spawns a CLI (`run`, `stream`, `interrupt`, `Probe::run`,
 
 ## What each agent can actually do
 
-Verified live, against `claude 2.1.267`, `codex-cli 0.154.0`, `GitHub Copilot CLI 1.0.88` and
+Verified live, against `claude 2.1.267`, `codex-cli 0.156.1`, `GitHub Copilot CLI 1.0.88` and
 `grok 1.0.40`, and not inferred from documentation.
 
 | | session id | fork | events | system prompt | resume flag |
@@ -187,7 +187,8 @@ the account actually allows. `Model::is_default` marks the safe pre-selection.
 Aliases and pinned ids are both carried, and `Model::kind` tells them apart, because they
 do not always agree. On claude 2.1.212, `--model opus` reported `claude-opus-4-8` while
 `--model claude-opus-5` reported `claude-opus-5`, even though that release's own notes call
-Opus 5 the default Opus model. An alias is whatever the account resolves it to.
+Opus 5 the default Opus model. On 2.1.267 they agree again: `opus` reports `claude-opus-5`
+and `fable` reports `claude-fable-5-1`. An alias is whatever the account resolves it to.
 
 ### Reasoning effort
 
@@ -571,10 +572,10 @@ own variables do not reach the child.
   cleanly, reports `subtype: "success"`, and puts "There's an issue with the selected model"
   where the answer belongs. Codex does the same and wraps the upstream body in a JSON string.
   Both come back as `Error::AgentError`; see below.
-- **`claude-opus-5` defaults to a 200k window while every other 5-series model is 1M.**
-  Verified by running each id: `claude-sonnet-5` and `claude-fable-5` report a 1,000,000
-  token window natively, `claude-opus-5` reports 200,000 and needs the `[1m]` suffix
-  (`claude-opus-5[1m]`) to widen. The catalogue carries both forms.
+- **`claude-opus-5`'s window depends on the CLI release.** On 2.1.212 it reported 200,000
+  and needed the `[1m]` suffix (`claude-opus-5[1m]`) to widen, while `claude-sonnet-5` and
+  `claude-fable-5` reported 1,000,000 natively. On 2.1.267 plain `claude-opus-5` reports
+  1,000,000 too. The catalogue carries both forms, and `default` resolves to the suffixed one.
 - **Claude's `stream-json` requires `--verbose`**, or it refuses to start. Handled.
 - **Large prompts move to stdin automatically** above 128 KiB, so a long prompt never fails
   with `E2BIG`.

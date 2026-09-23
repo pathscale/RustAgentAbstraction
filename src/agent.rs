@@ -399,8 +399,8 @@ impl Agent {
         let (major, minor, patch) = match self {
             // `claude --version` -> "2.1.267 (Claude Code)"
             Agent::Claude => (2, 1, 267),
-            // `codex --version` -> "codex-cli 0.154.0"
-            Agent::Codex => (0, 154, 0),
+            // `codex --version` -> "codex-cli 0.156.1"
+            Agent::Codex => (0, 156, 1),
             // `copilot --version` -> "GitHub Copilot CLI 1.0.88."
             Agent::Copilot => (1, 0, 88),
             // `grok --version` -> "grok 1.0.40 (eb1a2256660d)"
