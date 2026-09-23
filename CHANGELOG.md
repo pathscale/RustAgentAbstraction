@@ -8,6 +8,49 @@ appear in a patch rather than inflating the version toward 1.0 on a crate still 
 shape. **Where that happens the entry says so at the top**, because a version number that
 under-signals is only acceptable if the changelog over-signals to compensate.
 
+## 0.5.2
+
+**Behaviour change in a patch.** A run on a model the catalogue marks retired now fails
+with the new `Error::RetiredModel` before anything is spawned, where before it ran. `Model` also
+gains a public `retired` field (additive: `Model` is `#[non_exhaustive]`).
+
+Model catalogues re-checked against the installed CLIs: claude 2.1.280 and codex-cli
+0.156.1. Every Claude entry was run once with `--model` and answered under the id it
+reports; the Codex list is what `codex debug models` returns. The live Codex suite passed
+on 0.156.1 apart from the two tests that need a session fixture.
+
+### Added
+
+- **Claude Opus 5.5:** `claude-opus-5-5` and `claude-opus-5-5[1m]`, both 1M. On 2.1.280
+  `opus` and `default` resolve to `claude-opus-5-5`, and `opus[1m]` to
+  `claude-opus-5-5[1m]`. 2.1.267 refused the id as `[claude-code:unrecognized_model]`.
+- **Retired models stay in the catalogue.** A model a CLI stops offering is kept with
+  `Model::retired` set (`Retired { since, replacement, reason }`) instead of being deleted,
+  because a host that stored the id would otherwise see it vanish from its picker while
+  its runs kept using it. `Model::is_retired()` flags it, a retired entry is never
+  `is_default`, and a request naming one fails with `Error::RetiredModel` carrying the model,
+  the reason and the replacement. Ids the catalogue does not know still pass through.
+  `discover_models` appends the compiled-in retired entries after the discovered ones.
+  Retired: `claude-fable-5` (claude 2.1.267, answers as `claude-opus-4-8`; use
+  `claude-fable-5-1`), and Codex `gpt-5.4` and `gpt-5.4-mini` (codex-cli 0.154.0, no longer
+  listed; use `gpt-6-astra`).
+
+### Changed
+
+- **Codex catalogue** follows what 0.156.1 reports: `gpt-6-sol` and `gpt-6-luna` are new,
+  between `gpt-6-astra` (still the default) and `gpt-5.6-sol`. `gpt-6-luna` stops at `max`;
+  `gpt-6-sol` goes to `ultra`.
+- **`verified_version`** is claude 2.1.280 and codex 0.156.1, the releases `Probe` now
+  compares against. `claude --help` on 2.1.280 differs from 2.1.267 only in the wording of
+  `--bare` and `--safe-mode`; no flag this crate passes changed.
+- **Claude catalogue:** `claude-fable-5-1` is added and `claude-fable-5` is retired. Both
+  `fable` and `best` now resolve to `claude-fable-5-1`, and a run on `claude-fable-5`
+  produced no output of its own, with the answer coming from `claude-opus-4-8`.
+  `claude-haiku-4-5-20251001`, the id the `haiku` alias reports, is added beside
+  `claude-haiku-4-5`, which still answers under its own name and stays live.
+- **`claude-opus-5` is 1M natively** since 2.1.267. It reported a 200k window on 2.1.212;
+  it now reports 1,000,000 without the `[1m]` suffix.
+
 ## 0.5.1
 
 Re-verified against the installed CLIs: claude 2.1.267, codex-cli 0.154.0, GitHub Copilot
