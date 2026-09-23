@@ -7,14 +7,23 @@
 //!
 //! # Running a prompt
 //!
+//! Every entry point that spawns a CLI takes a handle to a
+//! [`nagoya::reactor::Reactor`], the I/O driver the child's pipes are
+//! registered with. The caller starts it, keeps it alive for as long as any run
+//! it served is in flight, and passes `&reactor.handle()`. This crate never
+//! starts one itself.
+//!
 //! ```no_run
+//! use agent_abstraction::nagoya::reactor::Reactor;
 //! use agent_abstraction::{Agent, Permission, Request, run};
 //!
 //! # async fn example() -> agent_abstraction::Result<()> {
+//! let reactor = Reactor::start().expect("an I/O reactor");
 //! let outcome = run(
 //!     &Request::new(Agent::Claude, "Reply with the single word: pong")
 //!         .model("haiku")
 //!         .permission(Permission::ReadOnly),
+//!     &reactor.handle(),
 //! )
 //! .await?;
 //!
@@ -26,10 +35,11 @@
 //! # Watching one as it works
 //!
 //! ```no_run
+//! use agent_abstraction::nagoya::reactor::Handle;
 //! use agent_abstraction::{Agent, Event, Request, stream};
 //!
-//! # async fn example() -> agent_abstraction::Result<()> {
-//! let mut running = stream(&Request::new(Agent::Claude, "audit this repo"))?;
+//! # async fn example(reactor: &Handle) -> agent_abstraction::Result<()> {
+//! let mut running = stream(&Request::new(Agent::Claude, "audit this repo"), reactor)?;
 //! while let Some(event) = running.recv().await {
 //!     match event {
 //!         Event::Text(text) => print!("{text}"),
@@ -48,19 +58,20 @@
 //! whatever handle the agent understands:
 //!
 //! ```no_run
+//! use agent_abstraction::nagoya::reactor::Handle;
 //! use agent_abstraction::{Agent, Request, SessionStore, run};
 //!
-//! # async fn example() -> agent_abstraction::Result<()> {
+//! # async fn example(reactor: &Handle) -> agent_abstraction::Result<()> {
 //! let store = SessionStore::open("/var/lib/myapp/sessions");
 //!
 //! // First turn creates the session; later turns continue it.
 //! let first = Request::new(Agent::Claude, "remember the number 7")
 //!     .session(&store, ".", "thread-42", false)?;
-//! run(&first).await?;
+//! run(&first, reactor).await?;
 //!
 //! let second = Request::new(Agent::Claude, "what number did I say?")
 //!     .session(&store, ".", "thread-42", false)?;
-//! println!("{}", run(&second).await?.text);
+//! println!("{}", run(&second, reactor).await?.text);
 //! # Ok(())
 //! # }
 //! ```
@@ -116,3 +127,8 @@ pub use probe::{Probe, Version, VersionStatus};
 pub use request::Request;
 pub use run::{Run, RunControl, interrupt, run, stream};
 pub use session::{Phase, SessionRecord, SessionStore};
+
+/// The runtime this crate is built on, re-exported so a caller can start the
+/// [`nagoya::reactor::Reactor`] every spawning entry point takes a handle to
+/// without naming a second, possibly mismatched, copy of the dependency.
+pub use nagoya;

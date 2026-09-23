@@ -7,9 +7,10 @@
 //!
 //! ```no_run
 //! # use agent_abstraction::{Agent, AuthStatus};
-//! # async fn example() -> agent_abstraction::Result<()> {
+//! # use agent_abstraction::nagoya::reactor::Handle;
+//! # async fn example(reactor: &Handle) -> agent_abstraction::Result<()> {
 //! for agent in Agent::ALL {
-//!     let status = AuthStatus::check(agent).await?;
+//!     let status = AuthStatus::check(agent, reactor).await?;
 //!     println!("{agent}: {}", status.summary());
 //! }
 //! # Ok(())
@@ -66,8 +67,12 @@ impl AuthStatus {
     /// [`Error::NotInstalled`] if the binary is missing, [`Error::Spawn`] if it
     /// cannot be run. A CLI that answers "logged out" is a successful check,
     /// not an error.
-    pub async fn check(agent: Agent) -> Result<AuthStatus> {
-        AuthStatus::check_bin(agent, agent.bin()).await
+    ///
+    /// # Reactor
+    /// `reactor` drives the status command's pipes; the caller keeps its
+    /// [`nagoya::reactor::Reactor`] alive until this returns.
+    pub async fn check(agent: Agent, reactor: &nagoya::reactor::Handle) -> Result<AuthStatus> {
+        AuthStatus::check_bin(agent, agent.bin(), reactor).await
     }
 
     /// Ask a specific binary, for a caller overriding the path with
@@ -76,14 +81,18 @@ impl AuthStatus {
     /// # Errors
     /// [`Error::NotInstalled`] if the binary is missing, [`Error::Spawn`] if it
     /// cannot be run.
-    pub async fn check_bin(agent: Agent, bin: &str) -> Result<AuthStatus> {
+    pub async fn check_bin(
+        agent: Agent,
+        bin: &str,
+        reactor: &nagoya::reactor::Handle,
+    ) -> Result<AuthStatus> {
         let Some(args) = agent.auth_status_argv() else {
             return Ok(AuthStatus::uncheckable(agent));
         };
 
-        let output = tokio::process::Command::new(bin)
+        let output = nagoya::process::Command::new(bin)
             .args(args)
-            .output()
+            .output(reactor)
             .await
             .map_err(|source| {
                 if source.kind() == std::io::ErrorKind::NotFound {
@@ -320,11 +329,15 @@ mod tests {
 
     /// Copilot exposes no status command, and saying "logged out" for an agent
     /// that cannot be asked would send someone to fix a working setup.
-    #[tokio::test]
-    async fn copilot_reports_that_it_cannot_be_checked() {
-        let status = AuthStatus::check_bin(Agent::Copilot, "copilot")
-            .await
-            .expect("an uncheckable agent is not an error");
+    #[test]
+    fn copilot_reports_that_it_cannot_be_checked() {
+        let reactor = nagoya::reactor::Reactor::start().expect("reactor");
+        let status = nagoya::block_on(AuthStatus::check_bin(
+            Agent::Copilot,
+            "copilot",
+            &reactor.handle(),
+        ))
+        .expect("an uncheckable agent is not an error");
         assert_eq!(status.state, AuthState::Unknown);
         assert!(!status.needs_login());
         assert!(

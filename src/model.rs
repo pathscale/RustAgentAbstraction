@@ -191,6 +191,9 @@ impl Agent {
     /// Worth preferring wherever it works: it reflects the binary actually
     /// present instead of the one this crate was written against.
     ///
+    /// `reactor` drives the child's pipes; the caller keeps its
+    /// [`nagoya::reactor::Reactor`] alive until this returns.
+    ///
     /// # Errors
     /// [`Error::Unsupported`] on an agent with no headless way to answer, which
     /// today is Claude and Copilot. That is deliberately an error rather than a
@@ -199,10 +202,10 @@ impl Agent {
     /// answers a question they did not ask. [`Error::NotInstalled`] if the
     /// binary is missing, [`Error::Spawn`] if it cannot be run, and
     /// [`Error::Parse`] if its output is not the expected shape.
-    pub async fn discover_models(&self) -> Result<Vec<Model>> {
+    pub async fn discover_models(&self, reactor: &nagoya::reactor::Handle) -> Result<Vec<Model>> {
         match self {
-            Agent::Codex => discover_codex(self.bin()).await,
-            Agent::Grok => discover_grok(self.bin()).await,
+            Agent::Codex => discover_codex(self.bin(), reactor).await,
+            Agent::Grok => discover_grok(self.bin(), reactor).await,
             // Neither can be asked without a terminal, verified against
             // Copilot CLI 1.0.75 and claude 2.1.212. Copilot has no `models`
             // subcommand, rejects an unknown `--model` without listing the valid
@@ -542,10 +545,10 @@ fn grok_models() -> Vec<Model> {
     ]
 }
 
-async fn discover_grok(bin: &str) -> Result<Vec<Model>> {
-    let output = tokio::process::Command::new(bin)
+async fn discover_grok(bin: &str, reactor: &nagoya::reactor::Handle) -> Result<Vec<Model>> {
+    let output = nagoya::process::Command::new(bin)
         .arg("models")
-        .output()
+        .output(reactor)
         .await
         .map_err(|source| {
             if source.kind() == std::io::ErrorKind::NotFound {
@@ -603,10 +606,10 @@ fn parse_grok_models(stdout: &str) -> Result<Vec<Model>> {
 /// `codex debug models` prints one JSON document carrying every model plus each
 /// one's full system prompt, so the reply runs to hundreds of kilobytes. Only
 /// the descriptive fields are kept.
-async fn discover_codex(bin: &str) -> Result<Vec<Model>> {
-    let output = tokio::process::Command::new(bin)
+async fn discover_codex(bin: &str, reactor: &nagoya::reactor::Handle) -> Result<Vec<Model>> {
+    let output = nagoya::process::Command::new(bin)
         .args(["debug", "models"])
-        .output()
+        .output(reactor)
         .await
         .map_err(|source| {
             if source.kind() == std::io::ErrorKind::NotFound {
@@ -789,12 +792,13 @@ mod tests {
     /// Discovery must not quietly answer with the compiled-in list: a caller
     /// asking for it is asking for freshness, and a silent fallback answers a
     /// different question.
-    #[tokio::test]
-    async fn agents_that_cannot_be_asked_say_so() {
+    #[test]
+    fn agents_that_cannot_be_asked_say_so() {
+        let reactor = nagoya::reactor::Reactor::start().expect("reactor");
         for agent in [Agent::Claude, Agent::Copilot] {
             assert!(
                 matches!(
-                    agent.discover_models().await,
+                    nagoya::block_on(agent.discover_models(&reactor.handle())),
                     Err(Error::Unsupported { .. })
                 ),
                 "{agent} should report that it cannot enumerate models"

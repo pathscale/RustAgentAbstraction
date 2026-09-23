@@ -13,9 +13,12 @@ use std::collections::{HashMap, VecDeque};
 use std::process::Stdio;
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, Command};
-use tokio::sync::mpsc;
+use futures::channel::{mpsc, oneshot};
+use futures::future::FutureExt as _;
+use futures::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+use futures::sink::SinkExt as _;
+use futures::stream::StreamExt as _;
+use nagoya::process::{Child, ChildStdin, ChildStdout, Command};
 
 use crate::agent::{Continue, EnvPolicy};
 use crate::error::{Error, Result};
@@ -32,7 +35,7 @@ use crate::request::Request;
 /// discards the remainder of that line. Returns `None` at end of input.
 async fn read_bounded_line<R>(reader: &mut R, buf: &mut String) -> std::io::Result<Option<bool>>
 where
-    R: tokio::io::AsyncBufRead + Unpin,
+    R: futures::io::AsyncBufRead + Unpin,
 {
     buf.clear();
     let mut bytes = Vec::new();
@@ -69,12 +72,44 @@ where
 ///
 /// The decision forwarder holds the child's stdin, so leaving it running past
 /// the run would keep a pipe open to a process that is gone.
-struct AbortOnDrop(tokio::task::JoinHandle<()>);
+struct AbortOnDrop(Option<nagoya::JoinHandle<()>>);
 
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
-        self.0.abort();
+        // nagoya's `cancel` consumes the handle where tokio's `abort` borrowed
+        // it, hence the `Option`. Dropping the handle instead would detach.
+        if let Some(task) = self.0.take() {
+            task.cancel();
+        }
     }
+}
+
+/// A spawned task whose panic comes back as a value rather than a rethrow.
+///
+/// tokio reported a task's panic as a `JoinError` on its handle; nagoya
+/// rethrows it in whoever awaits the handle. Catching inside the task keeps
+/// the old contract: a panicking driver becomes [`Error::Interrupted`] from
+/// [`Run::finish`], and a panicking stderr reader an empty capture, rather than
+/// a panic in the caller. The outer `Option` is nagoya's own: `None` means the
+/// task was cancelled before it produced anything.
+type Caught<T> = nagoya::JoinHandle<std::thread::Result<T>>;
+
+/// Spawn on nagoya's shared pool with the task's panic caught. See [`Caught`].
+fn spawn_caught<F>(future: F) -> Caught<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    nagoya::spawn(std::panic::AssertUnwindSafe(future).catch_unwind())
+}
+
+/// The event channel, holding at most [`EVENT_BUFFER`] events.
+///
+/// A futures bounded channel admits `buffer` messages plus one per sender,
+/// where tokio's admitted exactly `buffer`. The driver is the only sender, so
+/// asking for one fewer keeps the queue depth tokio had.
+fn event_channel() -> (mpsc::Sender<Event>, mpsc::Receiver<Event>) {
+    mpsc::channel(EVENT_BUFFER - 1)
 }
 
 /// How many decisions may queue on the way back to the agent.
@@ -96,7 +131,7 @@ const EVENT_BUFFER: usize = 256;
 enum Control {
     Message {
         body: String,
-        receipt: tokio::sync::oneshot::Sender<Result<()>>,
+        receipt: oneshot::Sender<Result<()>>,
     },
     Approval {
         id: String,
@@ -138,11 +173,11 @@ pub struct Run {
     reaped: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Dropping or firing this asks the driver to tear down in order. Held as
     /// an `Option` so `detach` can discard it without signalling.
-    cancel: Option<tokio::sync::oneshot::Sender<()>>,
+    cancel: Option<oneshot::Sender<()>>,
     /// `None` only after [`Run::finish`], [`Run::cancel`] or [`Run::detach`]
     /// has taken ownership, which is what stops `Drop` from aborting a run that
     /// was already settled deliberately.
-    task: Option<tokio::task::JoinHandle<Result<Outcome>>>,
+    task: Option<Caught<Result<Outcome>>>,
     argv: Vec<String>,
 }
 
@@ -193,15 +228,25 @@ impl RunControl {
         let cancelled = || Error::Cancelled {
             bin: self.bin.clone(),
         };
-        let (receipt, delivered) = tokio::sync::oneshot::channel();
+        let (receipt, delivered) = oneshot::channel();
+        // futures' `send` needs `&mut Sender` where tokio's took `&self`, so
+        // each call sends through its own clone. The future still resolves
+        // only once the queue is back within its bound, which is the
+        // backpressure tokio gave; the difference is that the message is
+        // already queued while it waits, so dropping this future no longer
+        // withdraws it.
         channel
+            .clone()
             .send(Control::Message {
                 body: message.to_string(),
                 receipt,
             })
             .await
             .map_err(|_| cancelled())?;
-        match tokio::time::timeout(timeout, delivered).await {
+        // A dropped receipt sender is `Canceled` here where tokio said
+        // `RecvError`; both mean the run settled first, and both map to
+        // `Error::Cancelled` below.
+        match nagoya::timeout(timeout, delivered).await {
             Ok(receipt) => receipt.map_err(|_| cancelled())?,
             Err(_) => Err(Error::ControlTimeout {
                 bin: self.bin.clone(),
@@ -223,7 +268,9 @@ impl RunControl {
                 what: "answering an approval on a run that did not request them",
             });
         };
+        // A clone per call for the reason given in `send_with_timeout`.
         channel
+            .clone()
             .send(Control::Approval {
                 id: id.to_string(),
                 decision: decision.clone(),
@@ -238,7 +285,7 @@ impl RunControl {
 impl Run {
     /// The next event, or `None` once the agent has finished producing them.
     pub async fn recv(&mut self) -> Option<Event> {
-        self.events.recv().await
+        self.events.next().await
     }
 
     /// Clone the route used for follow-up messages and approval decisions.
@@ -331,26 +378,16 @@ impl Run {
     pub async fn finish(mut self) -> Result<Outcome> {
         // The driver owns teardown from here; `Drop` must not also fire.
         self.pid = None;
-        while self.events.recv().await.is_some() {}
+        while self.events.next().await.is_some() {}
         // Taking the handle disarms the `Drop` guard: this run is settling
         // normally, not being abandoned.
         let Some(task) = self.task.take() else {
             unreachable!("the handle is only taken by a consuming method")
         };
-        match task.await {
-            Ok(result) => result,
-            // The driver task panicked or was cancelled. The process itself
-            // started fine, so this is not a spawn failure and must not claim
-            // to be one.
-            Err(join) => Err(Error::Interrupted {
-                bin: self.argv.first().cloned().unwrap_or_default(),
-                detail: if join.is_panic() {
-                    "the driver task panicked".into()
-                } else {
-                    "the driver task was cancelled".into()
-                },
-            }),
-        }
+        // The driver task panicked or was cancelled. The process itself
+        // started fine, so this is not a spawn failure and must not claim to
+        // be one.
+        joined(task.await, &self.argv)
     }
 
     /// Stop the run and wait until the agent is actually gone.
@@ -376,17 +413,7 @@ impl Run {
         let Some(task) = self.task.take() else {
             unreachable!("the handle is only taken by a consuming method")
         };
-        match task.await {
-            Ok(result) => result,
-            Err(join) => Err(Error::Interrupted {
-                bin: self.argv.first().cloned().unwrap_or_default(),
-                detail: if join.is_panic() {
-                    "the driver task panicked".into()
-                } else {
-                    "the driver task was cancelled".into()
-                },
-            }),
-        }
+        joined(task.await, &self.argv)
     }
 
     /// Let the run continue after this handle goes away.
@@ -403,9 +430,30 @@ impl Run {
         if let Some(cancel) = self.cancel.take() {
             std::mem::forget(cancel);
         }
-        // Dropping the handle without aborting is what detaches a tokio task.
+        // Dropping a nagoya handle without cancelling it detaches the task,
+        // exactly as dropping a tokio handle without aborting it did.
         drop(self.task.take());
     }
+}
+
+/// Read a driver task's result off its [`Caught`] handle.
+///
+/// `None` is nagoya cancelling the task before it finished, and `Some(Err)` a
+/// panic caught inside it: the two cases tokio's `JoinError` distinguished
+/// with `is_panic`, reported with the same wording.
+fn joined(
+    result: Option<std::thread::Result<Result<Outcome>>>,
+    argv: &[String],
+) -> Result<Outcome> {
+    let detail = match result {
+        Some(Ok(outcome)) => return outcome,
+        Some(Err(_panic)) => "the driver task panicked",
+        None => "the driver task was cancelled",
+    };
+    Err(Error::Interrupted {
+        bin: argv.first().cloned().unwrap_or_default(),
+        detail: detail.into(),
+    })
 }
 
 impl Drop for Run {
@@ -425,7 +473,7 @@ impl Drop for Run {
         }
         drop(self.cancel.take());
         if let Some(task) = self.task.take() {
-            task.abort();
+            task.cancel();
         }
     }
 }
@@ -458,14 +506,16 @@ fn redact(argv: &[crate::agent::Arg]) -> Vec<String> {
 /// [`Error::Unsupported`] for a request that asked for approvals: this entry
 /// point discards events, so an approval request would reach nobody and the run
 /// would sit blocked until its timeout. Use [`stream`] instead.
-pub async fn run(request: &Request) -> Result<Outcome> {
+///
+/// `reactor` drives the child's pipes and exit; see [`stream`].
+pub async fn run(request: &Request, reactor: &nagoya::reactor::Handle) -> Result<Outcome> {
     if request.plan().approvals {
         return Err(Error::Unsupported {
             agent: request.agent,
             what: "approvals on a run whose events are discarded; use `stream`",
         });
     }
-    stream(request)?.finish().await
+    stream(request, reactor)?.finish().await
 }
 
 /// Interrupt an orphaned active Codex turn without starting a replacement.
@@ -478,7 +528,7 @@ pub async fn run(request: &Request) -> Result<Outcome> {
 /// # Errors
 /// Returns [`Error::Unsupported`] for another provider or a request that does
 /// not resume a session, and the ordinary spawn/protocol errors otherwise.
-pub async fn interrupt(request: &Request) -> Result<bool> {
+pub async fn interrupt(request: &Request, reactor: &nagoya::reactor::Handle) -> Result<bool> {
     if !matches!(request.agent, crate::Agent::Codex | crate::Agent::Grok) {
         return Err(Error::Unsupported {
             agent: request.agent,
@@ -494,13 +544,19 @@ pub async fn interrupt(request: &Request) -> Result<bool> {
     let mut request = request.clone();
     request.duplex = true;
     request.operation = crate::request::Operation::Interrupt;
-    let outcome = run(&request).await?;
+    let outcome = run(&request, reactor).await?;
     Ok(matches!(outcome.stop, Stop::Other(ref reason) if reason == "interrupted"))
 }
 
 /// Start `request`, returning a handle that streams its events.
 ///
 /// Returns as soon as the child is spawned; the work proceeds on a task.
+///
+/// `reactor` is the I/O driver the child's pipes and exit are registered
+/// with. The caller owns it and must keep the [`nagoya::reactor::Reactor`]
+/// behind it alive until the returned [`Run`] has settled: a dropped reactor
+/// stops the thread that wakes these reads, and the run would stall. This
+/// crate never starts one of its own.
 ///
 /// # Errors
 /// [`Error::NotInstalled`] if the binary is missing, [`Error::Unsupported`] if
@@ -509,11 +565,11 @@ pub async fn interrupt(request: &Request) -> Result<bool> {
     clippy::too_many_lines,
     reason = "one spawn boundary keeps command posture, pipes, process group, and driver selection together"
 )]
-pub fn stream(request: &Request) -> Result<Run> {
-    // `tokio::spawn` panics outside a runtime. A fallible signature must not
-    // hide that, so the context is checked and reported as an ordinary error.
-    let runtime = tokio::runtime::Handle::try_current().map_err(|_| Error::NoRuntime)?;
-
+pub fn stream(request: &Request, reactor: &nagoya::reactor::Handle) -> Result<Run> {
+    // No runtime context to check: the driver goes to nagoya's shared pool,
+    // which starts on first use, and I/O goes through the caller's `reactor`,
+    // so this cannot fail the way `tokio::spawn` outside a runtime did, and
+    // `Error::NoRuntime` is no longer returned.
     let mut request = request.clone();
     let session_lease = if let Some(binding) = &request.binding {
         let lease = binding.store.lease(&binding.project, &binding.name)?;
@@ -610,8 +666,8 @@ pub fn stream(request: &Request) -> Result<Run> {
     // together. Killing only the CLI leaves the commands *it* spawned running:
     // a build, a test run, a server, still holding files and credentials after
     // the run is supposedly over.
-    // 0 means "make this child its own group leader". `tokio::process::Command`
-    // exposes this directly on unix.
+    // 0 means "make this child its own group leader". `nagoya::process::Command`
+    // exposes this directly on unix, as tokio's did.
     #[cfg(unix)]
     command.process_group(0);
 
@@ -622,7 +678,7 @@ pub fn stream(request: &Request) -> Result<Run> {
         persist_session(request, &token)?;
     }
 
-    let child = command.spawn().map_err(|source| {
+    let child = command.spawn(reactor).map_err(|source| {
         // A missing binary is the common case and deserves an actionable error
         // with an install hint. Reading it off the spawn avoids resolving PATH
         // twice, and with it the window where the resolved path is replaced
@@ -643,20 +699,24 @@ pub fn stream(request: &Request) -> Result<Run> {
 
     let request_agent = request.agent;
     let pid = child.id();
-    let (tx, rx) = mpsc::channel(EVENT_BUFFER);
+    let (tx, rx) = event_channel();
     // Only created for an approvals run, so `respond` can tell "no channel" from
     // "channel closed" and refuse the first rather than hanging on it.
     let (decisions_tx, decisions_rx) = if grok_acp || plan.duplex || plan.approvals {
-        let (tx, rx) = mpsc::channel::<Control>(APPROVAL_BUFFER);
+        // Less one for the sender `RunControl` holds, as in `event_channel`.
+        // Each send goes through a fresh clone (see `send_with_timeout`), and
+        // each clone adds one slot, so concurrent senders can together queue
+        // past this, one message each, before any of them resolves.
+        let (tx, rx) = mpsc::channel::<Control>(APPROVAL_BUFFER - 1);
         (Some(tx), Some(rx))
     } else {
         (None, None)
     };
-    let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+    let (cancel_tx, cancel_rx) = oneshot::channel();
     let reaped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let reaped_for_task = std::sync::Arc::clone(&reaped);
     let request = request.clone();
-    let task = runtime.spawn(async move {
+    let task = spawn_caught(async move {
         // Held across the whole read-run-commit cycle. It deliberately lives in
         // the driver task rather than `Run`, so `detach` keeps the session
         // reserved until the background agent actually exits.
@@ -769,8 +829,8 @@ impl Drop for ChildGuard {
 async fn drive(
     child: Child,
     request: Request,
-    events: mpsc::Sender<Event>,
-    cancel: tokio::sync::oneshot::Receiver<()>,
+    mut events: mpsc::Sender<Event>,
+    cancel: oneshot::Receiver<()>,
     reaped: std::sync::Arc<std::sync::atomic::AtomicBool>,
     decisions: Option<mpsc::Receiver<Control>>,
 ) -> Result<Outcome> {
@@ -809,20 +869,27 @@ async fn drive(
         // Forwarding runs on its own task so a decision can be written while
         // stdout is being read. It ends on whichever comes first: the channel
         // closing, or the turn settling.
-        let (close_tx, mut close_rx) = tokio::sync::oneshot::channel::<()>();
+        let (close_tx, close_rx) = oneshot::channel::<()>();
+        // Fused so a dropped sender still wins its arm. A bare futures
+        // `oneshot::Receiver` reports itself terminated once its sender is
+        // gone, and `select!` skips a terminated arm, where tokio's
+        // `&mut close_rx` resolved with an error and broke the loop.
+        let mut close_rx = close_rx.fuse();
         close_stdin = Some(close_tx);
         let decision_bin = bin.clone();
         decision_task = decisions.map(|mut rx| {
-            tokio::spawn(async move {
+            nagoya::spawn(async move {
                 loop {
-                    tokio::select! {
-                        biased;
+                    // `select_biased!` is tokio's `biased;`: arms are polled
+                    // in the order written. Plain `futures::select!` would
+                    // shuffle them and lose the priority below.
+                    futures::select_biased! {
                         // Once the terminal record has arrived there is no
                         // turn left to receive another message. Prioritizing
                         // closure makes a simultaneous late send fail instead
                         // of being reported as delivered to a finished turn.
-                        _ = &mut close_rx => break,
-                        reply = rx.recv() => {
+                        _ = close_rx => break,
+                        reply = rx.next() => {
                             let Some(control) = reply else { break };
                             match control {
                                 Control::Message { body, receipt } => {
@@ -877,10 +944,10 @@ async fn drive(
     // while stdout still has room.
     // Aborted on every exit path from here, so a forwarder never survives the
     // run it belongs to.
-    let _decision_guard = decision_task.map(AbortOnDrop);
+    let _decision_guard = decision_task.map(|task| AbortOnDrop(Some(task)));
 
     let stderr = child.child.stderr.take();
-    let stderr_task = tokio::spawn(async move {
+    let stderr_task = spawn_caught(async move {
         let mut buf = String::new();
         if let Some(handle) = stderr {
             let mut reader = BufReader::new(handle);
@@ -954,17 +1021,20 @@ async fn drive(
     // rather than duplicating the whole select.
     let deadline = async {
         match request.timeout {
-            Some(limit) => tokio::time::sleep(limit).await,
+            Some(limit) => nagoya::sleep(limit).await,
             None => std::future::pending().await,
         }
     };
 
-    let status = tokio::select! {
+    // `select_biased!` is tokio's `biased;`. The three futures are passed as
+    // expressions, not by name, so the macro owns and drops them before an
+    // arm's body runs, as tokio's `select!` did; that is what lets the bodies
+    // below borrow `child` and `parser` again.
+    let status = futures::select_biased! {
         // Biased so a finished run is reported as finished even if a deadline
         // or cancellation lands in the same tick.
-        biased;
-        result = work => result,
-        () = deadline => {
+        result = work.fuse() => result,
+        () = deadline.fuse() => {
             // Order matters: signal the group *before* reaping. Reaping clears
             // the child's pid, and the group kill needs that pid to target the
             // group, so the other order silently leaves grandchildren running.
@@ -977,7 +1047,10 @@ async fn drive(
             })
             .inspect_err(|_| drop(partial));
         }
-        _ = cancel => {
+        // Fused because a bare futures `oneshot::Receiver` counts as terminated
+        // once its sender is dropped, and dropping the sender is exactly how
+        // `Run::cancel` and `Run::drop` signal; `select!` would skip the arm.
+        _ = cancel.fuse() => {
             // Cooperative teardown: the caller is waiting on this, so the tree
             // is signalled, reaped and joined before returning.
             shut_down(&mut child, stderr_task).await;
@@ -996,7 +1069,10 @@ async fn drive(
     reaped.store(true, std::sync::atomic::Ordering::SeqCst);
 
     drop(events);
-    let stderr = stderr_task.await.unwrap_or_default();
+    let stderr: String = stderr_task
+        .await
+        .and_then(std::thread::Result::ok)
+        .unwrap_or_default();
     let saw_structured = parser.saw_structured_record();
     let saw_terminal = parser.saw_terminal_record();
     let terminal = parser.finish();
@@ -1133,8 +1209,8 @@ async fn drive(
 async fn drive_grok_acp(
     child: Child,
     request: Request,
-    events: mpsc::Sender<Event>,
-    cancel: tokio::sync::oneshot::Receiver<()>,
+    mut events: mpsc::Sender<Event>,
+    cancel: oneshot::Receiver<()>,
     reaped: std::sync::Arc<std::sync::atomic::AtomicBool>,
     controls: Option<mpsc::Receiver<Control>>,
 ) -> Result<Outcome> {
@@ -1161,7 +1237,7 @@ async fn drive_grok_acp(
     };
 
     let stderr = child.child.stderr.take();
-    let stderr_task = tokio::spawn(async move {
+    let stderr_task = spawn_caught(async move {
         let mut buf = String::new();
         if let Some(handle) = stderr {
             let mut reader = BufReader::new(handle);
@@ -1197,20 +1273,28 @@ async fn drive_grok_acp(
     let mut persist_result: Result<()> = Ok(());
     let deadline = async {
         match request.timeout {
-            Some(limit) => tokio::time::sleep(limit).await,
+            Some(limit) => nagoya::sleep(limit).await,
             None => std::future::pending().await,
         }
-    };
-    tokio::pin!(deadline);
-    tokio::pin!(cancel);
+    }
+    .fuse();
+    futures::pin_mut!(deadline);
+    // Fused so a dropped sender still wins its arm; see `drive`.
+    let mut cancel = cancel.fuse();
 
     while !protocol.finished {
-        tokio::select! {
-            biased;
-            control = controls.recv() => {
-                let Some(control) = control else {
-                    continue;
-                };
+        // `select_biased!` is tokio's `biased;`; see `drive`. `deadline` and
+        // `cancel` are named, so they persist across iterations as the pinned
+        // futures did; the read is an expression, rebuilt each pass and dropped
+        // before an arm's body runs, as under tokio.
+        futures::select_biased! {
+            // `select_next_some` rather than `next`: once every sender is gone
+            // the arm is skipped instead of yielding `None` on every pass.
+            // tokio's arm did yield `None`, and the `continue` it took then
+            // spun this loop until tokio's cooperative budget forced a yield;
+            // futures has no such budget, so a biased arm that is always ready
+            // would starve the reader outright.
+            control = controls.select_next_some() => {
                 pending.push_back(control);
                 flush_grok_controls(
                     &mut protocol,
@@ -1223,7 +1307,7 @@ async fn drive_grok_acp(
                     bin: bin.clone(), source
                 })?;
             }
-            record = read_bounded_line(&mut reader, &mut line) => {
+            record = read_bounded_line(&mut reader, &mut line).fuse() => {
                 if record.map_err(|source| Error::Spawn { bin: bin.clone(), source })?.is_some() {
                     append_capped(&mut raw, &line);
                     if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
@@ -1266,7 +1350,7 @@ async fn drive_grok_acp(
                     protocol.finished = true;
                 }
             }
-            () = &mut deadline => {
+            () = deadline => {
                 let partial = protocol.terminal.text.clone();
                 interrupt_grok_turn(&mut protocol, &mut stdin, &mut reader, &mut line, &mut raw)
                     .await;
@@ -1278,7 +1362,7 @@ async fn drive_grok_acp(
                     partial,
                 });
             }
-            _ = &mut cancel => {
+            _ = cancel => {
                 interrupt_grok_turn(&mut protocol, &mut stdin, &mut reader, &mut line, &mut raw)
                     .await;
                 shut_down(&mut child, stderr_task).await;
@@ -1289,7 +1373,7 @@ async fn drive_grok_acp(
     }
 
     drop(stdin);
-    if tokio::time::timeout(std::time::Duration::from_secs(2), child.child.wait())
+    if nagoya::timeout(std::time::Duration::from_secs(2), child.child.wait())
         .await
         .is_err()
     {
@@ -1299,7 +1383,10 @@ async fn drive_grok_acp(
     child.armed = false;
     reaped.store(true, std::sync::atomic::Ordering::SeqCst);
     drop(events);
-    let stderr = stderr_task.await.unwrap_or_default();
+    let stderr: String = stderr_task
+        .await
+        .and_then(std::thread::Result::ok)
+        .unwrap_or_default();
 
     persist_result?;
     if let Some(detail) = protocol.failure {
@@ -1343,8 +1430,8 @@ async fn drive_grok_acp(
 
 async fn interrupt_grok_turn(
     protocol: &mut crate::grok_acp::Protocol,
-    stdin: &mut tokio::process::ChildStdin,
-    reader: &mut BufReader<tokio::process::ChildStdout>,
+    stdin: &mut ChildStdin,
+    reader: &mut BufReader<ChildStdout>,
     line: &mut String,
     raw: &mut String,
 ) {
@@ -1365,14 +1452,14 @@ async fn interrupt_grok_turn(
             }
         }
     };
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), settle).await;
+    let _ = nagoya::timeout(std::time::Duration::from_secs(2), settle).await;
 }
 
 async fn flush_grok_controls(
     protocol: &mut crate::grok_acp::Protocol,
     pending: &mut VecDeque<Control>,
-    steer_receipts: &mut HashMap<u64, tokio::sync::oneshot::Sender<Result<()>>>,
-    stdin: &mut tokio::process::ChildStdin,
+    steer_receipts: &mut HashMap<u64, oneshot::Sender<Result<()>>>,
+    stdin: &mut ChildStdin,
     bin: &str,
 ) -> Result<()> {
     let mut waiting = VecDeque::new();
@@ -1411,7 +1498,7 @@ async fn flush_grok_controls(
 }
 
 fn settle_grok_steers(
-    receipts: &mut HashMap<u64, tokio::sync::oneshot::Sender<Result<()>>>,
+    receipts: &mut HashMap<u64, oneshot::Sender<Result<()>>>,
     responses: Vec<crate::grok_acp::SteerResponse>,
     bin: &str,
 ) {
@@ -1444,8 +1531,8 @@ fn settle_grok_steers(
 async fn drive_codex_app_server(
     child: Child,
     request: Request,
-    events: mpsc::Sender<Event>,
-    cancel: tokio::sync::oneshot::Receiver<()>,
+    mut events: mpsc::Sender<Event>,
+    cancel: oneshot::Receiver<()>,
     reaped: std::sync::Arc<std::sync::atomic::AtomicBool>,
     controls: Option<mpsc::Receiver<Control>>,
 ) -> Result<Outcome> {
@@ -1472,7 +1559,7 @@ async fn drive_codex_app_server(
     };
 
     let stderr = child.child.stderr.take();
-    let stderr_task = tokio::spawn(async move {
+    let stderr_task = spawn_caught(async move {
         let mut buf = String::new();
         if let Some(handle) = stderr {
             let mut reader = BufReader::new(handle);
@@ -1508,24 +1595,27 @@ async fn drive_codex_app_server(
     let mut persist_result: Result<()> = Ok(());
     let deadline = async {
         match request.timeout {
-            Some(limit) => tokio::time::sleep(limit).await,
+            Some(limit) => nagoya::sleep(limit).await,
             None => std::future::pending().await,
         }
-    };
-    tokio::pin!(deadline);
-    tokio::pin!(cancel);
+    }
+    .fuse();
+    futures::pin_mut!(deadline);
+    // Fused so a dropped sender still wins its arm; see `drive`.
+    let mut cancel = cancel.fuse();
 
     while !protocol.finished {
-        tokio::select! {
-            biased;
+        // `select_biased!` is tokio's `biased;`; see `drive_grok_acp` for why
+        // the arms are shaped the way they are.
+        futures::select_biased! {
             // User steering and approval answers outrank the agent's output.
             // app-server can keep stdout continuously ready with reasoning and
             // text deltas; reading it first in a biased select could starve a
             // correction precisely while Codex was busiest.
-            control = controls.recv() => {
-                let Some(control) = control else {
-                    continue;
-                };
+            //
+            // `select_next_some` skips a closed channel rather than spinning on
+            // its `None`, as `drive_grok_acp` explains.
+            control = controls.select_next_some() => {
                 pending.push_back(control);
                 flush_codex_controls(
                     &mut protocol,
@@ -1538,7 +1628,7 @@ async fn drive_codex_app_server(
                     bin: bin.clone(), source
                 })?;
             }
-            record = read_bounded_line(&mut reader, &mut line) => {
+            record = read_bounded_line(&mut reader, &mut line).fuse() => {
                 if record.map_err(|source| Error::Spawn { bin: bin.clone(), source })?.is_some() {
                     append_capped(&mut raw, &line);
                     if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
@@ -1581,7 +1671,7 @@ async fn drive_codex_app_server(
                     protocol.finished = true;
                 }
             }
-            () = &mut deadline => {
+            () = deadline => {
                 let partial = protocol.terminal.text.clone();
                 interrupt_codex_turn(&mut protocol, &mut stdin, &mut reader, &mut line, &mut raw)
                     .await;
@@ -1593,7 +1683,7 @@ async fn drive_codex_app_server(
                     partial,
                 });
             }
-            _ = &mut cancel => {
+            _ = cancel => {
                 interrupt_codex_turn(&mut protocol, &mut stdin, &mut reader, &mut line, &mut raw)
                     .await;
                 shut_down(&mut child, stderr_task).await;
@@ -1607,7 +1697,7 @@ async fn drive_codex_app_server(
     // stop cleanly; the short fallback prevents a completed turn from hanging
     // because a future CLI release keeps serving after its input closes.
     drop(stdin);
-    if tokio::time::timeout(std::time::Duration::from_secs(2), child.child.wait())
+    if nagoya::timeout(std::time::Duration::from_secs(2), child.child.wait())
         .await
         .is_err()
     {
@@ -1617,7 +1707,10 @@ async fn drive_codex_app_server(
     child.armed = false;
     reaped.store(true, std::sync::atomic::Ordering::SeqCst);
     drop(events);
-    let stderr = stderr_task.await.unwrap_or_default();
+    let stderr: String = stderr_task
+        .await
+        .and_then(std::thread::Result::ok)
+        .unwrap_or_default();
 
     persist_result?;
     if let Some(detail) = protocol.failure {
@@ -1666,8 +1759,8 @@ async fn drive_codex_app_server(
 /// `turn/interrupt` it needs to make this thread resumable again.
 async fn interrupt_codex_turn(
     protocol: &mut crate::codex_app_server::Protocol,
-    stdin: &mut tokio::process::ChildStdin,
-    reader: &mut BufReader<tokio::process::ChildStdout>,
+    stdin: &mut ChildStdin,
+    reader: &mut BufReader<ChildStdout>,
     line: &mut String,
     raw: &mut String,
 ) {
@@ -1696,7 +1789,7 @@ async fn interrupt_codex_turn(
             }
         }
     };
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), settle).await;
+    let _ = nagoya::timeout(std::time::Duration::from_secs(2), settle).await;
 }
 
 /// Write every control whose protocol ids are available, preserving earlier
@@ -1704,8 +1797,8 @@ async fn interrupt_codex_turn(
 async fn flush_codex_controls(
     protocol: &mut crate::codex_app_server::Protocol,
     pending: &mut VecDeque<Control>,
-    steer_receipts: &mut HashMap<u64, tokio::sync::oneshot::Sender<Result<()>>>,
-    stdin: &mut tokio::process::ChildStdin,
+    steer_receipts: &mut HashMap<u64, oneshot::Sender<Result<()>>>,
+    stdin: &mut ChildStdin,
     bin: &str,
 ) -> Result<()> {
     let mut waiting = VecDeque::new();
@@ -1748,7 +1841,7 @@ async fn flush_codex_controls(
 /// turn completes is deliberate: the caller receives `Error::Cancelled` and
 /// can put the message into a fresh resumed turn.
 fn settle_codex_steers(
-    receipts: &mut HashMap<u64, tokio::sync::oneshot::Sender<Result<()>>>,
+    receipts: &mut HashMap<u64, oneshot::Sender<Result<()>>>,
     responses: Vec<crate::codex_app_server::SteerResponse>,
     bin: &str,
 ) {
@@ -1773,14 +1866,17 @@ fn settle_codex_steers(
 ///
 /// The orderly teardown both cancellation and timeout share. Returns whatever
 /// stderr had been captured, so a caller can still report why a run was stopped.
-async fn shut_down(child: &mut ChildGuard, stderr_task: tokio::task::JoinHandle<String>) -> String {
+async fn shut_down(child: &mut ChildGuard, stderr_task: Caught<String>) -> String {
     kill_process_group(&child.child);
     // Reap, so the caller is not left with a zombie once this returns.
     let _ = child.child.kill().await;
     child.armed = false;
     // The pipes are closed now that the child is gone, so this finishes
     // promptly rather than hanging the cancellation.
-    stderr_task.await.unwrap_or_default()
+    stderr_task
+        .await
+        .and_then(std::thread::Result::ok)
+        .unwrap_or_default()
 }
 
 /// Turn a failure into the most specific error available, agent included so an
@@ -2757,18 +2853,33 @@ mod tests {
         assert!(safe.contains(&"resume".to_string()));
     }
 
-    /// `stream` is synchronous but spawns a task. Outside a runtime that would
-    /// panic, which a `Result`-returning function must not do.
+    /// `stream` is synchronous but spawns a task. Under tokio that needed an
+    /// ambient runtime and reported `Error::NoRuntime` without one. nagoya's
+    /// shared pool needs no context and the reactor is passed in, so outside
+    /// any executor the call gets as far as the spawn and reports what is
+    /// actually wrong.
     #[test]
-    fn stream_outside_a_runtime_errors_instead_of_panicking() {
-        let err = stream(&crate::Request::new(Agent::Claude, "hi")).unwrap_err();
-        assert!(matches!(err, Error::NoRuntime), "got {err:?}");
+    fn stream_needs_no_ambient_runtime() {
+        let reactor = nagoya::reactor::Reactor::start().expect("reactor");
+        let request = Request::new(Agent::Claude, "hi").bin("definitely-not-a-real-binary-xyz");
+        let err = stream(&request, &reactor.handle()).unwrap_err();
+        assert!(matches!(err, Error::NotInstalled { .. }), "got {err:?}");
     }
 
-    #[tokio::test]
-    async fn a_missing_binary_names_the_install_command() {
+    /// The handles a host moves between tasks and threads must stay `Send` and
+    /// `Sync` whatever the channel and task types underneath them are.
+    #[test]
+    fn run_handles_are_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Run>();
+        assert_send_sync::<RunControl>();
+    }
+
+    #[test]
+    fn a_missing_binary_names_the_install_command() {
+        let reactor = nagoya::reactor::Reactor::start().expect("reactor");
         let request = Request::new(Agent::Claude, "hi").bin("definitely-not-a-real-binary-xyz");
-        let err = run(&request).await.unwrap_err();
+        let err = nagoya::block_on(run(&request, &reactor.handle())).unwrap_err();
         let Error::NotInstalled { hint, agent, .. } = err else {
             panic!("expected NotInstalled, got {err:?}")
         };
@@ -2780,96 +2891,102 @@ mod tests {
     /// behind more events than fit in the bounded channel. Input must wait on a
     /// handle independent from the mutable event receiver, or the producer and
     /// consumer block each other permanently.
-    #[tokio::test]
-    async fn a_control_receipt_can_wait_behind_a_full_event_buffer() {
-        let (events_tx, events_rx) = mpsc::channel(EVENT_BUFFER);
-        let (controls_tx, mut controls_rx) = mpsc::channel(1);
-        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
-        let task = tokio::spawn(async move {
-            let _cancel_rx = cancel_rx;
-            let Some(Control::Message { receipt, .. }) = controls_rx.recv().await else {
-                panic!("follow-up message")
+    #[test]
+    fn a_control_receipt_can_wait_behind_a_full_event_buffer() {
+        nagoya::block_on(async {
+            // The production channel, so "full" means the depth a real run has:
+            // one more event than it holds is sent below.
+            let (mut events_tx, events_rx) = event_channel();
+            let (controls_tx, mut controls_rx) = mpsc::channel(1);
+            let (cancel_tx, cancel_rx) = oneshot::channel();
+            let task = spawn_caught(async move {
+                let _cancel_rx = cancel_rx;
+                let Some(Control::Message { receipt, .. }) = controls_rx.next().await else {
+                    panic!("follow-up message")
+                };
+                for index in 0..=EVENT_BUFFER {
+                    events_tx
+                        .send(Event::Thinking(index.to_string()))
+                        .await
+                        .expect("the host keeps draining events");
+                }
+                let _ = receipt.send(Ok(()));
+                Ok(Outcome {
+                    agent: Agent::Codex,
+                    session: None,
+                    text: String::new(),
+                    usage: crate::Usage::default(),
+                    stop: Stop::Completed,
+                    rate_limit: None,
+                    exit_code: 0,
+                    stderr: String::new(),
+                    unparsed: 0,
+                    first_unparsed: None,
+                    structured: None,
+                })
+            });
+            let reaped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let mut run = Run {
+                events: events_rx,
+                control: RunControl {
+                    agent: Agent::Codex,
+                    to_agent: Some(controls_tx),
+                    bin: "codex".into(),
+                },
+                typed: Vec::new(),
+                pid: None,
+                reaped,
+                cancel: Some(cancel_tx),
+                task: Some(task),
+                argv: vec!["codex".into()],
             };
-            for index in 0..=EVENT_BUFFER {
-                events_tx
-                    .send(Event::Thinking(index.to_string()))
-                    .await
-                    .expect("the host keeps draining events");
+
+            let control = run.control();
+            let delivery = nagoya::spawn(async move { control.send("change course").await });
+            let mut seen = 0;
+            while run.recv().await.is_some() {
+                seen += 1;
             }
-            let _ = receipt.send(Ok(()));
-            Ok(Outcome {
-                agent: Agent::Codex,
-                session: None,
-                text: String::new(),
-                usage: crate::Usage::default(),
-                stop: Stop::Completed,
-                rate_limit: None,
-                exit_code: 0,
-                stderr: String::new(),
-                unparsed: 0,
-                first_unparsed: None,
-                structured: None,
-            })
+
+            assert_eq!(seen, EVENT_BUFFER + 1);
+            delivery
+                .await
+                .expect("delivery task")
+                .expect("transport receipt");
+            run.finish().await.expect("run outcome");
         });
-        let reaped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let mut run = Run {
-            events: events_rx,
-            control: RunControl {
-                agent: Agent::Codex,
-                to_agent: Some(controls_tx),
-                bin: "codex".into(),
-            },
-            typed: Vec::new(),
-            pid: None,
-            reaped,
-            cancel: Some(cancel_tx),
-            task: Some(task),
-            argv: vec!["codex".into()],
-        };
-
-        let control = run.control();
-        let delivery = tokio::spawn(async move { control.send("change course").await });
-        let mut seen = 0;
-        while run.recv().await.is_some() {
-            seen += 1;
-        }
-
-        assert_eq!(seen, EVENT_BUFFER + 1);
-        delivery
-            .await
-            .expect("delivery task")
-            .expect("transport receipt");
-        run.finish().await.expect("run outcome");
     }
 
     /// A live app-server can keep its pipes open after it stops processing
     /// requests. Input delivery needs a deadline so the host can reap that run
     /// and retry the visible message on the resumed session.
-    #[tokio::test]
-    async fn a_control_receipt_that_never_arrives_times_out() {
-        let (controls_tx, mut controls_rx) = mpsc::channel(1);
-        let control = RunControl {
-            agent: Agent::Codex,
-            to_agent: Some(controls_tx),
-            bin: "codex".into(),
-        };
-        let receiver = tokio::spawn(async move {
-            let Some(Control::Message { receipt, .. }) = controls_rx.recv().await else {
-                panic!("follow-up message")
+    #[test]
+    fn a_control_receipt_that_never_arrives_times_out() {
+        nagoya::block_on(async {
+            let (controls_tx, mut controls_rx) = mpsc::channel(1);
+            let control = RunControl {
+                agent: Agent::Codex,
+                to_agent: Some(controls_tx),
+                bin: "codex".into(),
             };
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            drop(receipt);
-        });
+            let receiver = nagoya::spawn(async move {
+                let Some(Control::Message { receipt, .. }) = controls_rx.next().await else {
+                    panic!("follow-up message")
+                };
+                nagoya::sleep(Duration::from_secs(1)).await;
+                drop(receipt);
+            });
 
-        let err = control
-            .send_with_timeout("are you there?", Duration::from_millis(10))
-            .await
-            .expect_err("the missing receipt must not wait forever");
-        assert!(
-            matches!(err, Error::ControlTimeout { .. }),
-            "expected ControlTimeout, got {err:?}"
-        );
-        receiver.abort();
+            let err = control
+                .send_with_timeout("are you there?", Duration::from_millis(10))
+                .await
+                .expect_err("the missing receipt must not wait forever");
+            assert!(
+                matches!(err, Error::ControlTimeout { .. }),
+                "expected ControlTimeout, got {err:?}"
+            );
+            receiver.cancel();
+        });
     }
 
     #[test]

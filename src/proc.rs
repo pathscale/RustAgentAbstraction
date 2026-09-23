@@ -36,7 +36,7 @@
 /// failure. Call this **before** reaping the child, because reaping clears the
 /// pid this needs to address the group.
 #[cfg(unix)]
-pub(crate) fn kill_process_group(child: &tokio::process::Child) {
+pub(crate) fn kill_process_group(child: &nagoya::process::Child) {
     let Some(pid) = child.id() else {
         // Already reaped, so there is no pid left to address. Signalling now
         // would risk hitting a pid the OS has since recycled.
@@ -46,7 +46,7 @@ pub(crate) fn kill_process_group(child: &tokio::process::Child) {
 }
 
 /// Signal a group by its leader pid, for a caller holding the pid rather than
-/// the [`tokio::process::Child`].
+/// the [`nagoya::process::Child`].
 ///
 /// [`crate::Run`]'s `Drop` needs this. `Drop` cannot await, so its only other
 /// option is to abort the driver task and rely on the runtime polling that task
@@ -80,7 +80,7 @@ pub(crate) fn kill_group_by_pid(pid: u32) {
 
 /// No-op: see the module docs. Only the direct child is killed on Windows.
 #[cfg(not(unix))]
-pub(crate) fn kill_process_group(_child: &tokio::process::Child) {}
+pub(crate) fn kill_process_group(_child: &nagoya::process::Child) {}
 
 /// No-op counterpart for non-unix.
 #[cfg(not(unix))]

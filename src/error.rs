@@ -243,11 +243,13 @@ pub enum Error {
         limit: usize,
     },
 
-    /// [`crate::stream`] was called outside a Tokio runtime.
+    /// No longer returned. Kept so existing matches on it still compile.
     ///
-    /// Spawning the driver task needs a runtime context. Reporting this rather
-    /// than letting `tokio::spawn` panic keeps the fallible signature honest.
-    #[error("no Tokio runtime is running; call this from within one")]
+    /// [`crate::stream`] used to need an ambient Tokio runtime to spawn its
+    /// driver task, and reported its absence here. The driver now runs on
+    /// nagoya's shared pool, which exists without being entered, so there is no
+    /// missing context left to report.
+    #[error("no async runtime is running; call this from within one")]
     NoRuntime,
 
     /// The task driving the run panicked or was cancelled, so there is no

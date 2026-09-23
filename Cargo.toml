@@ -1,6 +1,6 @@
 [package]
 name = "agent-abstraction"
-version = "0.4.21"
+version = "0.5.0"
 edition = "2024"
 # The floor edition 2024 requires, and where the strictest dependencies (uuid,
 # getrandom) sit. Derived from the dependency graph rather than compile-tested.
@@ -32,10 +32,15 @@ name = "agent_abstraction"
 path = "src/lib.rs"
 
 [dependencies]
-# `process` gives an async child with piped stdio; `io-util` the line reader that
-# turns a JSONL stream into events; `time` the run timeout; `sync` the event
-# channel. No `full`: the consumer picks its own runtime features.
-tokio = { version = "1", features = ["process", "io-util", "sync", "time", "rt", "macros"] }
+# The runtime: `spawn` for the driver task, `sleep` and `timeout` for the run
+# deadline, and `process` for an async child with piped stdio. `process` needs
+# the reactor, which is why both are named. The returned futures and pipes work
+# under any executor, so a consumer on another runtime can still await a `Run`.
+nagoya = { version = "^0.1", features = ["reactor", "process"] }
+# What nagoya deliberately does not carry: the oneshot and mpsc channels, the
+# `select_biased!` that stands in for tokio's biased `select!`, and the
+# `AsyncRead`/`AsyncBufRead` extension traits the line reader is built on.
+futures = "^0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
@@ -53,7 +58,6 @@ uuid = { version = "1", features = ["v4", "serde"] }
 libc = "0.2"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 # The live tests mint UUIDs to prove a caller-assigned session id round-trips.
 uuid = { version = "1", features = ["v4"] }
 
