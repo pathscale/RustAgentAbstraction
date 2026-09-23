@@ -356,10 +356,20 @@ impl Protocol {
                     .map(str::to_string);
                 self.finished = true;
             }
+            // Verified against the codex-cli 0.154.0 app-server schema:
+            // `ErrorNotification { error: TurnError { message, .. }, threadId,
+            // turnId, willRetry }`. The message is under `error`, so reading
+            // `params.message` always came back empty. A notification codex
+            // says it will retry is not the end of the turn: marking it an
+            // error failed runs that went on to succeed.
             "error" => {
+                if params.get("willRetry").and_then(Value::as_bool) == Some(true) {
+                    return step;
+                }
                 self.terminal.stop = Stop::Error;
                 self.terminal.error_message = params
-                    .get("message")
+                    .pointer("/error/message")
+                    .or_else(|| params.get("message"))
                     .and_then(Value::as_str)
                     .map(str::to_string);
             }
@@ -809,6 +819,43 @@ mod tests {
             "result": {"turn": {"id": "turn-9"}},
         }));
         protocol
+    }
+
+    /// codex-cli 0.154.0 sends `{ error: { message }, willRetry }`. A retried
+    /// error is not the end of the turn; a final one carries its message.
+    #[test]
+    fn an_error_notification_reads_its_nested_message_and_skips_retries() {
+        let mut protocol = running_protocol();
+        protocol.push(&json!({
+            "method": "error",
+            "params": {
+                "error": {"message": "overloaded"},
+                "threadId": "thread-7",
+                "turnId": "turn-9",
+                "willRetry": true
+            }
+        }));
+        assert_ne!(
+            protocol.terminal.stop,
+            Stop::Error,
+            "a retry is not a failure"
+        );
+        assert_eq!(protocol.terminal.error_message, None);
+
+        protocol.push(&json!({
+            "method": "error",
+            "params": {
+                "error": {"message": "quota exhausted"},
+                "threadId": "thread-7",
+                "turnId": "turn-9",
+                "willRetry": false
+            }
+        }));
+        assert_eq!(protocol.terminal.stop, Stop::Error);
+        assert_eq!(
+            protocol.terminal.error_message.as_deref(),
+            Some("quota exhausted")
+        );
     }
 
     #[test]
