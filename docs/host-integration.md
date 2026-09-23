@@ -14,7 +14,7 @@ A user who types a correction mid-turn must not have to wait for the turn to end
 
 ```rust
 let request = Request::new(Agent::Claude, prompt).interactive();
-let mut run = stream(&request)?;
+let mut run = stream(&request, &reactor.handle())?;
 
 // Later, from the UI, the moment the user hits enter:
 run.send("actually, skip the tests and just fix the parser").await?;
@@ -70,7 +70,7 @@ let request = Request::new(Agent::Claude, prompt)
     .permission(Permission::Edit)   // not ReadOnly, see below
     .approvals();
 
-let mut run = stream(&request)?;
+let mut run = stream(&request, &reactor.handle())?;
 while let Some(event) = run.recv().await {
     if let Event::ApprovalRequest(approval) = event {
         let decision = if user_approves(&approval) {
@@ -119,7 +119,7 @@ let request = Request::new(Agent::Claude, prompt)
     .session(&store, &project, "chat")?   // so the conversation continues across turns
     .approvals();                          // implies .interactive()
 
-let mut run = stream(&request)?;
+let mut run = stream(&request, &reactor.handle())?;
 while let Some(event) = run.recv().await {
     match event {
         Event::Text(chunk)            => ui.append_assistant(&chunk),

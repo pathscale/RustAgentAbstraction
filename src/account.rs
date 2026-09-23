@@ -36,9 +36,10 @@
 use std::process::Stdio;
 use std::time::Duration;
 
+use futures::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use futures::stream::StreamExt as _;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::agent::Agent;
 use crate::error::{Error, Result};
@@ -144,6 +145,9 @@ impl Agent {
 
     /// Ask the agent what the account has spent and what remains.
     ///
+    /// `reactor` drives the child's pipes; the caller keeps its
+    /// [`nagoya::reactor::Reactor`] alive until this returns.
+    ///
     /// # Errors
     /// [`Error::Unsupported`] where the agent has no headless way to answer,
     /// which today is Claude and Copilot; check
@@ -152,9 +156,9 @@ impl Agent {
     /// cannot be run, [`Error::Timeout`] if it does not reply,
     /// [`Error::AgentError`] if it replies with a refusal, and
     /// [`Error::Parse`] if the reply is not the expected shape.
-    pub async fn account_usage(self) -> Result<AccountUsage> {
+    pub async fn account_usage(self, reactor: &nagoya::reactor::Handle) -> Result<AccountUsage> {
         match self {
-            Agent::Codex => codex_account_usage(self.bin()).await,
+            Agent::Codex => codex_account_usage(self.bin(), reactor).await,
             // Deliberately an error rather than a half-answer assembled from a
             // past run's rate-limit event: that would be neither current nor
             // account-wide, and would read as though it were both.
@@ -174,15 +178,15 @@ impl Agent {
 /// names the method, rather than as silence.
 ///
 /// Verified against codex-cli 0.145.0 on 2026-07-29.
-async fn codex_account_usage(bin: &str) -> Result<AccountUsage> {
-    let mut child = tokio::process::Command::new(bin)
+async fn codex_account_usage(bin: &str, reactor: &nagoya::reactor::Handle) -> Result<AccountUsage> {
+    let mut child = nagoya::process::Command::new(bin)
         .arg("app-server")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         // Silenced rather than captured: the server logs progress here and none
         // of it belongs in an error about usage.
         .stderr(Stdio::null())
-        .spawn()
+        .spawn(reactor)
         .map_err(|source| {
             if source.kind() == std::io::ErrorKind::NotFound {
                 Error::NotInstalled {
@@ -199,7 +203,7 @@ async fn codex_account_usage(bin: &str) -> Result<AccountUsage> {
         })?;
 
     let exchange = codex_exchange(&mut child);
-    let result = match tokio::time::timeout(QUERY_TIMEOUT, exchange).await {
+    let result = match nagoya::timeout(QUERY_TIMEOUT, exchange).await {
         Ok(result) => result,
         Err(_) => Err(Error::Timeout {
             bin: bin.to_string(),
@@ -214,7 +218,7 @@ async fn codex_account_usage(bin: &str) -> Result<AccountUsage> {
 }
 
 /// Drive the three requests and collect their replies.
-async fn codex_exchange(child: &mut tokio::process::Child) -> Result<AccountUsage> {
+async fn codex_exchange(child: &mut nagoya::process::Child) -> Result<AccountUsage> {
     const ACCOUNT: i64 = 2;
     const LIMITS: i64 = 3;
     const USAGE: i64 = 4;
@@ -266,7 +270,9 @@ async fn codex_exchange(child: &mut tokio::process::Child) -> Result<AccountUsag
     while outstanding > 0 {
         // A stream that ends before every reply arrives leaves whatever was
         // collected in place rather than discarding it.
-        let Ok(Some(line)) = lines.next_line().await else {
+        // futures' `Lines` is a stream, so tokio's `Ok(Some(line))` from
+        // `next_line` is `Some(Ok(line))` here; a read error still ends it.
+        let Some(Ok(line)) = lines.next().await else {
             break;
         };
         if line.len() > MAX_REPLY_BYTES {
@@ -470,12 +476,16 @@ mod tests {
 
     /// The capability is answerable without spawning anything, so a host can
     /// decide whether to build the panel at all.
-    #[tokio::test]
-    async fn agents_that_cannot_report_say_so_without_being_asked_twice() {
+    #[test]
+    fn agents_that_cannot_report_say_so_without_being_asked_twice() {
+        let reactor = nagoya::reactor::Reactor::start().expect("reactor");
         for agent in [Agent::Claude, Agent::Copilot] {
             assert!(!agent.reports_account_usage(), "{agent}");
             assert!(
-                matches!(agent.account_usage().await, Err(Error::Unsupported { .. })),
+                matches!(
+                    nagoya::block_on(agent.account_usage(&reactor.handle())),
+                    Err(Error::Unsupported { .. })
+                ),
                 "{agent} should refuse rather than assemble a partial answer"
             );
         }

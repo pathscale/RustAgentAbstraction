@@ -8,6 +8,43 @@ appear in a patch rather than inflating the version toward 1.0 on a crate still 
 shape. **Where that happens the entry says so at the top**, because a version number that
 under-signals is only acceptable if the changelog over-signals to compensate.
 
+## 0.5.0
+
+The crate now runs on nagoya instead of tokio, and every entry point that spawns a CLI
+takes the I/O reactor it should use.
+
+### Breaking
+
+- **Spawning entry points take a `&nagoya::reactor::Handle`.** The caller starts a
+  `nagoya::reactor::Reactor`, keeps it alive while its runs are in flight, and passes
+  `&reactor.handle()`. The crate never starts a reactor of its own and holds no global
+  one. Changed signatures:
+  - `run(request: &Request, reactor: &Handle) -> Result<Outcome>`
+  - `stream(request: &Request, reactor: &Handle) -> Result<Run>`
+  - `interrupt(request: &Request, reactor: &Handle) -> Result<bool>`
+  - `Probe::run(agent: Agent, reactor: &Handle) -> Result<Probe>`
+  - `Probe::run_bin(agent: Agent, bin: &str, reactor: &Handle) -> Result<Probe>`
+  - `AuthStatus::check(agent: Agent, reactor: &Handle) -> Result<AuthStatus>`
+  - `AuthStatus::check_bin(agent: Agent, bin: &str, reactor: &Handle) -> Result<AuthStatus>`
+  - `Agent::account_usage(self, reactor: &Handle) -> Result<AccountUsage>`
+  - `Agent::discover_models(&self, reactor: &Handle) -> Result<Vec<Model>>`
+- `nagoya` is re-exported as `agent_abstraction::nagoya`, so a caller can name
+  `Reactor` and `Handle` without a second copy of the dependency.
+
+### Changed
+
+- **tokio is gone**, from dependencies and dev-dependencies. Child processes come from
+  `nagoya::process`, the driver and stderr reader run on nagoya's shared pool, and the
+  channels, `select_biased!` and I/O extension traits come from `futures`. Every future
+  this crate returns still works under any executor, tokio included.
+- **`stream` no longer needs an ambient runtime.** It used to return
+  `Error::NoRuntime` when called outside a tokio runtime; nagoya's pool starts on first
+  use and the reactor is passed in, so that variant is never returned now. It stays in the enum so existing matches
+  compile.
+- **A closed control channel no longer spins the Codex and Grok drivers.** Under tokio a
+  detached interactive run polled its closed channel until tokio's cooperative budget
+  forced a yield; the arm is now skipped once every sender is gone.
+
 ## 0.4.20
 
 ### Added

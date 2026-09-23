@@ -20,18 +20,28 @@ It is a **library, not a CLI**. Your program links it and spawns the agent direc
 nothing marshals a request through a command line and back out of stdout twice.
 
 ```rust
+use agent_abstraction::nagoya::reactor::Reactor;
 use agent_abstraction::{Agent, Permission, Request, run};
+
+// The I/O driver for the child's pipes. Yours to start and keep alive while
+// runs are in flight; the crate never starts one of its own.
+let reactor = Reactor::start()?;
 
 let outcome = run(
     &Request::new(Agent::Claude, "Reply with the single word: pong")
         .model("haiku")
         .permission(Permission::ReadOnly),
+    &reactor.handle(),
 )
 .await?;
 
 println!("{}", outcome.text);          // "pong"
 println!("{:?}", outcome.usage.cost_usd);
 ```
+
+Every entry point that spawns a CLI (`run`, `stream`, `interrupt`, `Probe::run`,
+`AuthStatus::check`, `Agent::account_usage`, `Agent::discover_models`) takes that
+`&reactor.handle()`. The examples below assume a `reactor` like this one is in scope.
 
 ## What each agent can actually do
 
@@ -60,7 +70,7 @@ Both, depending on the agent. Verified by round-trip, not from `--help`:
 // Claude and Copilot: the id is yours to pick, so it can match a thread id
 // your app already has, with no mapping table in between.
 let mine = uuid::Uuid::new_v4().to_string();
-let outcome = run(&Request::new(Agent::Claude, "hi").session_id(&mine)).await?;
+let outcome = run(&Request::new(Agent::Claude, "hi").session_id(&mine), &reactor.handle()).await?;
 assert_eq!(outcome.session.as_deref(), Some(mine.as_str()));
 ```
 
@@ -83,7 +93,7 @@ conversation it meant to branch.
 ## Streaming
 
 ```rust
-let mut running = stream(&Request::new(Agent::Claude, "audit this repo"))?;
+let mut running = stream(&Request::new(Agent::Claude, "audit this repo"), &reactor.handle())?;
 while let Some(event) = running.recv().await {
     match event {
         Event::Text(text) => print!("{text}"),
@@ -123,7 +133,7 @@ let turn = Request::new(Agent::Claude, "what did I ask you to remember?")
     .session(&store, ".", "thread-42", /* fork */ false)?;
 
 assert_eq!(turn.session_phase(), Some(Phase::Continue));
-let outcome = run(&turn).await?;
+let outcome = run(&turn, &reactor.handle()).await?;
 ```
 
 Records live at `<dir>/<project-slug>/<name>.json`, partitioned by project so the same name
@@ -206,7 +216,7 @@ established here; the entry says which.
 Where a CLI can be asked directly, prefer that:
 
 ```rust
-let models = Agent::Codex.discover_models().await?;   // reflects the installed binary
+let models = Agent::Codex.discover_models(&reactor.handle()).await?;   // reflects the installed binary
 ```
 
 `discover_models` returns `Error::Unsupported` on Claude and Copilot rather than silently
@@ -241,7 +251,8 @@ back parsed instead of guessing at formatting the model never promised:
 let outcome = run(&Request::new(Agent::Codex, "Alice is 30 years old.")
     .schema(r#"{"type":"object",
                 "properties":{"name":{"type":"string"},"age":{"type":"integer"}},
-                "required":["name","age"],"additionalProperties":false}"#))
+                "required":["name","age"],"additionalProperties":false}"#),
+    &reactor.handle())
     .await?;
 
 assert_eq!(outcome.structured.unwrap()["name"], "Alice");
@@ -265,7 +276,7 @@ cancelling a request should stop the work, not leave an agent running invisibly,
 quota and writing files with nobody watching.
 
 ```rust
-let running = stream(&request)?;
+let running = stream(&request, &reactor.handle())?;
 drop(running);                  // agent and its children are killed
 running.cancel().await?;        // cooperative: returns only once the tree has exited
 running.detach();               // opt out: keep running unsupervised
@@ -294,7 +305,7 @@ a run already under way:
 
 ```rust
 let request = Request::new(Agent::Claude, prompt).interactive();
-let mut run = stream(&request)?;
+let mut run = stream(&request, &reactor.handle())?;
 
 // Keep input independent from the task continuously draining run.recv().
 let control = run.control();
@@ -353,7 +364,7 @@ use agent_abstraction::{Agent, Command, Compaction, Event, Request, stream};
 let request = Request::command(Agent::Claude, &Command::Compact { instructions: None })
     .resume(&session_id);
 
-let mut run = stream(&request)?;
+let mut run = stream(&request, &reactor.handle())?;
 while let Some(event) = run.recv().await {
     if let Event::Compaction(Compaction::Finished { ok, error }) = event {
         // `ok: false` with a reason is an answer, not an error.
@@ -402,7 +413,7 @@ let request = Request::new(Agent::Claude, prompt)
     .permission(Permission::Edit)
     .approvals();
 
-let mut run = stream(&request)?;
+let mut run = stream(&request, &reactor.handle())?;
 while let Some(event) = run.recv().await {
     if let Event::ApprovalRequest(approval) = event {
         // approval.tool is "Bash"; approval.input carries the actual command
@@ -484,7 +495,7 @@ Without spending a request:
 
 ```rust
 for agent in Agent::ALL {
-    let status = AuthStatus::check(agent).await?;
+    let status = AuthStatus::check(agent, &reactor.handle()).await?;
     println!("{agent}: {}", status.summary());
 }
 ```
@@ -613,7 +624,7 @@ These are `Error::AgentError`, carrying the agent's own wording and the provider
 where one was reported:
 
 ```rust
-match run(&request).await {
+match run(&request, &reactor.handle()).await {
     Err(Error::AgentError { status: Some(404), message, .. }) => {
         // Typically a model the account cannot reach. `message` is the agent's wording.
         eprintln!("{message}");
@@ -634,14 +645,14 @@ passed through untouched.
 
 ## Usage and quota
 
-Two questions with two answers. `Outcome::usage` measures the run; `Agent::account_usage()`
+Two questions with two answers. `Outcome::usage` measures the run; `Agent::account_usage`
 measures the plan behind it. Everything is a value, never a formatted string or a rendered
 bar, so a host presents it however it likes.
 
 ### Per run, and per session
 
 ```rust
-let outcome = run(&request).await?;
+let outcome = run(&request, &reactor.handle()).await?;
 let used = outcome.usage.context_used();   // Option<f64>, 0.0 to 1.0
 ```
 
@@ -710,7 +721,7 @@ until the turn completes, so it never emits this.
 
 ```rust
 if agent.reports_account_usage() {
-    let account = agent.account_usage().await?;
+    let account = agent.account_usage(&reactor.handle()).await?;
     for window in &account.windows {
         // window.used_percent, window.window_minutes, window.resets_at
     }
@@ -770,7 +781,7 @@ A Rust port of [nickderobertis/oneharness](https://github.com/nickderobertis/one
   two JSON round-trips to ask a question.
 - **The shell scripts are gone**, 39 of them, mostly CI gates and per-harness e2e drivers.
 - **Five harnesses are gone** (OpenCode, Goose, Qwen, Crush, Cursor).
-- **Async throughout.** oneharness runs blocking; this streams over tokio, which is what a
+- **Async throughout.** oneharness runs blocking; this streams over nagoya, which is what a
   Tauri front end needs to render a run as it happens.
 
 Some findings did not survive re-verification against the current CLIs. oneharness models

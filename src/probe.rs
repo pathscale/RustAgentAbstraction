@@ -132,11 +132,14 @@ pub struct Probe {
 impl Probe {
     /// Ask `agent`'s default binary for its version.
     ///
+    /// `reactor` drives the child's pipes; the caller keeps its
+    /// [`nagoya::reactor::Reactor`] alive until this returns.
+    ///
     /// # Errors
     /// [`Error::NotInstalled`] if the binary is missing, [`Error::Spawn`] if it
     /// cannot be run.
-    pub async fn run(agent: Agent) -> Result<Probe> {
-        Probe::run_bin(agent, agent.bin()).await
+    pub async fn run(agent: Agent, reactor: &nagoya::reactor::Handle) -> Result<Probe> {
+        Probe::run_bin(agent, agent.bin(), reactor).await
     }
 
     /// Ask a specific binary for its version, for a caller that overrides the
@@ -145,10 +148,14 @@ impl Probe {
     /// # Errors
     /// [`Error::NotInstalled`] if the binary is missing, [`Error::Spawn`] if it
     /// cannot be run.
-    pub async fn run_bin(agent: Agent, bin: &str) -> Result<Probe> {
-        let output = tokio::process::Command::new(bin)
+    pub async fn run_bin(
+        agent: Agent,
+        bin: &str,
+        reactor: &nagoya::reactor::Handle,
+    ) -> Result<Probe> {
+        let output = nagoya::process::Command::new(bin)
             .arg("--version")
-            .output()
+            .output(reactor)
             .await
             .map_err(|source| {
                 if source.kind() == std::io::ErrorKind::NotFound {
@@ -298,11 +305,15 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn probing_a_missing_binary_says_how_to_install_it() {
-        let err = Probe::run_bin(Agent::Claude, "agent-abstraction-no-such-binary")
-            .await
-            .unwrap_err();
+    #[test]
+    fn probing_a_missing_binary_says_how_to_install_it() {
+        let reactor = nagoya::reactor::Reactor::start().expect("reactor");
+        let err = nagoya::block_on(Probe::run_bin(
+            Agent::Claude,
+            "agent-abstraction-no-such-binary",
+            &reactor.handle(),
+        ))
+        .unwrap_err();
         assert!(matches!(err, Error::NotInstalled { .. }), "{err:?}");
     }
 }
