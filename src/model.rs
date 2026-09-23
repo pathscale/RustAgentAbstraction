@@ -167,8 +167,8 @@ impl Agent {
             },
             Agent::Codex => Verified {
                 source: Source::Cli,
-                checked: "2026-08-07",
-                against: "codex-cli 0.146.0",
+                checked: "2026-09-23",
+                against: "codex-cli 0.154.0",
             },
             // Read from the `/model` picker. Copilot has no headless list; see
             // `discover_models`.
@@ -179,8 +179,8 @@ impl Agent {
             },
             Agent::Grok => Verified {
                 source: Source::Cli,
-                checked: "2026-09-13",
-                against: "grok 1.0.30",
+                checked: "2026-09-23",
+                against: "grok 1.0.40",
             },
         }
     }
@@ -392,26 +392,38 @@ fn claude_pinned() -> Vec<Model> {
 
 /// Codex, in the priority order the CLI itself reports.
 ///
-/// Verified by running `codex debug models` against codex-cli 0.146.0 on
-/// 2026-08-07. `codex-auto-review` is reported with `visibility: "hide"` and is
-/// left out for that reason; [`discover_codex`] applies the same filter.
+/// Verified by running `codex debug models` against codex-cli 0.154.0 on
+/// 2026-09-23. `gpt-reserve` and `codex-auto-review` are reported with
+/// `visibility: "hide"` and are left out for that reason; [`discover_codex`]
+/// applies the same filter. `gpt-daybreak-blue-latest` is listed only in the
+/// server-refreshed catalogue (the bundled one hides it), so it is
+/// account-dependent. `gpt-5.5` carries an upgrade notice retiring it on
+/// 2026-10-14 in favour of `gpt-5.6-sol`. The descriptions are Codex's own.
 fn codex_models() -> Vec<Model> {
     const FULL: &[&str] = &["low", "medium", "high", "xhigh", "max", "ultra"];
     const TO_MAX: &[&str] = &["low", "medium", "high", "xhigh", "max"];
     const TO_XHIGH: &[&str] = &["low", "medium", "high", "xhigh"];
     vec![
         Model::new(
-            "gpt-5.6-sol",
-            "GPT-5.6-Sol",
-            "Latest frontier agentic coding model.",
+            "gpt-6-astra",
+            "GPT-6-Astra",
+            "Frontier intelligence for the most demanding work.",
             Kind::Pinned,
             FULL,
             true,
         ),
         Model::new(
+            "gpt-5.6-sol",
+            "GPT-5.6-Sol",
+            "Older coding model for complex work.",
+            Kind::Pinned,
+            FULL,
+            false,
+        ),
+        Model::new(
             "gpt-5.6-terra",
             "GPT-5.6-Terra",
-            "Balanced agentic coding model for everyday work.",
+            "Older balanced model for straightforward work.",
             Kind::Pinned,
             FULL,
             false,
@@ -419,31 +431,23 @@ fn codex_models() -> Vec<Model> {
         Model::new(
             "gpt-5.6-luna",
             "GPT-5.6-Luna",
-            "Fast and affordable agentic coding model.",
+            "Older fast and efficient model.",
             Kind::Pinned,
             TO_MAX,
             false,
         ),
         Model::new(
+            "gpt-daybreak-blue-latest",
+            "Daybreak Blue",
+            "Latest frontier agentic coding model for broad defensive cybersecurity work.",
+            Kind::Pinned,
+            FULL,
+            false,
+        ),
+        Model::new(
             "gpt-5.5",
             "GPT-5.5",
-            "Frontier model for complex coding, research, and real-world tasks.",
-            Kind::Pinned,
-            TO_XHIGH,
-            false,
-        ),
-        Model::new(
-            "gpt-5.4",
-            "GPT-5.4",
-            "Strong model for everyday coding.",
-            Kind::Pinned,
-            TO_XHIGH,
-            false,
-        ),
-        Model::new(
-            "gpt-5.4-mini",
-            "GPT-5.4-Mini",
-            "Small, fast, and cost-efficient model for simpler coding tasks.",
+            "Legacy coding model.",
             Kind::Pinned,
             TO_XHIGH,
             false,
@@ -518,21 +522,40 @@ fn pinned(id: &'static str, name: &'static str) -> Model {
     Model::new(id, name, "", Kind::Pinned, COPILOT_EFFORTS, false)
 }
 
-/// Grok, from `grok models` on 1.0.30 (2026-09-13).
+/// Grok, from `grok models` on 1.0.40 (2026-09-23).
 ///
 /// Effort tokens from grok `--help` (`--reasoning-effort` / `--effort`) and
-/// the session config option `reasoning_effort`.
+/// the session config option `reasoning_effort`. The 1.0.40 binary's validator
+/// also names `none` and `max`, but that is a string in the binary, not a
+/// verified run, so they are not claimed here.
 const GROK_EFFORTS: &[&str] = &["minimal", "low", "medium", "high", "xhigh"];
 
 fn grok_models() -> Vec<Model> {
     vec![
         Model::new(
-            "grok-4.6",
-            "Grok 4.6",
+            "grok-4.7",
+            "Grok 4.7",
             "Default Grok Build model",
             Kind::Pinned,
             GROK_EFFORTS,
             true,
+        ),
+        // `grok models` prints ids only; the display name follows the others.
+        Model::new(
+            "grok-4.7-build-fast",
+            "Grok 4.7 Build Fast",
+            "",
+            Kind::Pinned,
+            GROK_EFFORTS,
+            false,
+        ),
+        Model::new(
+            "grok-4.6",
+            "Grok 4.6",
+            "",
+            Kind::Pinned,
+            GROK_EFFORTS,
+            false,
         ),
         Model::new(
             "grok-4.5",
