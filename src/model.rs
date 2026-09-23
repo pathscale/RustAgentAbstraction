@@ -70,7 +70,7 @@ pub struct Model {
     ///
     /// Kept as strings for the same reason ids are, and the three agents make
     /// the case on their own: Claude documents five levels, Copilot seven, and
-    /// Codex varies them per model, offering `ultra` on its two frontier models
+    /// Codex varies them per model, offering `ultra` on its larger models
     /// and not on the rest. A shared enum would have to be edited before a new
     /// level could even be named.
     ///
@@ -156,19 +156,20 @@ impl Agent {
     #[must_use]
     pub fn models_verified(&self) -> Verified {
         match self {
-            // Mixed: the five aliases were read from the `/model` picker, but
-            // the pinned ids and the `best` / `opusplan` / `[1m]` entries come
-            // from documentation. `source` records the weakest evidence behind
-            // any entry, since that is the one a reader needs to distrust.
+            // Mixed: the aliases were read from the `/model` picker and every
+            // entry was run on 2.1.267, but the notes come from documentation
+            // and Claude cannot list its models headlessly. `source` records
+            // the weakest evidence behind any entry, since that is the one a
+            // reader needs to distrust.
             Agent::Claude => Verified {
                 source: Source::Docs,
-                checked: "2026-07-30",
-                against: "claude 2.1.212",
+                checked: "2026-09-23",
+                against: "claude 2.1.267",
             },
             Agent::Codex => Verified {
                 source: Source::Cli,
                 checked: "2026-09-23",
-                against: "codex-cli 0.154.0",
+                against: "codex-cli 0.156.1",
             },
             // Read from the `/model` picker. Copilot has no headless list; see
             // `discover_models`.
@@ -207,7 +208,7 @@ impl Agent {
             Agent::Codex => discover_codex(self.bin(), reactor).await,
             Agent::Grok => discover_grok(self.bin(), reactor).await,
             // Neither can be asked without a terminal, verified against
-            // Copilot CLI 1.0.75 and claude 2.1.212. Copilot has no `models`
+            // Copilot CLI 1.0.75 and claude 2.1.267. Copilot has no `models`
             // subcommand, rejects an unknown `--model` without listing the valid
             // ones, and its ACP `session/new` reply carries session modes and
             // permissions but no models. Claude documents its aliases in
@@ -228,9 +229,9 @@ impl Agent {
 /// and respect what the account is entitled to, which a pinned id does neither
 /// of. Pinned ids follow for a caller who needs one exact model.
 ///
-/// Verified against claude 2.1.212 (`--help`) and the published model list,
-/// 2026-07-29.
-/// Claude's effort levels, verified from `claude --help` on 2.1.212:
+/// Verified against claude 2.1.267 (`--help`, and a one-line run of every entry)
+/// on 2026-09-23. The notes still come from the published model list.
+/// Claude's effort levels, verified from `claude --help` on 2.1.267:
 /// `--effort <level>` (low, medium, high, xhigh, max).
 ///
 /// Session-level rather than per-model, so every entry carries the same set:
@@ -311,8 +312,10 @@ fn claude_aliases() -> Vec<Model> {
         // terminal record reports `contextWindow: 1000000`, keyed by the
         // suffixed id (`claude-sonnet-5[1m]`). The suffix also composes with a
         // pinned id: `claude-opus-5[1m]` ran and reported 1M. `fable[1m]` is
-        // accepted too, resolving to plain `claude-fable-5` at 1M, since Fable
-        // is 1M natively and needs no suffix.
+        // accepted too (2.1.212), resolving to plain `claude-fable-5` at 1M, since Fable
+        // is 1M natively and needs no suffix. On 2.1.267 (2026-09-23) `opus[1m]` and
+        // `sonnet[1m]` were run again and reported 1M under `claude-opus-5[1m]` and
+        // `claude-sonnet-5[1m]`; `fable[1m]` was not re-run.
         Model::new(
             "opus[1m]",
             "Opus (1M context)",
@@ -336,21 +339,33 @@ fn claude_aliases() -> Vec<Model> {
 ///
 /// Its own subtitle says so: "For other/previous model names, specify with
 /// `--model`". They are still worth carrying, because an alias and a pinned id
-/// do not always agree. Verified on 2026-07-29 against claude 2.1.212 by running
-/// both: `--model opus` reported `claude-opus-4-8` in its usage while
-/// `--model claude-opus-5` reported `claude-opus-5`, even though that release's
-/// own notes call Opus 5 "now the default Opus model". An alias is whatever the
-/// account resolves it to, which is not always the newest model.
+/// do not always agree. On claude 2.1.212 (2026-07-29) `--model opus` reported
+/// `claude-opus-4-8` in its usage while `--model claude-opus-5` reported
+/// `claude-opus-5`, even though that release's own notes call Opus 5 "now the
+/// default Opus model". On 2.1.267 (2026-09-23) the two agree again: `opus`
+/// reports `claude-opus-5`, `sonnet` reports `claude-sonnet-5`, `fable` and
+/// `best` report `claude-fable-5-1`, and `haiku` reports
+/// `claude-haiku-4-5-20251001`. An alias is whatever the account resolves it
+/// to, which is not always the newest model.
+///
+/// Every id below was run on claude 2.1.267 (2026-09-23) and answered under its
+/// own name. `claude-opus-5-5` was tried and refused as
+/// `[claude-code:unrecognized_model]`, and 2.1.267 carries no such string, so
+/// it is not catalogued. `claude-fable-5` is left out: it is still accepted,
+/// but its run produced no output of its own and the answer came from
+/// `claude-opus-4-8`, and both the `fable` alias and `best` now resolve to
+/// `claude-fable-5-1`. `claude-haiku-4-5` is replaced by the dated id the
+/// `haiku` alias reports.
 fn claude_pinned() -> Vec<Model> {
     vec![
-        // Windows verified by running each id on claude 2.1.212 (2026-07-30).
-        // `claude-opus-5` is the odd one out: every other 5-series model is 1M
-        // natively, while it defaults to 200k and needs the suffix. Both forms
-        // are catalogued so a picker can offer the choice explicitly.
+        // Windows as reported by running each id on claude 2.1.267
+        // (2026-09-23). On 2.1.212 plain `claude-opus-5` reported 200k and
+        // needed the suffix; on 2.1.267 it reports 1,000,000 on its own. The
+        // suffixed form stays because it is what `default` resolves to.
         Model::new(
             "claude-opus-5",
             "Claude Opus 5",
-            "For complex agentic coding and enterprise work (200k context)",
+            "For complex agentic coding and enterprise work (1M context)",
             Kind::Pinned,
             CLAUDE_EFFORTS,
             false,
@@ -358,7 +373,7 @@ fn claude_pinned() -> Vec<Model> {
         Model::new(
             "claude-opus-5[1m]",
             "Claude Opus 5 (1M context)",
-            "Opus 5 with a 1M token context window",
+            "Opus 5 with the 1M context window requested explicitly",
             Kind::Pinned,
             CLAUDE_EFFORTS,
             false,
@@ -372,17 +387,17 @@ fn claude_pinned() -> Vec<Model> {
             false,
         ),
         Model::new(
-            "claude-fable-5",
-            "Claude Fable 5",
+            "claude-fable-5-1",
+            "Claude Fable 5.1",
             "Next-generation intelligence for long-running agents (1M context)",
             Kind::Pinned,
             CLAUDE_EFFORTS,
             false,
         ),
         Model::new(
-            "claude-haiku-4-5",
+            "claude-haiku-4-5-20251001",
             "Claude Haiku 4.5",
-            "The fastest model with near-frontier intelligence",
+            "The fastest model with near-frontier intelligence (200k context)",
             Kind::Pinned,
             CLAUDE_EFFORTS,
             false,
@@ -392,11 +407,11 @@ fn claude_pinned() -> Vec<Model> {
 
 /// Codex, in the priority order the CLI itself reports.
 ///
-/// Verified by running `codex debug models` against codex-cli 0.154.0 on
+/// Verified by running `codex debug models` against codex-cli 0.156.1 on
 /// 2026-09-23. `gpt-reserve` and `codex-auto-review` are reported with
 /// `visibility: "hide"` and are left out for that reason; [`discover_codex`]
-/// applies the same filter. `gpt-daybreak-blue-latest` is listed only in the
-/// server-refreshed catalogue (the bundled one hides it), so it is
+/// applies the same filter. `gpt-daybreak-blue-latest` was listed only in the
+/// server-refreshed catalogue on 0.154.0 (the bundled one hid it), so it is
 /// account-dependent. `gpt-5.5` carries an upgrade notice retiring it on
 /// 2026-10-14 in favour of `gpt-5.6-sol`. The descriptions are Codex's own.
 fn codex_models() -> Vec<Model> {
@@ -411,6 +426,22 @@ fn codex_models() -> Vec<Model> {
             Kind::Pinned,
             FULL,
             true,
+        ),
+        Model::new(
+            "gpt-6-sol",
+            "GPT-6-Sol",
+            "Workhorse model for coding and everyday work.",
+            Kind::Pinned,
+            FULL,
+            false,
+        ),
+        Model::new(
+            "gpt-6-luna",
+            "GPT-6-Luna",
+            "Fast and affordable model for easier tasks.",
+            Kind::Pinned,
+            TO_MAX,
+            false,
         ),
         Model::new(
             "gpt-5.6-sol",
@@ -867,7 +898,7 @@ mod tests {
         );
     }
 
-    /// Verified from `claude --help` (2.1.212) and `copilot --help` (1.0.75).
+    /// Verified from `claude --help` (2.1.267) and `copilot --help` (1.0.75).
     /// Copilot's set is two wider at the bottom, which is the whole reason
     /// levels are strings rather than a shared enum.
     #[test]
@@ -903,11 +934,11 @@ mod tests {
                 .collect()
         };
         assert!(
-            by_id("gpt-5.6-sol").contains(&"ultra".to_string()),
-            "its frontier model offers ultra"
+            by_id("gpt-6-sol").contains(&"ultra".to_string()),
+            "its workhorse model offers ultra"
         );
         assert!(
-            !by_id("gpt-5.6-luna").contains(&"ultra".to_string()),
+            !by_id("gpt-6-luna").contains(&"ultra".to_string()),
             "its fast model does not"
         );
     }
