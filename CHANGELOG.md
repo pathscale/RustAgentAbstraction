@@ -8,6 +8,37 @@ appear in a patch rather than inflating the version toward 1.0 on a crate still 
 shape. **Where that happens the entry says so at the top**, because a version number that
 under-signals is only acceptable if the changelog over-signals to compensate.
 
+## 0.5.1
+
+Re-verified against the installed CLIs: claude 2.1.267, codex-cli 0.154.0, GitHub Copilot
+CLI 1.0.88 and grok 1.0.40. Every flag was checked against each CLI's `--help`, and the live
+suite passed against all four.
+
+### Fixed
+
+- **Codex: resuming with extra directories no longer fails.** `codex exec resume` refuses
+  `--add-dir`; a resumed run now carries its roots as
+  `-c sandbox_workspace_write.writable_roots=[...]`. A fresh `exec` still takes the flag.
+- **Codex: app-server errors carry their message.** The notification is
+  `{ error: { message }, willRetry }`; the crate read a top-level `message` and always got
+  nothing. A notification Codex will retry no longer ends the turn as an error.
+- **Claude: a `[1m]` run reports its window even when the Haiku helper ran.**
+  `--output-format json` has no `init` record, so with the helper listed beside the run's
+  model there was no name to choose by and the window came back unknown. The run's own
+  `modelUsage` entry is now found by its counts, which equal the top-level `usage`; anything
+  ambiguous is still unknown rather than guessed.
+- **Copilot: effort is passed as `--reasoning-effort`**, the documented spelling in 1.0.88.
+  `--effort` still parses but is no longer in `--help`.
+- **Claude's login hint is `claude auth login`**, the subcommand 2.1.267 documents.
+
+### Changed
+
+- **Codex catalogue** follows what 0.154.0 reports: `gpt-6-astra` (now the default),
+  `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-daybreak-blue-latest` (account
+  dependent) and `gpt-5.5` (retiring 2026-10-14). `gpt-5.4` and `gpt-5.4-mini` are gone.
+- **Grok catalogue** follows `grok models` on 1.0.40: `grok-4.7` (now the default),
+  `grok-4.7-build-fast`, `grok-4.6`, `grok-4.5`.
+
 ## 0.5.0
 
 The crate now runs on nagoya instead of tokio, and every entry point that spawns a CLI

@@ -45,8 +45,8 @@ Every entry point that spawns a CLI (`run`, `stream`, `interrupt`, `Probe::run`,
 
 ## What each agent can actually do
 
-Verified live, against `claude 2.1.205`, `codex-cli 0.146.0` and `GitHub Copilot CLI 1.0.78`
-and not inferred from documentation.
+Verified live, against `claude 2.1.267`, `codex-cli 0.154.0`, `GitHub Copilot CLI 1.0.88` and
+`grok 1.0.40`, and not inferred from documentation.
 
 | | session id | fork | events | system prompt | resume flag |
 |---|---|---|---|---|---|
