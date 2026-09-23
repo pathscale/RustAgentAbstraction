@@ -291,7 +291,11 @@ mod tests {
         let status = AuthStatus::read(Agent::Claude, r#"{"loggedIn": false}"#, true);
         assert_eq!(status.state, AuthState::LoggedOut);
         assert!(status.needs_login());
-        assert!(status.summary().contains("/login"), "{}", status.summary());
+        assert!(
+            status.summary().contains("claude auth login"),
+            "{}",
+            status.summary()
+        );
     }
 
     /// Verbatim from `codex login status`.
