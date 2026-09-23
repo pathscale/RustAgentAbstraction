@@ -163,6 +163,11 @@ impl Request {
 
     /// Pin the model. Passed through verbatim; this crate does not validate
     /// model names, so an unknown one surfaces as the agent's own error.
+    ///
+    /// The one exception is an id the agent's compiled-in catalogue marks
+    /// [`crate::Model::retired`]: building the command line, and so starting
+    /// the run, fails with [`crate::Error::RetiredModel`] carrying the reason and
+    /// the replacement, so the user picks another model.
     #[must_use]
     pub fn model(mut self, model: impl Into<String>) -> Self {
         self.model = Some(model.into());
@@ -529,7 +534,8 @@ impl Request {
     /// will run before they approve it.
     ///
     /// # Errors
-    /// [`crate::Error::Unsupported`] if the agent cannot honour this request.
+    /// [`crate::Error::Unsupported`] if the agent cannot honour this request,
+    /// and [`crate::Error::RetiredModel`] for a model its catalogue marks retired.
     pub fn argv(&self) -> Result<Vec<String>> {
         Ok(self
             .typed_argv()?
@@ -538,11 +544,40 @@ impl Request {
             .collect())
     }
 
+    /// Refuse a model the agent's compiled-in catalogue marks retired.
+    ///
+    /// Only a catalogued, retired id is refused. An id the catalogue does not
+    /// know still passes through verbatim, since a model newer than this crate
+    /// must not be blocked. Refused rather than run because a retired id can
+    /// still be accepted and answer as a different model (`claude-fable-5` on
+    /// claude 2.1.267), which is a quiet wrong answer.
+    ///
+    /// # Errors
+    /// [`crate::Error::RetiredModel`] carrying the model, why it was retired,
+    /// and its replacement when there is one.
+    pub(crate) fn refuse_retired_model(&self) -> Result<()> {
+        let Some(id) = &self.model else {
+            return Ok(());
+        };
+        match self.agent.retired_model(id).and_then(|model| model.retired) {
+            Some(retired) => Err(crate::Error::RetiredModel {
+                agent: self.agent,
+                model: id.clone(),
+                retired,
+            }),
+            None => Ok(()),
+        }
+    }
+
     /// The command line with per-argument sensitivity, the single source both
     /// the executable and the redacted forms are derived from.
+    ///
+    /// Every spawn builds its argv here, so the retired-model refusal sits here
+    /// too and nothing runs on a retired model.
     pub(crate) fn typed_argv(&self) -> Result<Vec<crate::agent::Arg>> {
         use crate::agent::{Arg, Sensitivity};
 
+        self.refuse_retired_model()?;
         let plan = self.plan();
         let mut argv = self.agent.typed_argv(&plan)?;
         // Raw arguments have no known shape, so they are assumed to carry
@@ -693,5 +728,59 @@ mod tests {
             .unwrap();
         let at = argv.iter().position(|a| a == "--resume").unwrap();
         assert_eq!(argv[at + 1], "sess-9");
+    }
+
+    /// A retired model never runs: the argv, which every spawn goes through,
+    /// is refused, and the message tells the user what to pick instead.
+    #[test]
+    fn a_retired_model_is_refused_with_its_replacement() {
+        for (agent, id, replacement) in [
+            (Agent::Claude, "claude-fable-5", "claude-fable-5-1"),
+            (Agent::Codex, "gpt-5.4", "gpt-6-astra"),
+            (Agent::Codex, "gpt-5.4-mini", "gpt-6-astra"),
+        ] {
+            let err = Request::new(agent, "hi")
+                .model(id)
+                .argv()
+                .expect_err("a retired model must be refused");
+            let crate::Error::RetiredModel {
+                agent: refused,
+                model,
+                retired,
+            } = &err
+            else {
+                panic!("expected RetiredModel, got {err:?}");
+            };
+            assert_eq!(*refused, agent);
+            assert_eq!(model, id);
+            assert_eq!(retired.replacement.as_deref(), Some(replacement));
+            assert!(
+                err.to_string().contains(replacement),
+                "the display should carry it too: {err}"
+            );
+        }
+    }
+
+    /// Retirement is per agent and per catalogued id. An id no catalogue
+    /// knows, and a live one, still pass through verbatim.
+    #[test]
+    fn only_a_catalogued_retired_id_is_refused() {
+        for (agent, id) in [
+            (Agent::Claude, "some-model-from-next-year"),
+            (Agent::Claude, "claude-haiku-4-5"),
+            (Agent::Claude, "claude-fable-5-1"),
+            // Retired on Claude, not on Copilot's own catalogue.
+            (Agent::Copilot, "claude-fable-5"),
+            (Agent::Codex, "gpt-6-astra"),
+        ] {
+            let argv = Request::new(agent, "hi")
+                .model(id)
+                .argv()
+                .unwrap_or_else(|e| panic!("{agent} {id} must not be refused: {e}"));
+            assert!(
+                argv.windows(2).any(|w| w[0] == "--model" && w[1] == id),
+                "{agent} {id} should reach the command line: {argv:?}"
+            );
+        }
     }
 }

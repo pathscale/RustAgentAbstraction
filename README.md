@@ -167,10 +167,28 @@ for model in Agent::Claude.models() {
 }
 ```
 
-The list is **advisory and never enforced**. `Request::model` takes any string and nothing
-here checks it, so a model released this morning is not blocked by a list compiled last
-month. A model the account cannot reach comes back as `Error::AgentError` with the
-provider's own status and wording.
+The list is **advisory, with one exception**. `Request::model` takes any string and an id
+the list does not know passes straight through, so a model released this morning is not
+blocked by a list compiled last month. A model the account cannot reach comes back as
+`Error::AgentError` with the provider's own status and wording.
+
+The exception is a **retired** entry. A model a CLI stops offering is kept in the list with
+`Model::retired` set (`since`, `reason`, and a `replacement` where there is one) instead of
+being deleted, because a host that stored the id would otherwise watch it vanish from its
+picker while its runs kept using it. `Model::is_retired()` lets a picker flag it; a retired
+entry is never `is_default`. A request naming one is refused with `Error::RetiredModel`
+before anything is spawned. It carries the model and its `Retired`, so a host can offer the
+replacement, and the user picks another model:
+
+| Agent | Retired id | Since | Replacement | Why |
+|---|---|---|---|---|
+| Claude | `claude-fable-5` | claude 2.1.267 | `claude-fable-5-1` | Still accepted, but the answer comes from `claude-opus-4-8` |
+| Codex | `gpt-5.4` | codex-cli 0.154.0 | `gpt-6-astra` | No longer listed by `codex debug models` |
+| Codex | `gpt-5.4-mini` | codex-cli 0.154.0 | `gpt-6-astra` | No longer listed by `codex debug models` |
+
+Retirement is per agent: Copilot's own `gpt-5.4` and `claude-fable-5` entries are untouched.
+`claude-haiku-4-5` is not retired; it still answers under its own name and sits beside the
+dated `claude-haiku-4-5-20251001` that the `haiku` alias reports.
 
 That distinction matters more than it sounds, because **a catalogue is not an entitlement**.
 Copilot's picker lists twenty-three models and a Free plan permits exactly one:
@@ -200,8 +218,8 @@ let request = Request::new(Agent::Codex, prompt).model("gpt-5.6-sol").effort("ul
 
 Passed through verbatim, like the model, because the sets are not interchangeable: Claude
 documents five levels, Copilot seven, and Codex varies them per model, offering `ultra` on
-its two frontier models and not on the rest. Delivered as `--effort` on Claude and Copilot,
-and as `-c model_reasoning_effort=<level>` on Codex, which has no flag for it.
+its larger models and not on the rest. Delivered as `--effort` on Claude, as
+`--reasoning-effort` on Copilot and Grok, and as `-c model_reasoning_effort=<level>` on Codex, which has no flag for it.
 
 Support is not uniform even within one agent. Copilot's `auto` **exits 1** rather than
 ignoring the flag:
@@ -224,6 +242,11 @@ let models = Agent::Codex.discover_models(&reactor.handle()).await?;   // reflec
 returning the compiled list: both enumerate models only in an interactive picker, and a
 caller asking for discovery is asking for freshness. `Agent::models_verified()` records how
 each compiled list was established and against which release.
+
+Discovery still appends the compiled list's retired entries after the discovered ones, since
+a CLI lists only what it offers today and a picker has to show and flag a stored id that has
+gone. An id the CLI lists that the compiled list marks retired is flagged in place, not
+repeated.
 
 ### Disabling thinking
 

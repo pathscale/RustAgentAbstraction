@@ -1,12 +1,25 @@
 //! Which models each agent offers, so a host can render a picker.
 //!
-//! The catalogue is **advisory and never enforced**. [`crate::Request::model`]
-//! takes any string and this crate does not check it against anything here. A
-//! model that shipped this morning must not be blocked by a list compiled last
+//! The catalogue is **advisory, with one exception**. [`crate::Request::model`]
+//! takes any string and passes an id this list does not know straight through.
+//! A model that shipped this morning must not be blocked by a list compiled last
 //! month, and a picked model the account cannot reach fails as
 //! [`crate::Error::AgentError`] carrying the provider's own status and wording.
 //! Enforcing the list would trade a clear runtime error for a wrong compile-time
 //! one.
+//!
+//! # Retired models
+//!
+//! The exception is an entry marked [`Model::retired`]. A model a CLI stops
+//! offering is kept here as a retired entry rather than deleted, because a host
+//! that stored its id (agencyzero keeps them as strings in its database) would
+//! otherwise see the id vanish from its picker while its runs kept using it.
+//! Retired entries are listed so a picker can show and flag them, are never
+//! [`Model::is_default`], and are refused: a request naming one fails with
+//! [`crate::Error::RetiredModel`] before anything is spawned, naming the reason
+//! and the replacement, so the user picks another model. Some of them still run
+//! (`claude-fable-5` is accepted and answers as a different model), which is
+//! exactly the quiet wrong answer the refusal exists to prevent.
 //!
 //! # A catalogue is not an entitlement
 //!
@@ -81,10 +94,53 @@ pub struct Model {
     /// refused, since nothing in this crate validates against it.
     pub efforts: Vec<Cow<'static, str>>,
     /// Whether the agent uses this when the caller names no model.
+    /// Always `false` on a retired entry.
     pub is_default: bool,
+    /// Set when the CLI no longer offers this model. A request naming it is
+    /// refused; see [`Retired`].
+    #[serde(default)]
+    pub retired: Option<Retired>,
+}
+
+/// Why a catalogued model may no longer be used, and what to use instead.
+///
+/// A retired entry stays in the catalogue so an id a host stored keeps a name
+/// and a reason in its picker, but a request naming it fails with
+/// [`crate::Error::RetiredModel`] rather than running.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct Retired {
+    /// The CLI release it was found retired on, such as `claude 2.1.267`.
+    pub since: Cow<'static, str>,
+    /// The id to offer in its place, when there is an obvious one.
+    pub replacement: Option<Cow<'static, str>>,
+    /// What was observed, in one line.
+    pub reason: Cow<'static, str>,
 }
 
 impl Model {
+    /// Whether the CLI no longer offers this model. A retired model never runs.
+    #[must_use]
+    pub fn is_retired(&self) -> bool {
+        self.retired.is_some()
+    }
+
+    /// Mark a catalogue entry retired. A retired entry is never the default.
+    fn retire(
+        mut self,
+        since: &'static str,
+        replacement: Option<&'static str>,
+        reason: &'static str,
+    ) -> Model {
+        self.is_default = false;
+        self.retired = Some(Retired {
+            since: Cow::Borrowed(since),
+            replacement: replacement.map(Cow::Borrowed),
+            reason: Cow::Borrowed(reason),
+        });
+        self
+    }
+
     /// Build a catalogue entry from static parts.
     fn new(
         id: &'static str,
@@ -101,6 +157,7 @@ impl Model {
             kind,
             efforts: efforts.iter().map(|e| Cow::Borrowed(*e)).collect(),
             is_default,
+            retired: None,
         }
     }
 }
@@ -138,10 +195,12 @@ pub enum Source {
 }
 
 impl Agent {
-    /// The models this agent offers, best first.
+    /// The models this agent offers, best first, followed by the ones it no
+    /// longer offers, marked [`Model::retired`].
     ///
-    /// Advisory: this is not enforced, and it does not tell you what an account
-    /// may actually use. See [`Model`] and [`Agent::models_verified`].
+    /// Advisory apart from the retired entries, which a request may not name.
+    /// It does not tell you what an account may actually use. See [`Model`]
+    /// and [`Agent::models_verified`].
     #[must_use]
     pub fn models(&self) -> Vec<Model> {
         match self {
@@ -150,6 +209,14 @@ impl Agent {
             Agent::Copilot => copilot_models(),
             Agent::Grok => grok_models(),
         }
+    }
+
+    /// The compiled-in entry for `id` if it is retired, `None` for a live
+    /// entry or an id the catalogue does not know.
+    pub(crate) fn retired_model(self, id: &str) -> Option<Model> {
+        self.models()
+            .into_iter()
+            .find(|model| model.id == id && model.is_retired())
     }
 
     /// How this agent's compiled-in catalogue was established, and when.
@@ -195,6 +262,12 @@ impl Agent {
     /// `reactor` drives the child's pipes; the caller keeps its
     /// [`nagoya::reactor::Reactor`] alive until this returns.
     ///
+    /// The retired entries of the compiled-in catalogue are appended after the
+    /// discovered ones, because a CLI lists only what it offers today and a
+    /// picker still has to show and flag an id a host stored before it went.
+    /// An id the CLI lists that the catalogue marks retired is flagged in place
+    /// rather than repeated, since a request naming it is refused either way.
+    ///
     /// # Errors
     /// [`Error::Unsupported`] on an agent with no headless way to answer, which
     /// today is Claude and Copilot. That is deliberately an error rather than a
@@ -204,9 +277,9 @@ impl Agent {
     /// binary is missing, [`Error::Spawn`] if it cannot be run, and
     /// [`Error::Parse`] if its output is not the expected shape.
     pub async fn discover_models(&self, reactor: &nagoya::reactor::Handle) -> Result<Vec<Model>> {
-        match self {
-            Agent::Codex => discover_codex(self.bin(), reactor).await,
-            Agent::Grok => discover_grok(self.bin(), reactor).await,
+        let discovered = match self {
+            Agent::Codex => discover_codex(self.bin(), reactor).await?,
+            Agent::Grok => discover_grok(self.bin(), reactor).await?,
             // Neither can be asked without a terminal, verified against
             // Copilot CLI 1.0.75 and claude 2.1.267. Copilot has no `models`
             // subcommand, rejects an unknown `--model` without listing the valid
@@ -214,12 +287,39 @@ impl Agent {
             // permissions but no models. Claude documents its aliases in
             // `--help` but has no subcommand that enumerates them. In both the
             // interactive `/model` picker is the only listing.
-            Agent::Claude | Agent::Copilot => Err(Error::Unsupported {
-                agent: *self,
-                what: "listing models without a terminal",
-            }),
+            Agent::Claude | Agent::Copilot => {
+                return Err(Error::Unsupported {
+                    agent: *self,
+                    what: "listing models without a terminal",
+                });
+            }
+        };
+        Ok(keep_retired(discovered, self.models()))
+    }
+}
+
+/// Carry the catalogue's retired entries into a discovered list.
+///
+/// Split from the spawn so it can be tested without a subprocess. A discovered
+/// id the catalogue marks retired takes the catalogue's [`Retired`] and loses
+/// any default; the rest are appended in catalogue order. If that took the
+/// default away, the first live entry becomes the default, as discovery itself
+/// does when a CLI names none.
+fn keep_retired(mut discovered: Vec<Model>, catalogue: Vec<Model>) -> Vec<Model> {
+    for entry in catalogue.into_iter().filter(Model::is_retired) {
+        if let Some(listed) = discovered.iter_mut().find(|m| m.id == entry.id) {
+            listed.is_default = false;
+            listed.retired = entry.retired;
+        } else {
+            discovered.push(entry);
         }
     }
+    if !discovered.iter().any(|m| m.is_default)
+        && let Some(first) = discovered.iter_mut().find(|m| !m.is_retired())
+    {
+        first.is_default = true;
+    }
+    discovered
 }
 
 /// Claude, aliases first.
@@ -353,11 +453,8 @@ fn claude_aliases() -> Vec<Model> {
 /// their own names; 2.1.267 refused `claude-opus-5-5` as
 /// `[claude-code:unrecognized_model]`. The rest were run on 2.1.267
 /// (2026-09-23), and `claude-opus-5` again on 2.1.280, reporting 1M.
-/// `claude-fable-5` is left out: it is still accepted,
-/// but its run produced no output of its own and the answer came from
-/// `claude-opus-4-8`, and both the `fable` alias and `best` now resolve to
-/// `claude-fable-5-1`. `claude-haiku-4-5` is replaced by the dated id the
-/// `haiku` alias reports.
+/// `claude-fable-5` is retired, with its evidence next to the entry.
+/// `claude-haiku-4-5` stays beside the dated id the `haiku` alias reports.
 fn claude_pinned() -> Vec<Model> {
     vec![
         // Windows as reported by running each id on claude 2.1.267
@@ -421,6 +518,36 @@ fn claude_pinned() -> Vec<Model> {
             CLAUDE_EFFORTS,
             false,
         ),
+        // Not retired. 0.5.2 swapped it for the dated id above only because
+        // that is what the `haiku` alias reports on claude 2.1.267; the
+        // undated id itself still answers under its own name on 2.1.267
+        // (2026-09-23), so a host that stored it keeps a working model.
+        Model::new(
+            "claude-haiku-4-5",
+            "Claude Haiku 4.5",
+            "The fastest model with near-frontier intelligence (200k context)",
+            Kind::Pinned,
+            CLAUDE_EFFORTS,
+            false,
+        ),
+        // Retired on claude 2.1.267 (2026-09-23). Still accepted by `--model`,
+        // but the run produced no output of its own and the answer came from
+        // `claude-opus-4-8`, while the `fable` alias and `best` both resolve to
+        // `claude-fable-5-1` (also on 2.1.280, 2026-09-24). Running it would
+        // be a quiet wrong answer, so it is refused.
+        Model::new(
+            "claude-fable-5",
+            "Claude Fable 5",
+            "Next-generation intelligence for long-running agents (1M context)",
+            Kind::Pinned,
+            CLAUDE_EFFORTS,
+            false,
+        )
+        .retire(
+            "claude 2.1.267",
+            Some("claude-fable-5-1"),
+            "accepted, but the answer comes from claude-opus-4-8",
+        ),
     ]
 }
 
@@ -433,6 +560,7 @@ fn claude_pinned() -> Vec<Model> {
 /// server-refreshed catalogue on 0.154.0 (the bundled one hid it), so it is
 /// account-dependent. `gpt-5.5` carries an upgrade notice retiring it on
 /// 2026-10-14 in favour of `gpt-5.6-sol`. The descriptions are Codex's own.
+/// Models Codex has stopped listing follow the live ones, marked retired.
 fn codex_models() -> Vec<Model> {
     const FULL: &[&str] = &["low", "medium", "high", "xhigh", "max", "ultra"];
     const TO_MAX: &[&str] = &["low", "medium", "high", "xhigh", "max"];
@@ -501,6 +629,36 @@ fn codex_models() -> Vec<Model> {
             Kind::Pinned,
             TO_XHIGH,
             false,
+        ),
+        // Retired on codex-cli 0.154.0 (2026-09-23): `codex debug models`
+        // stopped listing both, and 0.156.1 does not list them either. Listed
+        // on 0.146.0 (2026-08-07) with these descriptions and levels. Codex
+        // names no successor, so the replacement is its current default.
+        Model::new(
+            "gpt-5.4",
+            "GPT-5.4",
+            "Strong model for everyday coding.",
+            Kind::Pinned,
+            TO_XHIGH,
+            false,
+        )
+        .retire(
+            "codex-cli 0.154.0",
+            Some("gpt-6-astra"),
+            "no longer listed by `codex debug models`",
+        ),
+        Model::new(
+            "gpt-5.4-mini",
+            "GPT-5.4-Mini",
+            "Small, fast, and cost-efficient model for simpler coding tasks.",
+            Kind::Pinned,
+            TO_XHIGH,
+            false,
+        )
+        .retire(
+            "codex-cli 0.154.0",
+            Some("gpt-6-astra"),
+            "no longer listed by `codex debug models`",
         ),
     ]
 }
@@ -660,6 +818,7 @@ fn parse_grok_models(stdout: &str) -> Result<Vec<Model>> {
             kind: Kind::Pinned,
             efforts: GROK_EFFORTS.iter().map(|e| Cow::Borrowed(*e)).collect(),
             is_default,
+            retired: None,
         });
     }
     if models.is_empty() {
@@ -760,6 +919,7 @@ fn parse_codex_models(stdout: &str) -> Result<Vec<Model>> {
                 // Codex names a default reasoning level per model but never a
                 // default model, so the top of its own ordering stands in.
                 is_default: false,
+                retired: None,
             };
             let priority = m
                 .get("priority")
@@ -980,6 +1140,83 @@ mod tests {
             ids.dedup();
             assert_eq!(ids.len(), count, "{agent} has a duplicate model id");
         }
+    }
+
+    /// A retired entry is kept for a picker, never pre-selected.
+    #[test]
+    fn no_retired_entry_is_a_default() {
+        for agent in [Agent::Claude, Agent::Codex, Agent::Copilot, Agent::Grok] {
+            for model in agent.models().iter().filter(|m| m.is_retired()) {
+                assert!(
+                    !model.is_default,
+                    "{agent} marks retired {} as default",
+                    model.id
+                );
+            }
+        }
+    }
+
+    /// Every model a catalogue has dropped is still there, flagged, so a stored
+    /// id keeps its name. `claude-haiku-4-5` still answers as itself and is live.
+    #[test]
+    fn dropped_models_stay_as_retired_entries() {
+        let retired = |agent: Agent| -> Vec<String> {
+            agent
+                .models()
+                .into_iter()
+                .filter(Model::is_retired)
+                .map(|m| m.id.into_owned())
+                .collect()
+        };
+        assert_eq!(retired(Agent::Claude), ["claude-fable-5"]);
+        assert_eq!(retired(Agent::Codex), ["gpt-5.4", "gpt-5.4-mini"]);
+        let haiku = Agent::Claude
+            .models()
+            .into_iter()
+            .find(|m| m.id == "claude-haiku-4-5")
+            .expect("claude-haiku-4-5 should be catalogued");
+        assert!(!haiku.is_retired(), "claude-haiku-4-5 still runs as itself");
+        let fable = Agent::Claude
+            .retired_model("claude-fable-5")
+            .expect("claude-fable-5 is retired");
+        assert_eq!(
+            fable.retired.and_then(|r| r.replacement).as_deref(),
+            Some("claude-fable-5-1")
+        );
+    }
+
+    /// Discovery lists what a CLI offers today; the retired entries follow it,
+    /// after every discovered one, so a picker built from discovery can still
+    /// show and flag a stored id.
+    #[test]
+    fn discovery_keeps_retired_entries() {
+        let discovered = parse_codex_models(CODEX_OUTPUT).expect("should parse");
+        let models = keep_retired(discovered, Agent::Codex.models());
+        let ids: Vec<&str> = models.iter().map(|m| m.id.as_ref()).collect();
+        assert_eq!(ids, ["gpt-5.6-sol", "gpt-5.5", "gpt-5.4", "gpt-5.4-mini"]);
+        assert!(models[..2].iter().all(|m| !m.is_retired()));
+        assert!(models[2..].iter().all(Model::is_retired));
+        assert_eq!(models.iter().filter(|m| m.is_default).count(), 1);
+        assert!(models[0].is_default);
+    }
+
+    /// A CLI listing an id the catalogue retired gets it flagged in place, not
+    /// repeated, and a retired id never keeps the default.
+    #[test]
+    fn discovery_flags_a_listed_retired_id_in_place() {
+        let output = r#"{"models":[
+          {"slug":"gpt-5.4","display_name":"GPT-5.4","visibility":"list","priority":1},
+          {"slug":"gpt-6-astra","display_name":"GPT-6-Astra","visibility":"list","priority":2}
+        ]}"#;
+        let discovered = parse_codex_models(output).expect("should parse");
+        let models = keep_retired(discovered, Agent::Codex.models());
+        let ids: Vec<&str> = models.iter().map(|m| m.id.as_ref()).collect();
+        assert_eq!(ids, ["gpt-5.4", "gpt-6-astra", "gpt-5.4-mini"]);
+        assert!(models[0].is_retired() && !models[0].is_default);
+        assert!(
+            models[1].is_default,
+            "the first live entry takes the default"
+        );
     }
 
     /// The catalogue is a suggestion, not a gate. A model released after this

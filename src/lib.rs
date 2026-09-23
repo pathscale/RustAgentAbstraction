@@ -121,7 +121,7 @@ pub use auth::{AuthState, AuthStatus};
 pub use command::{Command, Commands, Compaction};
 pub use error::{Error, Result};
 pub use event::{Event, MAX_CAPTURE, MAX_EVENT_BYTES, MAX_LINE, TRUNCATION_MARK};
-pub use model::{Kind, Model, Source, Verified};
+pub use model::{Kind, Model, Retired, Source, Verified};
 pub use outcome::{Outcome, RateLimit, Stop, Usage};
 pub use probe::{Probe, Version, VersionStatus};
 pub use request::Request;
