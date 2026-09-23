@@ -157,14 +157,14 @@ impl Agent {
     pub fn models_verified(&self) -> Verified {
         match self {
             // Mixed: the aliases were read from the `/model` picker and every
-            // entry was run on 2.1.267, but the notes come from documentation
+            // entry was run on 2.1.280, but the notes come from documentation
             // and Claude cannot list its models headlessly. `source` records
             // the weakest evidence behind any entry, since that is the one a
             // reader needs to distrust.
             Agent::Claude => Verified {
                 source: Source::Docs,
-                checked: "2026-09-23",
-                against: "claude 2.1.267",
+                checked: "2026-09-24",
+                against: "claude 2.1.280",
             },
             Agent::Codex => Verified {
                 source: Source::Cli,
@@ -342,16 +342,18 @@ fn claude_aliases() -> Vec<Model> {
 /// do not always agree. On claude 2.1.212 (2026-07-29) `--model opus` reported
 /// `claude-opus-4-8` in its usage while `--model claude-opus-5` reported
 /// `claude-opus-5`, even though that release's own notes call Opus 5 "now the
-/// default Opus model". On 2.1.267 (2026-09-23) the two agree again: `opus`
-/// reports `claude-opus-5`, `sonnet` reports `claude-sonnet-5`, `fable` and
-/// `best` report `claude-fable-5-1`, and `haiku` reports
+/// default Opus model". On 2.1.280 (2026-09-24) `opus` and `default` report
+/// `claude-opus-5-5`, `opus[1m]` reports `claude-opus-5-5[1m]`, `sonnet` and
+/// `opusplan` report `claude-sonnet-5`, and `fable` and `best` report
+/// `claude-fable-5-1`. On 2.1.267 `haiku` reported
 /// `claude-haiku-4-5-20251001`. An alias is whatever the account resolves it
 /// to, which is not always the newest model.
 ///
-/// Every id below was run on claude 2.1.267 (2026-09-23) and answered under its
-/// own name. `claude-opus-5-5` was tried and refused as
-/// `[claude-code:unrecognized_model]`, and 2.1.267 carries no such string, so
-/// it is not catalogued. `claude-fable-5` is left out: it is still accepted,
+/// Opus 5.5 ids were run on claude 2.1.280 (2026-09-24) and answered under
+/// their own names; 2.1.267 refused `claude-opus-5-5` as
+/// `[claude-code:unrecognized_model]`. The rest were run on 2.1.267
+/// (2026-09-23), and `claude-opus-5` again on 2.1.280, reporting 1M.
+/// `claude-fable-5` is left out: it is still accepted,
 /// but its run produced no output of its own and the answer came from
 /// `claude-opus-4-8`, and both the `fable` alias and `best` now resolve to
 /// `claude-fable-5-1`. `claude-haiku-4-5` is replaced by the dated id the
@@ -361,7 +363,24 @@ fn claude_pinned() -> Vec<Model> {
         // Windows as reported by running each id on claude 2.1.267
         // (2026-09-23). On 2.1.212 plain `claude-opus-5` reported 200k and
         // needed the suffix; on 2.1.267 it reports 1,000,000 on its own. The
-        // suffixed form stays because it is what `default` resolves to.
+        // suffixed form stays for a caller that pinned it. Opus 5.5 reported
+        // 1,000,000 plain and suffixed on 2.1.280.
+        Model::new(
+            "claude-opus-5-5",
+            "Claude Opus 5.5",
+            "The latest Opus, for complex agentic coding (1M context)",
+            Kind::Pinned,
+            CLAUDE_EFFORTS,
+            false,
+        ),
+        Model::new(
+            "claude-opus-5-5[1m]",
+            "Claude Opus 5.5 (1M context)",
+            "Opus 5.5 with the 1M context window requested explicitly",
+            Kind::Pinned,
+            CLAUDE_EFFORTS,
+            false,
+        ),
         Model::new(
             "claude-opus-5",
             "Claude Opus 5",
