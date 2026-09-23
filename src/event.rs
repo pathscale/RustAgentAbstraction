@@ -1292,6 +1292,15 @@ fn claude_usage(v: &Value, model: Option<&str>) -> Usage {
     // The key is the resolved model name the `init` record announced, verified
     // against claude 2.1.212: asking for `sonnet[1m]`, init says
     // `claude-sonnet-5[1m]` and that exact string keys `modelUsage`.
+    //
+    // `--output-format json`, which a plain run uses, has no `init` record, so
+    // there is often no name at all. When the helper also ran, that left two
+    // entries and nothing to choose by, and a `[1m]` run reported no window
+    // (claude 2.1.267, intermittently, depending on whether the helper ran).
+    // The top-level `usage` is the run's own model: its four counts equal that
+    // model's `modelUsage` entry and not the helper's. So an entry is chosen
+    // by those counts only when exactly one matches; anything else is still
+    // reported as unknown rather than guessed.
     let per_model = v
         .get("modelUsage")
         .and_then(Value::as_object)
@@ -1300,9 +1309,32 @@ fn claude_usage(v: &Value, model: Option<&str>) -> Usage {
                 (Some(entry), _) => Some(entry),
                 // One entry and no name to match: it can only be the run's model.
                 (None, 1) => models.values().next(),
-                // Several entries and no match. Guessing here is how the bug
-                // happened, so the window is reported as unknown instead.
-                (None, _) => None,
+                // Several entries and no name: the one whose counts are the
+                // run's own, if exactly one is.
+                (None, _) => {
+                    let top = v.get("usage");
+                    let count = |value: Option<&Value>, key: &str| {
+                        value.and_then(|u| u.get(key)).and_then(Value::as_u64)
+                    };
+                    let same = |entry: &Value| {
+                        [
+                            ("input_tokens", "inputTokens"),
+                            ("output_tokens", "outputTokens"),
+                            ("cache_read_input_tokens", "cacheReadInputTokens"),
+                            ("cache_creation_input_tokens", "cacheCreationInputTokens"),
+                        ]
+                        .iter()
+                        .all(|(ours, theirs)| {
+                            count(top, ours).is_some()
+                                && count(top, ours) == count(Some(entry), theirs)
+                        })
+                    };
+                    let mut matching = models.values().filter(|entry| same(entry));
+                    match (matching.next(), matching.next()) {
+                        (Some(entry), None) => Some(entry),
+                        _ => None,
+                    }
+                }
             },
         );
     let of_model = |key: &str| per_model.and_then(|m| m.get(key)).and_then(Value::as_u64);
@@ -1676,6 +1708,21 @@ mod tests {
             ],
         );
         assert_eq!(single.usage.context_window, Some(200_000));
+    }
+
+    /// `--output-format json` has no init record, and claude 2.1.267 lists the
+    /// Haiku helper beside the run's model when the helper ran. The run's own
+    /// entry is the one whose counts equal the top-level `usage`.
+    #[test]
+    fn a_json_result_finds_its_model_by_its_own_counts() {
+        let (_, term) = run(
+            Agent::Claude,
+            &[
+                r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","session_id":"s","usage":{"input_tokens":2,"output_tokens":4,"cache_read_input_tokens":27128,"cache_creation_input_tokens":9825},"modelUsage":{"claude-haiku-4-5-20251001":{"inputTokens":521,"outputTokens":12,"cacheReadInputTokens":0,"cacheCreationInputTokens":0,"contextWindow":200000},"claude-sonnet-5[1m]":{"inputTokens":2,"outputTokens":4,"cacheReadInputTokens":27128,"cacheCreationInputTokens":9825,"contextWindow":1000000,"maxOutputTokens":64000}}}"#,
+            ],
+        );
+        assert_eq!(term.usage.context_window, Some(1_000_000));
+        assert_eq!(term.usage.max_output_tokens, Some(64_000));
     }
 
     #[test]
