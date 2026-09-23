@@ -570,6 +570,10 @@ pub fn stream(request: &Request, reactor: &nagoya::reactor::Handle) -> Result<Ru
     // which starts on first use, and I/O goes through the caller's `reactor`,
     // so this cannot fail the way `tokio::spawn` outside a runtime did, and
     // `Error::NoRuntime` is no longer returned.
+    //
+    // `typed_argv` below refuses a retired model too; asking first keeps the
+    // refusal ahead of the session lease and the schema file.
+    request.refuse_retired_model()?;
     let mut request = request.clone();
     let session_lease = if let Some(binding) = &request.binding {
         let lease = binding.store.lease(&binding.project, &binding.name)?;

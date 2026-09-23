@@ -90,6 +90,30 @@ pub enum Error {
         message: String,
     },
 
+    /// The request named a model the agent's catalogue marks retired.
+    ///
+    /// A user state, not a programming mistake: the id was valid once and a
+    /// host may have stored it. Refused rather than run, because a retired id
+    /// can still be accepted and answer as a different model. A host shows
+    /// this as "pick another model", offering [`crate::Retired::replacement`].
+    #[error(
+        "{agent} no longer offers `{model}` (retired since {}: {}); {}",
+        retired.since,
+        retired.reason,
+        match &retired.replacement {
+            Some(replacement) => format!("pick `{replacement}` instead"),
+            None => "pick another model".to_string(),
+        }
+    )]
+    RetiredModel {
+        /// The agent that was asked.
+        agent: Agent,
+        /// The id the request named.
+        model: String,
+        /// Why it was retired, and what replaces it.
+        retired: crate::Retired,
+    },
+
     /// The request asked an agent for something it cannot do headlessly:
     /// forking on Codex, a named session on Copilot, an event stream on an
     /// agent that only prints text.
