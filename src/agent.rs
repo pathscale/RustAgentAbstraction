@@ -373,13 +373,13 @@ impl Agent {
     /// The command that resolves a missing login for this agent.
     ///
     /// Verified against each CLI's own help: Codex and Copilot expose a `login`
-    /// subcommand, while Claude authenticates interactively or through a
-    /// long-lived token.
+    /// subcommand, and so does Claude (`claude auth login`, verified against
+    /// 2.1.267), which also offers `setup-token` for a long-lived token.
     #[must_use]
     pub fn login_hint(self) -> &'static str {
         match self {
             Agent::Claude => {
-                "run `claude` and use /login, or `claude setup-token` for a \
+                "run `claude auth login`, or `claude setup-token` for a \
                               long-lived token"
             }
             Agent::Codex => "run `codex login`",
@@ -397,14 +397,14 @@ impl Agent {
     #[must_use]
     pub fn verified_version(self) -> crate::Version {
         let (major, minor, patch) = match self {
-            // `claude --version` -> "2.1.220 (Claude Code)"
-            Agent::Claude => (2, 1, 220),
-            // `codex --version` -> "codex-cli 0.147.0"
-            Agent::Codex => (0, 147, 0),
-            // `copilot --version` -> "GitHub Copilot CLI 1.0.78."
-            Agent::Copilot => (1, 0, 78),
-            // `grok --version` -> "grok 1.0.30 (04b7ffed98c6) [stable]"
-            Agent::Grok => (1, 0, 30),
+            // `claude --version` -> "2.1.267 (Claude Code)"
+            Agent::Claude => (2, 1, 267),
+            // `codex --version` -> "codex-cli 0.154.0"
+            Agent::Codex => (0, 154, 0),
+            // `copilot --version` -> "GitHub Copilot CLI 1.0.88."
+            Agent::Copilot => (1, 0, 88),
+            // `grok --version` -> "grok 1.0.40 (eb1a2256660d)"
+            Agent::Grok => (1, 0, 40),
         };
         crate::Version {
             major,
@@ -540,7 +540,11 @@ impl Agent {
             },
             // `codex exec --json` emits `thread_id`; interactive turns use the
             // app-server protocol, which exposes steering and approvals.
-            // Continuation remains linear (`codex fork` is TUI-only).
+            // Continuation remains linear here. codex-cli 0.154.0 does have a
+            // headless `codex exec fork <SESSION_ID>` (and app-server
+            // `thread/fork`), but this crate does not drive it yet, so `fork`
+            // stays false and a fork request is `Error::Unsupported` rather
+            // than a silent linear resume.
             Agent::Codex => Caps {
                 session: SessionSupport::Printed,
                 fork: false,
@@ -939,7 +943,8 @@ fn argv_claude(plan: &Plan) -> Vec<Arg> {
     }
     if plan.format == Format::Stream {
         // Claude refuses `-p --output-format stream-json` without it:
-        // "--print with --output-format=stream-json requires --verbose".
+        // "Error: When using --print, --output-format=stream-json requires
+        // --verbose" (claude 2.1.267).
         a.bare("--verbose");
         // Without this Claude emits only *completed* messages, so text arrives
         // a paragraph at a time. With it, `stream_event` records carry the
@@ -1017,11 +1022,32 @@ fn argv_codex(plan: &Plan) -> Vec<Arg> {
     if let Some(effort) = plan.effort.as_ref() {
         a.pair("-c", format!("model_reasoning_effort={effort}"));
     }
-    // Verified against codex-cli 0.146.0. Options remain options after the
-    // positional prompt, but keeping roots before it makes the command's
-    // security posture readable and matches the CLI's help shape.
-    for dir in &plan.extra_dirs {
-        a.pair("--add-dir", dir);
+    // Verified against codex-cli 0.154.0. `codex exec` takes `--add-dir`, but
+    // `codex exec resume` refuses it ("unexpected argument '--add-dir'"), the
+    // same way it refuses `--sandbox`. A resumed run carries the roots through
+    // the config key `--add-dir` sets, so resuming with extra directories no
+    // longer fails before the agent starts. JSON string encoding is a valid
+    // TOML basic string, so each path is quoted and escaped the same way.
+    // Keeping roots before the prompt makes the security posture readable.
+    if resuming {
+        if !plan.extra_dirs.is_empty() {
+            let roots: Vec<String> = plan
+                .extra_dirs
+                .iter()
+                .map(|dir| serde_json::Value::from(dir.as_str()).to_string())
+                .collect();
+            a.pair(
+                "-c",
+                format!(
+                    "sandbox_workspace_write.writable_roots=[{}]",
+                    roots.join(",")
+                ),
+            );
+        }
+    } else {
+        for dir in &plan.extra_dirs {
+            a.pair("--add-dir", dir);
+        }
     }
     // Codex reads the schema from a file, which the runner writes before the
     // spawn. `Request::argv` has no file to name, so it shows a placeholder:
@@ -1082,11 +1108,13 @@ fn argv_copilot(plan: &Plan) -> Vec<Arg> {
     };
 
     a.opt("--model", plan.model.as_ref());
-    // Verified against Copilot CLI 1.0.78: `--effort` is the documented spelling
-    // and `--reasoning-effort` its alias (none, minimal, low, medium, high,
-    // xhigh, max). A wider set than Claude's, which is why the level is passed
-    // through rather than mapped to a shared enum.
-    a.opt("--effort", plan.effort.as_ref());
+    // Verified against Copilot CLI 1.0.88: `--reasoning-effort` is now the
+    // documented spelling (none, minimal, low, medium, high, xhigh, max).
+    // `--effort`, documented in 1.0.78, still parses but is gone from `--help`,
+    // so the documented flag is the one passed. A wider set than Claude's,
+    // which is why the level is passed through rather than mapped to a shared
+    // enum.
+    a.opt("--reasoning-effort", plan.effort.as_ref());
     // One flag serves both directions: it sets the UUID for a new session and
     // resumes an existing one by id.
     match &plan.cont {
@@ -1362,7 +1390,10 @@ mod tests {
         assert_eq!(claude[pos(&claude, "--effort").unwrap() + 1], "xhigh");
 
         let copilot = argv(Agent::Copilot, &p);
-        assert_eq!(copilot[pos(&copilot, "--effort").unwrap() + 1], "xhigh");
+        assert_eq!(
+            copilot[pos(&copilot, "--reasoning-effort").unwrap() + 1],
+            "xhigh"
+        );
 
         let codex = argv(Agent::Codex, &p);
         assert!(
@@ -1384,6 +1415,7 @@ mod tests {
         for agent in [Agent::Claude, Agent::Codex, Agent::Copilot] {
             let a = argv(agent, &p);
             assert!(pos(&a, "--effort").is_none(), "{agent}: {a:?}");
+            assert!(pos(&a, "--reasoning-effort").is_none(), "{agent}: {a:?}");
             assert!(
                 !a.iter()
                     .any(|arg| arg.starts_with("model_reasoning_effort")),
@@ -1493,6 +1525,31 @@ mod tests {
         let a = argv(Agent::Codex, &p);
         assert_eq!(a[0..4], ["codex", "exec", "resume", "thread-9"]);
         assert_eq!(a.last().unwrap(), "hi");
+    }
+
+    /// codex-cli 0.154.0 refuses `--add-dir` on `exec resume`, so a resumed
+    /// run carries its roots in the config key instead, TOML-quoted.
+    #[test]
+    fn codex_resume_carries_extra_roots_as_config_not_add_dir() {
+        let mut p = plan("codex");
+        p.cont = Continue::Resume("thread-9".into());
+        p.extra_dirs = vec!["/repo".into(), "/with \"quote\"".into()];
+        let a = argv(Agent::Codex, &p);
+        assert!(!a.contains(&"--add-dir".to_string()), "{a:?}");
+        let at = a
+            .iter()
+            .position(|arg| arg.starts_with("sandbox_workspace_write.writable_roots="))
+            .expect("the roots ride a config override");
+        assert_eq!(a[at - 1], "-c");
+        assert_eq!(
+            a[at],
+            r#"sandbox_workspace_write.writable_roots=["/repo","/with \"quote\""]"#
+        );
+
+        // A fresh exec still takes the flag.
+        p.cont = Continue::New;
+        let fresh = argv(Agent::Codex, &p);
+        assert!(fresh.contains(&"--add-dir".to_string()), "{fresh:?}");
     }
 
     /// `Minimal` exists to withhold secrets, so nothing it passes through may

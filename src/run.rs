@@ -2473,7 +2473,7 @@ mod tests {
             panic!("expected NotAuthenticated, got {err:?}")
         };
         assert_eq!(*agent, Agent::Claude);
-        assert!(hint.contains("/login"), "{hint}");
+        assert!(hint.contains("claude auth login"), "{hint}");
         assert!(err.is_auth_failure());
     }
 
