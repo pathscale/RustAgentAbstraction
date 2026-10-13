@@ -34,6 +34,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Read the version being released
         id: version
@@ -107,6 +109,8 @@ jobs:
       # Still ordered after the publish, so a tag never points at a version
       # that failed to go out.
       - name: Tag the release
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           tag="v${{ steps.version.outputs.version }}"
           if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
@@ -119,4 +123,4 @@ jobs:
           git config user.name  'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git tag -a "$tag" -m "$tag"
-          git push origin "$tag"
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" "$tag"
