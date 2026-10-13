@@ -26,6 +26,8 @@ jobs:
     runs-on: ${{ vars.UBICLOUD_RUNNER || 'ubicloud-standard-2-arm' }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install the toolchain
         uses: dtolnay/rust-toolchain@stable
