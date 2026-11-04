@@ -1,7 +1,7 @@
 name: CI
 
 on:
-  pull_request:
+  workflow_dispatch:
 
 # A force-push replaces the code under review, so the old run has no decision
 # left to make. Cancel it instead of billing two runners for the same PR.

@@ -8,10 +8,6 @@ name: Publish
 # already there. That makes an accidental re-run a no-op rather than a failure,
 # and means a merge that does not touch the version publishes nothing.
 on:
-  push:
-    branches: [master]
-    # Only the manifest carries the version, so nothing else can trigger this.
-    paths: ["Cargo.toml"]
   # For re-running after fixing a missing token, without an empty commit.
   workflow_dispatch:
 
