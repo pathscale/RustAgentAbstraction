@@ -656,16 +656,15 @@ impl Protocol {
             "usage_update" | "turn_completed" => {
                 // Grok puts the turn's usage on `_x.ai/session/update`
                 // `turn_completed`, not on ACP `usage_update` and not as
-                // `costUsd`. Ticks are 1e-9 USD (session 1.626e9 ticks ≈ $1.63).
+                // `costUsd`.
                 let payload = update.get("usage").unwrap_or(&update);
                 let usage = grok_usage(payload);
                 self.terminal.usage.accumulate(&usage);
                 vec![Event::Usage(usage)]
             }
             "auto_compact_completed" => {
-                // Live occupancy after Grok's own compact. Session 01a09ca7:
-                // `tokens_before` 179_555 / `tokens_after` 10_201 — not the
-                // turn's billed `totalTokens`.
+                // Use the post-compact window occupancy, not the turn's billed
+                // `totalTokens`.
                 let after = update
                     .get("tokens_after")
                     .or_else(|| update.get("tokensAfter"))
@@ -695,6 +694,11 @@ impl Protocol {
         };
         let params = value.get("params").unwrap_or(&Value::Null);
         let tool_call = params.get("toolCall").unwrap_or(params);
+        let tool_call_id = tool_call
+            .get("toolCallId")
+            .or_else(|| tool_call.get("tool_call_id"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
         let tool = tool_name(tool_call);
         let input = tool_call
             .get("rawInput")
@@ -714,15 +718,21 @@ impl Protocol {
                 options,
             },
         );
-        // Auto/Bypass must answer on the ACP pipe. Grok still emits
-        // `session/request_permission` for writes outside the workspace
-        // (session 01a09ca7: `~/.grok/config.toml` sat 30 minutes). Leaving
-        // the question for the host — and then not auto-answering it —
-        // stalls the turn until APPROVAL_TIMEOUT.
-        if matches!(
-            self.request.permission,
-            Permission::Auto | Permission::Bypass
-        ) {
+        // Auto/Bypass must answer on the ACP pipe. Grok can still emit
+        // `session/request_permission` for actions it considers outside the
+        // workspace. Auto denies that escalation; Bypass retains unattended
+        // allow behavior. Leaving either question unanswered stalls the turn.
+        if matches!(self.request.permission, Permission::Auto) {
+            return PermissionStep {
+                event: Some(Event::ToolResult {
+                    id: tool_call_id,
+                    ok: Some(false),
+                    output: "Grok Auto permission escalation denied".into(),
+                }),
+                write: self.respond(&key, &Decision::deny()),
+            };
+        }
+        if matches!(self.request.permission, Permission::Bypass) {
             return PermissionStep {
                 event: None,
                 write: self.respond(&key, &Decision::Allow),
@@ -782,8 +792,7 @@ impl Protocol {
 
     pub fn respond(&mut self, id: &str, decision: &Decision) -> Option<String> {
         let pending = self.pending.remove(id)?;
-        let option_id = pick_option(&pending.options, decision)
-            .or_else(|| matches!(decision, Decision::Allow).then(|| "allow-once".to_string()));
+        let option_id = pick_option(&pending.options, decision);
         let result = match option_id {
             Some(option_id) => json!({
                 "outcome": { "outcome": "selected", "optionId": option_id }
@@ -1138,8 +1147,8 @@ fn grok_usage(usage: &Value) -> Usage {
                     value.as_u64().map(|n| n as f64)
                 })
             })
-            // CLI `costUsdTicks` is 1e-9 USD (session 01a09ca7: 1.644e9 ticks).
-            // xAI API `cost_in_usd_ticks` is 1e-10; do not mix the two.
+            // CLI `costUsdTicks` is 1e-9 USD. The xAI API's
+            // `cost_in_usd_ticks` is 1e-10; do not mix the two.
             .map(|ticks| ticks / 1_000_000_000.0)
             .or_else(|| usage.get("cost").and_then(Value::as_f64))
             .or_else(|| usage.get("costUsd").and_then(Value::as_f64)),
@@ -1149,12 +1158,11 @@ fn grok_usage(usage: &Value) -> Usage {
 
 /// Live window fill, never the turn's billed sum.
 ///
-/// `turn_completed.usage.totalTokens` / `inputTokens` are billed sums.
-/// A 1-call compact or notes pass reports the *old* window as `inputTokens`
-/// (session 01a09ca7: 264k after compact, live fill 29k). Treating that as
-/// occupancy made the next prompt look like 260k and re-trigger cliff
-/// steers. Occupancy is only `used` / `contextTokensUsed` on the payload,
-/// `_x.ai/session/info`, or `auto_compact_completed.tokens_after`.
+/// `turn_completed.usage.totalTokens` / `inputTokens` are billed sums. A
+/// single-call compact or notes pass can report the *old* window as
+/// `inputTokens`, so it is not reliable occupancy. Occupancy comes only from
+/// `used` / `contextTokensUsed` on the payload, `_x.ai/session/info`, or
+/// `auto_compact_completed.tokens_after`.
 fn grok_occupancy(usage: &Value, window: u64) -> Option<u64> {
     let num = |camel: &str, snake: &str| {
         usage
@@ -1200,8 +1208,8 @@ fn pick_option(options: &Value, decision: &Decision) -> Option<String> {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_ascii_lowercase();
-        let allow = kind.contains("allow") || kind.contains("approve");
-        let deny = kind.contains("reject") || kind.contains("deny");
+        let allow = kind == "allow_once";
+        let deny = kind == "reject_once";
         if want_allow && allow || !want_allow && deny {
             return id_of(entry);
         }
@@ -1329,23 +1337,23 @@ mod tests {
                 "update": {
                     "sessionUpdate": "turn_completed",
                     "usage": {
-                        "inputTokens": 18033,
-                        "outputTokens": 189,
+                        "inputTokens": 1200,
+                        "outputTokens": 10,
                         "cachedReadTokens": 0,
-                        "costUsdTicks": 126_480_000
+                        "costUsdTicks": 250_000_000
                     }
                 }
             }
         }));
         match events.as_slice() {
             [Event::Usage(usage)] => {
-                assert_eq!(usage.input_tokens, Some(18033));
-                assert_eq!(usage.output_tokens, Some(189));
+                assert_eq!(usage.input_tokens, Some(1200));
+                assert_eq!(usage.output_tokens, Some(10));
                 // Billed input is not occupancy; session/info supplies that.
                 assert_eq!(usage.context_tokens, None);
                 assert_eq!(usage.context_window, Some(500_000));
                 let cost = usage.cost_usd.expect("ticks convert");
-                assert!((cost - 0.12648).abs() < 1e-9);
+                assert!((cost - 0.25).abs() < 1e-9);
             }
             other => panic!("expected Usage, got {other:?}"),
         }
@@ -1353,34 +1361,33 @@ mod tests {
 
     #[test]
     fn grok_usage_uses_occupancy_not_turn_aggregate() {
-        // Session 01a09ca7 turn 1: billed input includes cache; live context
-        // was 71,933. totalTokens 593,447 is the in-turn sum and must not
-        // become context_tokens.
+        // Billed input includes cache. Only the explicit `used` field supplies
+        // live context, not the in-turn `totalTokens` sum.
         let usage = grok_usage(&json!({
-            "inputTokens": 579_290,
-            "outputTokens": 1_644,
-            "cachedReadTokens": 506_624,
-            "totalTokens": 593_447,
-            "used": 71_933,
-            "costUsdTicks": 1_644_192_400u64
+            "inputTokens": 1_300,
+            "outputTokens": 40,
+            "cachedReadTokens": 300,
+            "totalTokens": 1_999,
+            "used": 250,
+            "costUsdTicks": 1_250_000_000u64
         }));
-        assert_eq!(usage.input_tokens, Some(72_666));
-        assert_eq!(usage.cache_read_tokens, Some(506_624));
-        assert_eq!(usage.context_tokens, Some(71_933));
+        assert_eq!(usage.input_tokens, Some(1_000));
+        assert_eq!(usage.cache_read_tokens, Some(300));
+        assert_eq!(usage.context_tokens, Some(250));
         assert_eq!(usage.context_window, Some(500_000));
         let cost = usage.cost_usd.expect("ticks convert");
-        assert!((cost - 1.644_192_4).abs() < 1e-9);
+        assert!((cost - 1.25).abs() < 1e-9);
     }
 
     #[test]
     fn grok_usage_leaves_context_unset_without_occupancy() {
         let usage = grok_usage(&json!({
-            "inputTokens": 579_290,
-            "cachedReadTokens": 506_624,
-            "totalTokens": 593_447,
+            "inputTokens": 1_300,
+            "cachedReadTokens": 300,
+            "totalTokens": 1_999,
             "modelCalls": 12
         }));
-        assert_eq!(usage.input_tokens, Some(72_666));
+        assert_eq!(usage.input_tokens, Some(1_000));
         assert_eq!(usage.context_tokens, None);
         assert_eq!(usage.context_window, Some(500_000));
     }
@@ -1389,10 +1396,10 @@ mod tests {
     fn grok_usage_one_call_input_is_not_occupancy() {
         // Compact/learn are 1-call turns whose input is the old window.
         let usage = grok_usage(&json!({
-            "inputTokens": 264_675,
-            "outputTokens": 2_045,
+            "inputTokens": 2_400,
+            "outputTokens": 50,
             "cachedReadTokens": 0,
-            "totalTokens": 266_720,
+            "totalTokens": 2_450,
             "modelCalls": 1
         }));
         assert_eq!(usage.context_tokens, None);
@@ -1401,12 +1408,12 @@ mod tests {
 
     #[test]
     fn grok_usage_rejects_billed_sum_as_occupancy() {
-        // Session 01a09ca7 turn 4: 65 calls, 7.6M billed, live context ~180k.
+        // Several billed model calls do not provide an exact current occupancy.
         let usage = grok_usage(&json!({
-            "inputTokens": 7_588_418,
-            "cachedReadTokens": 7_292_032,
-            "totalTokens": 7_641_353,
-            "modelCalls": 65
+            "inputTokens": 9_500,
+            "cachedReadTokens": 8_100,
+            "totalTokens": 11_000,
+            "modelCalls": 6
         }));
         assert_eq!(usage.context_tokens, None);
         assert_eq!(usage.context_window, Some(500_000));
@@ -1421,8 +1428,8 @@ mod tests {
             "params": {
                 "update": {
                     "sessionUpdate": "auto_compact_completed",
-                    "tokens_before": 179_555,
-                    "tokens_after": 10_201
+                    "tokens_before": 1_200,
+                    "tokens_after": 250
                 }
             }
         }));
@@ -1435,7 +1442,7 @@ mod tests {
         )));
         match events.iter().find(|event| matches!(event, Event::Usage(_))) {
             Some(Event::Usage(usage)) => {
-                assert_eq!(usage.context_tokens, Some(10_201));
+                assert_eq!(usage.context_tokens, Some(250));
                 assert_eq!(usage.context_window, Some(500_000));
             }
             other => panic!("expected Usage after compact, got {other:?}"),
@@ -1443,7 +1450,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_answers_permission_without_asking_the_host() {
+    fn auto_denies_permission_escalation_without_asking_the_host() {
         let mut p = protocol();
         p.session_id = Some("sess-1".into());
         let step = p.push(&json!({
@@ -1451,21 +1458,95 @@ mod tests {
             "id": 99,
             "method": "session/request_permission",
             "params": {
-                "toolCall": { "title": "search_replace", "rawInput": { "path": "/Users/revenge/.grok/config.toml" } },
+                "toolCall": { "toolCallId": "tool-1", "title": "search_replace", "rawInput": { "path": "/home/example/.grok/config.toml" } },
                 "options": [
                     { "optionId": "allow-once", "kind": "allow_once" },
                     { "optionId": "reject-once", "kind": "reject_once" }
                 ]
             }
         }));
-        assert!(
-            step.events.is_empty(),
-            "Auto must not surface an approval card"
-        );
+        assert!(matches!(
+            step.events.as_slice(),
+            [Event::ToolResult { id: Some(id), ok: Some(false), output }]
+                if id == "tool-1" && output == "Grok Auto permission escalation denied"
+        ));
         assert_eq!(step.writes.len(), 1);
         assert!(step.writes[0].contains("\"id\":99"));
-        assert!(step.writes[0].contains("allow-once"));
+        assert!(step.writes[0].contains("reject-once"));
+        assert!(!step.writes[0].contains("allow-once"));
+        assert!(!step.writes[0].contains("/home/example/.grok/config.toml"));
         assert!(!step.writes[0].contains("cancelled"));
+    }
+
+    #[test]
+    fn bypass_still_allows_permission_escalation() {
+        let mut p = Protocol::new(Request::new(Agent::Grok, "hi").permission(Permission::Bypass));
+        let step = p.push(&json!({
+            "jsonrpc": "2.0",
+            "id": 100,
+            "method": "session/request_permission",
+            "params": {
+                "toolCall": { "title": "search_replace", "rawInput": { "path": "/outside/file" } },
+                "options": [
+                    { "optionId": "allow-once", "kind": "allow_once" },
+                    { "optionId": "reject-once", "kind": "reject_once" }
+                ]
+            }
+        }));
+
+        assert!(step.events.is_empty());
+        assert_eq!(step.writes.len(), 1);
+        assert!(step.writes[0].contains("allow-once"));
+        assert!(!step.writes[0].contains("reject-once"));
+    }
+
+    #[test]
+    fn permission_options_require_exact_one_time_kinds() {
+        let options = json!([
+            { "optionId": "allow-always", "kind": "allow_always" },
+            { "optionId": "allow-once", "kind": "allow_once" },
+            { "optionId": "reject-always", "kind": "reject_always" },
+            { "optionId": "reject-once", "kind": "reject_once" }
+        ]);
+        assert_eq!(
+            pick_option(&options, &Decision::Allow).as_deref(),
+            Some("allow-once")
+        );
+        assert_eq!(
+            pick_option(&options, &Decision::deny()).as_deref(),
+            Some("reject-once")
+        );
+        assert_eq!(
+            pick_option(
+                &json!([{ "optionId": "allow-always", "kind": "allow_always" }]),
+                &Decision::Allow
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn unknown_allow_option_cancels_instead_of_fabricating_an_id() {
+        let mut p = Protocol::new(Request::new(Agent::Grok, "hi").permission(Permission::Edit));
+        let step = p.push(&json!({
+            "jsonrpc": "2.0",
+            "id": 101,
+            "method": "session/request_permission",
+            "params": {
+                "toolCall": { "title": "search_replace" },
+                "options": [{ "optionId": "allow-always", "kind": "allow_always" }]
+            }
+        }));
+        let Event::ApprovalRequest(approval) = &step.events[0] else {
+            panic!("expected approval request")
+        };
+
+        let response = p
+            .respond(&approval.id, &Decision::Allow)
+            .expect("permission response");
+        let response: Value = serde_json::from_str(&response).expect("valid JSON response");
+        assert_eq!(response["result"]["outcome"]["outcome"], "cancelled");
+        assert!(response["result"]["outcome"].get("optionId").is_none());
     }
 
     #[test]
@@ -1475,14 +1556,14 @@ mod tests {
             "id": 5,
             "result": {
                 "config": {
-                    "creditUsagePercent": 41.0,
-                    "billingPeriodEnd": "2026-09-20T11:48:54Z"
+                    "creditUsagePercent": 27.5,
+                    "billingPeriodEnd": "2030-01-02T03:04:05Z"
                 },
                 "subscription_tier": "SuperGrok Plus"
             }
         }))
         .expect("percent present");
-        assert_eq!(limit.used_percent, Some(41.0));
+        assert_eq!(limit.used_percent, Some(27.5));
         assert_eq!(limit.window.as_deref(), Some("weekly"));
         assert!(!limit.is_blocking());
     }

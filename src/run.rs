@@ -156,7 +156,6 @@ enum Control {
 /// joined. Use [`Run::cancel`] when you need to know the tree has actually gone
 /// before continuing, such as before touching the files it was working on. On
 /// Windows only the direct child is signalled.
-#[derive(Debug)]
 pub struct Run {
     events: mpsc::Receiver<Event>,
     /// A cloneable route back into the run. Kept separate from the event
@@ -179,6 +178,12 @@ pub struct Run {
     /// was already settled deliberately.
     task: Option<Caught<Result<Outcome>>>,
     argv: Vec<String>,
+}
+
+impl std::fmt::Debug for Run {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Run").finish_non_exhaustive()
+    }
 }
 
 /// A cloneable route for sending input to a live [`Run`].
@@ -813,12 +818,6 @@ impl SchemaFile {
 /// Whether an environment variable name identifies a credential rather than a
 /// generic setting such as `BASE_URL`, `RPC_URL`, or a public username.
 fn is_credential_environment_name(name: &std::ffi::OsStr) -> bool {
-    let name = name.to_string_lossy().to_ascii_uppercase();
-    let parts = name
-        .split(|character: char| !character.is_ascii_alphanumeric())
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>();
-
     const CREDENTIAL_PARTS: &[&str] = &[
         "PASSWORD",
         "PASSWD",
@@ -832,6 +831,13 @@ fn is_credential_environment_name(name: &std::ffi::OsStr) -> bool {
         "SESSION",
         "AUTHORIZATION",
     ];
+
+    let name = name.to_string_lossy().to_ascii_uppercase();
+    let parts = name
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+
     if parts.iter().any(|part| CREDENTIAL_PARTS.contains(part)) {
         return true;
     }
@@ -2372,8 +2378,8 @@ mod tests {
     #[test]
     fn credential_values_in_schema_are_rejected_before_file_creation() {
         let directory = fresh_temp_dir("schema-secret");
-        let env = environment(&[("OPENAI_API_KEY", "sk-live-credential-value-123")]);
-        let schema = r#"{"enum":["prefix-sk-live-credential-value-123-suffix"]}"#;
+        let env = environment(&[("OPENAI_API_KEY", "dummy-token-with-letters-123")]);
+        let schema = r#"{"enum":["prefix-dummy-token-with-letters-123-suffix"]}"#;
 
         let error = match SchemaFile::write_with_environment(schema, &directory, env) {
             Err(error) => error,
@@ -3040,6 +3046,38 @@ mod tests {
             "{safe:?}"
         );
         assert!(safe.contains(&"resume".to_string()));
+    }
+
+    #[test]
+    fn request_and_run_debug_omit_prompts_argv_and_environment_values() {
+        let prompt = "confidential request prompt";
+        let secret = "env-secret-value-123456";
+        let request = crate::Request::new(Agent::Claude, prompt).env("API_TOKEN", secret);
+        let request_debug = format!("{request:?}");
+        assert!(!request_debug.contains(prompt));
+        assert!(!request_debug.contains(secret));
+
+        let argv_secret = "unredacted-argv-value";
+        let (_, events) = event_channel();
+        let run = Run {
+            events,
+            control: RunControl {
+                agent: Agent::Claude,
+                to_agent: None,
+                bin: "claude".into(),
+            },
+            typed: vec![crate::agent::Arg {
+                value: argv_secret.into(),
+                sensitivity: crate::agent::Sensitivity::Unchecked,
+            }],
+            pid: None,
+            reaped: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            cancel: None,
+            task: None,
+            argv: vec![argv_secret.into()],
+        };
+        let run_debug = format!("{run:?}");
+        assert!(!run_debug.contains(argv_secret));
     }
 
     /// `stream` is synchronous but spawns a task. Under tokio that needed an

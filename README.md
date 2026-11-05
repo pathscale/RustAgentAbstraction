@@ -498,6 +498,10 @@ settings in place.
 
 The default is `ReadOnly`. Widen it explicitly.
 
+Grok uses ACP permission requests instead of the CLI flags in this table. `Auto` denies
+permission escalations the provider sends to the host, while `Bypass` grants them. In other
+postures, requests are surfaced only when the caller enabled approvals.
+
 Use `Request::cwd` for the primary workspace and repeat `Request::add_dir` for repositories
 or folders the agent also needs to edit. The mapping stays provider-neutral: Claude and
 ordinary Codex runs receive `--add-dir`, while interactive Codex runs receive the same paths

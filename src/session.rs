@@ -503,6 +503,12 @@ const MAX_STEM: usize = 200;
 fn encode_segment(name: &str) -> String {
     use std::fmt::Write as _;
 
+    if name == "." {
+        return "%2E".into();
+    }
+    if name == ".." {
+        return "%2E%2E".into();
+    }
     let mut out = String::with_capacity(name.len());
     for byte in name.bytes() {
         if byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_' | b'.')
@@ -589,6 +595,25 @@ mod tests {
             "token leaked through Debug: {debug}"
         );
         assert!(debug.contains("[REDACTED]"), "missing redaction: {debug}");
+    }
+
+    #[test]
+    fn dot_only_project_segments_cannot_escape_the_store() {
+        let (session_store, _) = store("dot-path");
+        assert_eq!(encode_segment("."), "%2E");
+        assert_eq!(encode_segment(".."), "%2E%2E");
+        assert_ne!(encode_segment(".."), encode_segment("%2E%2E"));
+
+        let path = session_store.path_of(Path::new(".."), "chat");
+        assert!(
+            path.starts_with(&session_store.dir),
+            "path escaped: {}",
+            path.display()
+        );
+        assert!(!path.components().any(|component| matches!(
+            component,
+            std::path::Component::CurDir | std::path::Component::ParentDir
+        )));
     }
 
     #[test]
