@@ -462,6 +462,10 @@ impl Protocol {
             PendingApproval::Permissions { rpc_id, requested } => (
                 rpc_id,
                 if allow {
+                    // Verified against codex-cli 0.166.0's app-server v2
+                    // schema: both `turn` and `session` are accepted. A
+                    // Decision::Allow authorizes this approval only, so keep
+                    // the grant scoped to the current turn.
                     json!({"permissions": requested, "scope": "turn"})
                 } else {
                     json!({"permissions": {}, "scope": "turn"})

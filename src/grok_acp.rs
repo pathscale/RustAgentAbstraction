@@ -694,11 +694,6 @@ impl Protocol {
         };
         let params = value.get("params").unwrap_or(&Value::Null);
         let tool_call = params.get("toolCall").unwrap_or(params);
-        let tool_call_id = tool_call
-            .get("toolCallId")
-            .or_else(|| tool_call.get("tool_call_id"))
-            .and_then(Value::as_str)
-            .map(str::to_string);
         let tool = tool_name(tool_call);
         let input = tool_call
             .get("rawInput")
@@ -721,14 +716,14 @@ impl Protocol {
         // Auto/Bypass must answer on the ACP pipe. Grok can still emit
         // `session/request_permission` for actions it considers outside the
         // workspace. Auto denies that escalation; Bypass retains unattended
-        // allow behavior. Leaving either question unanswered stalls the turn.
+        // allow behavior. The xAI Grok Build docs, checked with local grok
+        // 1.0.41, say Auto may prompt for dangerous tools while Always-approve
+        // skips prompts. Leaving either question unanswered stalls the turn.
         if matches!(self.request.permission, Permission::Auto) {
             return PermissionStep {
-                event: Some(Event::ToolResult {
-                    id: tool_call_id,
-                    ok: Some(false),
-                    output: "Grok Auto permission escalation denied".into(),
-                }),
+                // This is a permission RPC, not a tool result. Let the agent's
+                // subsequent session update report the tool-call outcome.
+                event: None,
                 write: self.respond(&key, &Decision::deny()),
             };
         }
@@ -1203,8 +1198,6 @@ fn pick_option(options: &Value, decision: &Decision) -> Option<String> {
     for entry in entries {
         let kind = entry
             .get("kind")
-            .or_else(|| entry.get("optionId"))
-            .or_else(|| entry.get("option_id"))
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_ascii_lowercase();
@@ -1465,11 +1458,7 @@ mod tests {
                 ]
             }
         }));
-        assert!(matches!(
-            step.events.as_slice(),
-            [Event::ToolResult { id: Some(id), ok: Some(false), output }]
-                if id == "tool-1" && output == "Grok Auto permission escalation denied"
-        ));
+        assert!(step.events.is_empty());
         assert_eq!(step.writes.len(), 1);
         assert!(step.writes[0].contains("\"id\":99"));
         assert!(step.writes[0].contains("reject-once"));
@@ -1504,17 +1493,17 @@ mod tests {
     fn permission_options_require_exact_one_time_kinds() {
         let options = json!([
             { "optionId": "allow-always", "kind": "allow_always" },
-            { "optionId": "allow-once", "kind": "allow_once" },
+            { "optionId": "opaque-grant-id", "kind": "allow_once" },
             { "optionId": "reject-always", "kind": "reject_always" },
-            { "optionId": "reject-once", "kind": "reject_once" }
+            { "optionId": "opaque-reject-id", "kind": "reject_once" }
         ]);
         assert_eq!(
             pick_option(&options, &Decision::Allow).as_deref(),
-            Some("allow-once")
+            Some("opaque-grant-id")
         );
         assert_eq!(
             pick_option(&options, &Decision::deny()).as_deref(),
-            Some("reject-once")
+            Some("opaque-reject-id")
         );
         assert_eq!(
             pick_option(
@@ -1522,6 +1511,14 @@ mod tests {
                 &Decision::Allow
             ),
             None
+        );
+        assert_eq!(
+            pick_option(
+                &json!([{ "optionId": "allow-once" }]),
+                &Decision::Allow
+            ),
+            None,
+            "an option id is opaque and cannot substitute for its kind"
         );
     }
 
