@@ -287,6 +287,15 @@ its own field, Codex reads it from a file this crate writes and removes, and ret
 value as its answer text. **Copilot 1.0.78 has no schema support at all**, so asking is an
 `Error::Unsupported` rather than prose dressed up as data.
 
+The temporary Codex schema is created with owner-only permissions on Unix and removed when
+the run ends. Before writing it, the runner checks for values from exported environment
+variables whose names identify credentials, including passwords, tokens, secrets, session
+handles, and common API or access keys. It rejects complete JSON string values and embedded
+values when they are at least eight characters long. Shorter values are ignored to avoid
+matching common schema literals. This is a narrow persistence guard, not a general secret
+scanner: it does not inspect credential files, non-exported shell variables, prompts, other
+request fields, or transformed/encoded values. Do not put credentials in a schema.
+
 **Write schemas strictly.** Codex sends yours to OpenAI's structured-output API, which
 requires `"additionalProperties": false` on every object and every property in `required`.
 Without it the request fails with a 400 before the model runs. Claude is more forgiving, so

@@ -772,11 +772,26 @@ struct SchemaFile(std::path::PathBuf);
 impl SchemaFile {
     /// Write `schema` somewhere the agent can read it.
     fn write(schema: &str) -> std::io::Result<SchemaFile> {
+        Self::write_with_environment(schema, &std::env::temp_dir(), std::env::vars_os())
+    }
+
+    fn write_with_environment(
+        schema: &str,
+        directory: &std::path::Path,
+        environment: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+    ) -> std::io::Result<SchemaFile> {
         use std::io::Write as _;
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
 
-        let path = std::env::temp_dir().join(format!(
+        if contains_sensitive_environment_value(schema, environment) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "schema contains a value from a credential environment variable",
+            ));
+        }
+
+        let path = directory.join(format!(
             "agent-abstraction-schema-{}-{}.json",
             std::process::id(),
             COUNTER.fetch_add(1, Ordering::Relaxed)
@@ -793,6 +808,76 @@ impl SchemaFile {
         options.open(&path)?.write_all(schema.as_bytes())?;
         Ok(SchemaFile(path))
     }
+}
+
+/// Whether an environment variable name identifies a credential rather than a
+/// generic setting such as `BASE_URL`, `RPC_URL`, or a public username.
+fn is_credential_environment_name(name: &std::ffi::OsStr) -> bool {
+    let name = name.to_string_lossy().to_ascii_uppercase();
+    let parts = name
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+
+    const CREDENTIAL_PARTS: &[&str] = &[
+        "PASSWORD",
+        "PASSWD",
+        "PASSPHRASE",
+        "SECRET",
+        "TOKEN",
+        "CREDENTIAL",
+        "CREDENTIALS",
+        "COOKIE",
+        "JWT",
+        "SESSION",
+        "AUTHORIZATION",
+    ];
+    if parts.iter().any(|part| CREDENTIAL_PARTS.contains(part)) {
+        return true;
+    }
+
+    // `API_KEY`, `ACCESS_KEY`, `AUTH_KEY`, `CLIENT_KEY` and `PRIVATE_KEY` are
+    // common names. A bare `KEY` is too broad and would match keyboard settings.
+    parts.contains(&"KEY")
+        && parts.iter().any(|part| {
+            matches!(
+                *part,
+                "API" | "ACCESS" | "AUTH" | "CLIENT" | "PRIVATE" | "SIGNING" | "ENCRYPTION" | "SSH"
+            )
+        })
+}
+
+/// Whether a credential environment value appears as a JSON string in a schema
+/// or as an embedded raw/escaped substring. Values shorter than eight Unicode
+/// characters are ignored to avoid matching common schema literals. This guards
+/// direct schema persistence, not all secret exposure: files, prompts,
+/// non-exported shell variables and transformed values are not inspected.
+fn contains_sensitive_environment_value(
+    schema: &str,
+    environment: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> bool {
+    environment.into_iter().any(|(name, value)| {
+        if !is_credential_environment_name(&name) {
+            return false;
+        }
+        let value = value.to_string_lossy();
+        if value.chars().count() < 8 {
+            return false;
+        }
+
+        // JSON string matching catches a value even when special characters
+        // need escaping in the schema text.
+        let Ok(encoded) = serde_json::to_string(value.as_ref()) else {
+            return false;
+        };
+        if schema.contains(&encoded) {
+            return true;
+        }
+
+        // Longer values are also checked as substrings in case a caller embeds
+        // or escapes a credential inside a larger schema string.
+        schema.contains(value.as_ref()) || schema.contains(&encoded[1..encoded.len() - 1])
+    })
 }
 
 impl Drop for SchemaFile {
@@ -2264,6 +2349,106 @@ impl Outcome {
 mod tests {
     use super::*;
     use crate::agent::Agent;
+
+    fn fresh_temp_dir(label: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "agent-abstraction-{label}-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&path).expect("create test directory");
+        path
+    }
+
+    fn environment(entries: &[(&str, &str)]) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+        entries
+            .iter()
+            .map(|(name, value)| ((*name).into(), (*value).into()))
+            .collect()
+    }
+
+    #[test]
+    fn credential_values_in_schema_are_rejected_before_file_creation() {
+        let directory = fresh_temp_dir("schema-secret");
+        let env = environment(&[("OPENAI_API_KEY", "sk-live-credential-value-123")]);
+        let schema = r#"{"enum":["prefix-sk-live-credential-value-123-suffix"]}"#;
+
+        let error = match SchemaFile::write_with_environment(schema, &directory, env) {
+            Err(error) => error,
+            Ok(file) => {
+                drop(file);
+                panic!("credential-bearing schema was written");
+            }
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(
+            std::fs::read_dir(&directory)
+                .expect("read test directory")
+                .count(),
+            0,
+            "rejection must happen before a file is created"
+        );
+        std::fs::remove_dir(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn schema_guard_matches_json_escaped_values_and_ignores_generic_settings() {
+        let escaped_value = r#"credential\"with-escaped-quote"#;
+        let escaped_schema = r#"{"const":"credential\\\"with-escaped-quote"}"#;
+        assert!(contains_sensitive_environment_value(
+            escaped_schema,
+            environment(&[("SERVICE_TOKEN", escaped_value)])
+        ));
+
+        let ordinary_schema = r#"{"const":"https://rpc.example.invalid"}"#;
+        assert!(!contains_sensitive_environment_value(
+            ordinary_schema,
+            environment(&[("BASE_URL", "https://rpc.example.invalid")])
+        ));
+        assert!(!contains_sensitive_environment_value(
+            ordinary_schema,
+            environment(&[("KEYBOARD_LAYOUT", "https://rpc.example.invalid")])
+        ));
+    }
+
+    #[test]
+    fn schema_guard_ignores_short_values_to_avoid_common_literal_matches() {
+        let env = environment(&[("SERVICE_TOKEN", "7")]);
+        assert!(!contains_sensitive_environment_value(
+            r#"{"const":"7"}"#,
+            env.clone()
+        ));
+        assert!(!contains_sensitive_environment_value(
+            r#"{"minimum":7}"#,
+            env
+        ));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn schema_temp_file_remains_owner_only_on_unix() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = fresh_temp_dir("schema-mode");
+        let file = SchemaFile::write_with_environment(
+            r#"{"type":"object"}"#,
+            &directory,
+            std::iter::empty(),
+        )
+        .expect("write harmless schema");
+        assert_eq!(
+            std::fs::metadata(&file.0)
+                .expect("schema metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        drop(file);
+        std::fs::remove_dir(directory).expect("remove test directory");
+    }
 
     #[test]
     fn quota_phrases_are_recognized_and_ordinary_errors_are_not() {
