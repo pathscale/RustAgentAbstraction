@@ -15,6 +15,7 @@
 //! Writes go through a temp file and a rename, so a concurrent reader never sees
 //! a half-written record.
 
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -26,7 +27,7 @@ use crate::agent::{Agent, Continue, SessionSupport};
 use crate::error::{Error, Result};
 
 /// One named conversation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct SessionRecord {
     /// The caller's stable name, exactly as they supplied it. The on-disk
@@ -43,6 +44,19 @@ pub struct SessionRecord {
     pub created: i64,
     /// Unix epoch seconds of the most recent turn.
     pub updated: i64,
+}
+
+impl fmt::Debug for SessionRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SessionRecord")
+            .field("name", &self.name)
+            .field("project", &self.project)
+            .field("agent", &self.agent)
+            .field("token", &"[REDACTED]")
+            .field("created", &self.created)
+            .field("updated", &self.updated)
+            .finish()
+    }
 }
 
 /// Whether the next turn starts a conversation or continues one.
@@ -489,6 +503,12 @@ const MAX_STEM: usize = 200;
 fn encode_segment(name: &str) -> String {
     use std::fmt::Write as _;
 
+    if name == "." {
+        return "%2E".into();
+    }
+    if name == ".." {
+        return "%2E%2E".into();
+    }
     let mut out = String::with_capacity(name.len());
     for byte in name.bytes() {
         if byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_' | b'.')
@@ -555,6 +575,45 @@ mod tests {
             now_secs()
         ));
         (SessionStore::open(dir), PathBuf::from("/home/me/proj"))
+    }
+
+    #[test]
+    fn session_record_debug_redacts_the_native_token() {
+        let token = "native-session-token-that-must-not-appear-in-logs";
+        let record = SessionRecord {
+            name: "chat".into(),
+            project: "/home/me/proj".into(),
+            agent: Agent::Claude,
+            token: token.into(),
+            created: 1,
+            updated: 2,
+        };
+
+        let debug = format!("{record:?}");
+        assert!(
+            !debug.contains(token),
+            "token leaked through Debug: {debug}"
+        );
+        assert!(debug.contains("[REDACTED]"), "missing redaction: {debug}");
+    }
+
+    #[test]
+    fn dot_only_project_segments_cannot_escape_the_store() {
+        let (session_store, _) = store("dot-path");
+        assert_eq!(encode_segment("."), "%2E");
+        assert_eq!(encode_segment(".."), "%2E%2E");
+        assert_ne!(encode_segment(".."), encode_segment("%2E%2E"));
+
+        let path = session_store.path_of(Path::new(".."), "chat");
+        assert!(
+            path.starts_with(&session_store.dir),
+            "path escaped: {}",
+            path.display()
+        );
+        assert!(!path.components().any(|component| matches!(
+            component,
+            std::path::Component::CurDir | std::path::Component::ParentDir
+        )));
     }
 
     #[test]

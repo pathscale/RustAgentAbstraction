@@ -462,7 +462,11 @@ impl Protocol {
             PendingApproval::Permissions { rpc_id, requested } => (
                 rpc_id,
                 if allow {
-                    json!({"permissions": requested, "scope": "session"})
+                    // Verified against codex-cli 0.166.0's app-server v2
+                    // schema: both `turn` and `session` are accepted. A
+                    // Decision::Allow authorizes this approval only, so keep
+                    // the grant scoped to the current turn.
+                    json!({"permissions": requested, "scope": "turn"})
                 } else {
                     json!({"permissions": {}, "scope": "turn"})
                 },
@@ -963,7 +967,7 @@ mod tests {
     }
 
     #[test]
-    fn permissions_can_be_granted_for_the_session() {
+    fn permission_grant_is_limited_to_the_current_turn() {
         let mut protocol = Protocol::new(request());
         let step = protocol.push(&json!({
             "id": 91,
@@ -982,7 +986,7 @@ mod tests {
             .expect("response");
         let response: Value = serde_json::from_str(&response).unwrap();
         assert_eq!(response["id"], 91);
-        assert_eq!(response["result"]["scope"], "session");
+        assert_eq!(response["result"]["scope"], "turn");
         assert_eq!(
             response["result"]["permissions"]["fileSystem"]["write"],
             json!(["/repo"])
