@@ -20,7 +20,7 @@ use crate::session::{Phase, SessionStore};
 ///     .model("sonnet")
 ///     .permission(Permission::ReadOnly);
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Request {
     pub(crate) agent: Agent,
     pub(crate) bin: Option<String>,
@@ -55,6 +55,12 @@ pub struct Request {
     pub(crate) is_command: bool,
     /// Whether this request runs a prompt or only repairs a resumed session.
     pub(crate) operation: Operation,
+}
+
+impl std::fmt::Debug for Request {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Request").finish_non_exhaustive()
+    }
 }
 
 /// The lifecycle operation a request asks the provider transport to perform.
@@ -499,6 +505,14 @@ impl Request {
     /// [`Request::argv`].
     #[must_use]
     pub(crate) fn plan(&self) -> Plan {
+        // Agents without a native system-prompt option prepend the system text
+        // to the positional prompt. If that combined prompt starts with `-`,
+        // use the stdin path just as for a flag-shaped user prompt.
+        let folded_system_starts_with_flag = !self.agent.caps().native_system
+            && self
+                .system
+                .as_deref()
+                .is_some_and(|value| value.starts_with('-'));
         Plan {
             bin: self
                 .bin
@@ -523,7 +537,9 @@ impl Request {
             // and Copilot the system text is prepended to it, and for Claude the
             // system prompt rides its own argument. A small prompt with a large
             // system prompt would otherwise still hit E2BIG.
-            stdin_prompt: self.argv_weight() >= STDIN_THRESHOLD,
+            stdin_prompt: self.argv_weight() >= STDIN_THRESHOLD
+                || self.prompt.starts_with('-')
+                || folded_system_starts_with_flag,
             schema: self.schema.clone(),
             schema_file: self.schema_file.clone(),
             is_command: self.is_command,
@@ -696,6 +712,36 @@ mod tests {
     #[test]
     fn a_small_prompt_stays_on_the_argv() {
         assert!(!Request::new(Agent::Claude, "hi").plan().stdin_prompt);
+    }
+
+    #[test]
+    fn a_flag_shaped_positional_prompt_moves_to_stdin() {
+        let claude = Request::new(Agent::Claude, "-review");
+        assert!(claude.plan().stdin_prompt);
+        let claude_argv = claude.argv().unwrap();
+        assert!(
+            claude_argv
+                .windows(2)
+                .any(|pair| { pair[0] == "--input-format" && pair[1] == "text" })
+        );
+        assert!(!claude_argv.iter().any(|argument| argument == "-review"));
+
+        let codex = Request::new(Agent::Codex, "-review");
+        assert!(codex.plan().stdin_prompt);
+        assert_eq!(codex.argv().unwrap().last().map(String::as_str), Some("-"));
+    }
+
+    #[test]
+    fn a_flag_shaped_folded_system_prompt_moves_to_stdin() {
+        for agent in [Agent::Codex, Agent::Copilot] {
+            let request = Request::new(agent, "review").system("-rules");
+            assert!(
+                request.plan().stdin_prompt,
+                "{agent} must pipe the whole prompt"
+            );
+            let argv = request.argv().unwrap();
+            assert!(!argv.iter().any(|argument| argument == "-rules"));
+        }
     }
 
     #[test]
